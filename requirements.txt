@@ -1,0 +1,11 @@
+# ── installed via apt (system-site-packages) ────────────────────────────────
+# python3-pyqt5        PyQt5 UI framework
+# python3-rpi.gpio     Raspberry Pi GPIO access
+# python3-gpiozero     High-level GPIO interface
+# python3-numpy        Array / matrix operations
+# python3-opencv       OpenCV image processing
+# Do NOT pip-install the above — use the system packages.
+
+# ── pip-installed inside the venv ───────────────────────────────────────────
+openvino                # OpenVINO runtime for YOLO inference
+pypylon                 # Basler Pylon Python binding (requires Pylon SDK system install)

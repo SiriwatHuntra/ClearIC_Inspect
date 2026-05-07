@@ -8,11 +8,11 @@ import numpy as np
 import cv2 as cv
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel,
-    QPushButton, QDoubleSpinBox, QSpinBox, QHBoxLayout, QVBoxLayout,
+    QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout,
     QDialog, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QImage, QFont
+from PyQt5.QtGui import QPixmap, QImage, QFont, QIntValidator, QDoubleValidator
 
 try:
     import RPi.GPIO as GPIO
@@ -34,14 +34,13 @@ CAMERA = "directory"   # "camera" | "directory"
 IO     = False          # True = real GPIO pins, False = mock / log
 MODE   = "DEBUG"        # "RUN" | "DEBUG"
 
-IMAGE_DIR = "Input" #Debug mode image folder 
+IMAGE_DIR = "Input"    # folder used when CAMERA="directory"
 
 # ─── GPIO Pin Assignment (BCM) ────────────────────────────────────────────────
 
 START_PIN  = 17   # IN  — rising edge = start inspection
 DONE_PIN   = 27   # IN  — rising edge from machine = stop / return to standby
 ACK_PIN    = 22   # OUT — pulse HIGH when result is ready
-# RESULT_PIN = 23   # OUT — HIGH = PASS, LOW = FAIL
 FAIL_A_PIN = 24   # OUT — HIGH = IC_A failed
 FAIL_B_PIN = 25   # OUT — HIGH = IC_B failed
 
@@ -49,6 +48,11 @@ _ACK_PULSE_S     = 0.1   # 100 ms pulse width
 _CAPTURE_RETRIES = 2
 _RETRY_DELAY_S   = 0.2
 _BASLER_TIMEOUT  = 5000  # ms
+
+# ─── Model Classes ────────────────────────────────────────────────────────────
+# Detection logic: PASS if any bounding box present in cell (class irrelevant)
+# FAIL if cell returns zero detections
+MODEL_CLASSES = ("IC_Presence", "Text")
 
 
 # ─── Stage & Error Flags ──────────────────────────────────────────────────────
@@ -133,7 +137,7 @@ class Image:
 # ─── Camera ───────────────────────────────────────────────────────────────────
 
 class Camera:
-    """Acquires frames from a Basler camera or image files in the 'input/' folder.
+    """Acquires frames from a Basler camera or image files in the 'Input/' folder.
 
     CAMERA="camera"    — live Basler feed via Pylon SDK.
     CAMERA="directory" — loads image files from IMAGE_DIR in sorted order,
@@ -170,7 +174,7 @@ class Camera:
 
     def _open_directory(self):
         if not os.path.isdir(IMAGE_DIR):
-            raise CameraError(f"Input folder not found: '{IMAGE_DIR}'")
+            raise CameraError(f"'Input' folder not found")
         _EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
         self._files = sorted(
             os.path.join(IMAGE_DIR, name)
@@ -181,10 +185,7 @@ class Camera:
             raise CameraError(f"No images found in '{IMAGE_DIR}'")
 
     def capture(self) -> Image:
-        """Grab one frame. Retries up to 2× on transient failure.
-
-        Returns an Image. Raises CameraError on persistent failure.
-        """
+        """Grab one frame. Retries up to 2× on transient failure."""
         last_exc = None
         for attempt in range(1 + _CAPTURE_RETRIES):
             try:
@@ -238,14 +239,6 @@ class RaspberryIO:
 
     IO=True  — drives physical BCM pins via RPi.GPIO.
     IO=False — mocks every state change as a log message.
-
-    Usage:
-        rio = RaspberryIO()
-        rio.register_start_callback(on_start)
-        rio.register_done_callback(on_done)
-        rio.set_result(passed=True, fail_a=False, fail_b=False)
-        rio.pulse_ack()
-        rio.release()
     """
 
     def __init__(self):
@@ -264,7 +257,6 @@ class RaspberryIO:
             GPIO.setwarnings(False)
             GPIO.setup(START_PIN, GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
             GPIO.setup(DONE_PIN,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            # for pin in (ACK_PIN, RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN):
             for pin in (ACK_PIN, FAIL_A_PIN, FAIL_B_PIN):
                 GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
             GPIO.add_event_detect(START_PIN, GPIO.RISING,
@@ -283,28 +275,23 @@ class RaspberryIO:
             self._done_cb()
 
     def register_start_callback(self, fn: callable):
-        """Called on START_PIN rising edge — machine signals begin inspection."""
         self._start_cb = fn
 
     def register_done_callback(self, fn: callable):
-        """Called on DONE_PIN rising edge — machine signals return to standby."""
         self._done_cb = fn
 
-    def set_result(self, passed: bool, fail_a: bool, fail_b: bool):
-        """Set RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN before pulse_ack()."""
+    def set_result(self, fail_a: bool, fail_b: bool):
+        """Set FAIL_A_PIN, FAIL_B_PIN before pulse_ack()."""
         if IO and _GPIO_AVAILABLE:
-            #GPIO.output(RESULT_PIN, GPIO.HIGH if passed else GPIO.LOW)
-            GPIO.output(FAIL_A_PIN, GPIO.HIGH if fail_a  else GPIO.LOW)
-            GPIO.output(FAIL_B_PIN, GPIO.HIGH if fail_b  else GPIO.LOW)
+            GPIO.output(FAIL_A_PIN, GPIO.HIGH if fail_a else GPIO.LOW)
+            GPIO.output(FAIL_B_PIN, GPIO.HIGH if fail_b else GPIO.LOW)
         else:
-            # r = "HIGH" if passed else "LOW"
-            a = "HIGH" if fail_a  else "LOW"
-            b = "HIGH" if fail_b  else "LOW"
-            # print(f"[IO MOCK] RESULT_PIN → {r}  FAIL_A_PIN → {a}  FAIL_B_PIN → {b}")
+            a = "HIGH" if fail_a else "LOW"
+            b = "HIGH" if fail_b else "LOW"
             print(f"[IO MOCK] FAIL_A_PIN → {a}  FAIL_B_PIN → {b}")
 
     def pulse_ack(self):
-        """Pulse ACK_PIN HIGH for 100 ms — machine reads outputs on this edge."""
+        """Pulse ACK_PIN HIGH for 100 ms."""
         if IO and _GPIO_AVAILABLE:
             GPIO.output(ACK_PIN, GPIO.HIGH)
             time.sleep(_ACK_PULSE_S)
@@ -313,19 +300,15 @@ class RaspberryIO:
             print("[IO MOCK] ACK_PIN → HIGH (pulse)")
 
     def clear_outputs(self):
-        """Drive all output pins LOW — called on DONE or graceful shutdown."""
+        """Drive all output pins LOW."""
         if IO and _GPIO_AVAILABLE:
-            #for pin in (RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN, ACK_PIN):
             for pin in (FAIL_A_PIN, FAIL_B_PIN, ACK_PIN):
                 GPIO.output(pin, GPIO.LOW)
         else:
-            #for name in ("RESULT_PIN", "FAIL_A_PIN", "FAIL_B_PIN", "ACK_PIN"):
             for name in ("FAIL_A_PIN", "FAIL_B_PIN", "ACK_PIN"):
-                
                 print(f"[IO MOCK] {name} → LOW")
 
     def release(self):
-        """Release GPIO resources — call during graceful shutdown."""
         if IO and _GPIO_AVAILABLE:
             try:
                 GPIO.cleanup()
@@ -333,11 +316,32 @@ class RaspberryIO:
                 pass
 
 
-# ─── Stylesheet ───────────────────────────────────────────────────────────────
+# ─── Input helpers ────────────────────────────────────────────────────────────
+
+def _int_val(field: QLineEdit, default: int = 0) -> int:
+    try:
+        return int(field.text())
+    except ValueError:
+        return default
+
+def _float_val(field: QLineEdit, default: float = 0.0) -> float:
+    try:
+        return float(field.text())
+    except ValueError:
+        return default
+
+
+# ─── Palette ──────────────────────────────────────────────────────────────────
+#
+#  #5465FF  deepest  — window bg, button fill
+#  #788BFF  dark     — panel / frame bg
+#  #9BB1FF  base     — card surface bg
+#  #BFD7FF  light    — input field bg
+#  #E2FDFF  lightest — image area, focus highlight
 
 STYLE = """
     QMainWindow, QWidget {
-        background-color: #263238;
+        background-color: #5465FF;
         color: #FFFFFF;
         font-family: 'Segoe UI', sans-serif;
     }
@@ -345,34 +349,32 @@ STYLE = """
         border-radius: 8px;
     }
     QPushButton {
-        background-color: #FFFFFF;
-        color: #263238;
-        border-radius: 8px;
-        padding: 6px 12px;
-        border: 1px solid #546E7A;
-    }
-    QPushButton:hover {
-        background-color: #00BCD4;
+        background-color: #5465FF;
         color: #FFFFFF;
-        border: 1px solid #00BCD4;
+        border-radius: 8px;
+        padding: 6px 14px;
+        border: 1px solid #788BFF;
+        min-height: 28px;
     }
     QPushButton:disabled {
-        background-color: #546E7A;
-        color: #90A4AE;
-        border: 1px solid #455A64;
+        background-color: #9BB1FF;
+        color: #BFD7FF;
+        border: 1px solid #9BB1FF;
     }
-    QDoubleSpinBox, QSpinBox {
-        background-color: #37474F;
-        color: #FFFFFF;
-        border: 1px solid #455A64;
-        border-radius: 4px;
-        padding: 2px 4px;
+    QLineEdit {
+        background-color: #BFD7FF;
+        color: #5465FF;
+        border-radius: 6px;
+        border: none;
+        padding: 4px 8px;
+        min-height: 26px;
     }
-    QDoubleSpinBox:focus, QSpinBox:focus {
-        border: 1px solid #00BCD4;
+    QLineEdit:focus {
+        background-color: #E2FDFF;
     }
     QLabel {
         color: #FFFFFF;
+        background-color: transparent;
     }
 """
 
@@ -387,22 +389,22 @@ class FailDialog(QDialog):
         self.setWindowTitle("Inspection Failed")
         self.setModal(True)
         self.setStyleSheet(
-            "QDialog { background-color: #37474F; border-radius: 8px; }"
-            "QLabel  { color: #FFFFFF; }"
+            "QDialog { background-color: #5465FF; }"
+            "QLabel  { color: #FFFFFF; background-color: transparent; }"
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(8)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(10)
 
         title = QLabel("Inspection Failed")
         title.setFont(QFont("Segoe UI", 14, QFont.Bold))
         layout.addWidget(title)
 
         if ic_a_missing:
-            layout.addWidget(QLabel(f"IC_A FAIL — missing cells: {ic_a_missing}"))
+            layout.addWidget(QLabel(f"IC_A  FAIL — missing cells: {ic_a_missing}"))
         if ic_b_missing:
-            layout.addWidget(QLabel(f"IC_B FAIL — missing cells: {ic_b_missing}"))
+            layout.addWidget(QLabel(f"IC_B  FAIL — missing cells: {ic_b_missing}"))
 
         ack_btn = QPushButton("Acknowledge")
         ack_btn.clicked.connect(self.accept)
@@ -417,7 +419,6 @@ class FailDialog(QDialog):
 
 class MainWindow(QMainWindow):
 
-    # Class-level signals so GPIO background thread can safely call Qt UI
     _sig_start = pyqtSignal()
     _sig_done  = pyqtSignal()
 
@@ -443,11 +444,11 @@ class MainWindow(QMainWindow):
         self._stat_fail  = 0
         self._stat_error = 0
 
-        # ── Wire Qt signals (thread-safe GPIO → UI bridge) ────────────────────
+        # ── Wire Qt signals (GPIO thread → Qt main thread) ────────────────────
         self._sig_start.connect(self._on_start)
         self._sig_done.connect(self._on_done)
 
-        # ── Init GPIO ────────────────────────────────────────────────────────
+        # ── Init GPIO ─────────────────────────────────────────────────────────
         try:
             self._rio = RaspberryIO()
             self._rio.register_start_callback(self._sig_start.emit)
@@ -469,7 +470,7 @@ class MainWindow(QMainWindow):
 
     def _build_main_view(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #37474F; border-radius: 8px;")
+        frame.setStyleSheet("background-color: #788BFF; border-radius: 8px;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
@@ -478,7 +479,7 @@ class MainWindow(QMainWindow):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet(
-            "background-color: #263238; border-radius: 8px; border: 1px solid #455A64;"
+            "background-color: #E2FDFF; border-radius: 8px; color: #788BFF;"
         )
         self.image_label.setText("No image")
         layout.addWidget(self.image_label, stretch=1)
@@ -495,7 +496,7 @@ class MainWindow(QMainWindow):
         bottom_row.setSpacing(8)
 
         badges_frame = QFrame()
-        badges_frame.setStyleSheet("background-color: #455A64; border-radius: 8px;")
+        badges_frame.setStyleSheet("background-color: #9BB1FF; border-radius: 8px;")
         badges_layout = QHBoxLayout(badges_frame)
         badges_layout.setContentsMargins(8, 8, 8, 8)
         badges_layout.setSpacing(8)
@@ -517,7 +518,8 @@ class MainWindow(QMainWindow):
         badge.setFixedSize(110, 56)
         badge.setFont(QFont("Segoe UI", 11, QFont.Bold))
         badge.setStyleSheet(
-            "background-color: #37474F; border-radius: 8px; padding: 4px; border: 1px solid #455A64;"
+            "background-color: #788BFF; color: #FFFFFF;"
+            "border-radius: 8px; padding: 4px; border: 1px solid #BFD7FF;"
         )
         return badge
 
@@ -525,10 +527,10 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #37474F; border-radius: 8px; border: 1px solid #455A64;")
+        frame.setStyleSheet("background-color: #5465FF; border-radius: 8px;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         layout.addWidget(self._build_setup_section())
         layout.addWidget(self._build_controls_section())
@@ -538,18 +540,23 @@ class MainWindow(QMainWindow):
 
     def _build_setup_section(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #455A64; border-radius: 8px;")
+        frame.setStyleSheet("background-color: #788BFF; border-radius: 8px;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
         layout.addWidget(self._section_title("Setup"))
 
-        self.exposure_spin   = self._labeled_spinbox(layout, "Exposure (µs)", 1, 1_000_000, 10000)
-        self.scale_spin      = self._labeled_double_spinbox(layout, "Scale / ratio", 0.1, 10.0, 1.0)
-        self.col_offset_spin = self._labeled_spinbox(layout, "Column offset (px)", 0, 2000, 0)
-        self.ic_b_offset_x   = self._labeled_spinbox(layout, "IC_B offset X (px)", -4000, 4000, 0)
-        self.ic_b_offset_y   = self._labeled_spinbox(layout, "IC_B offset Y (px)", -4000, 4000, 0)
+        self.inp_exposure    = self._labeled_input(layout, "Exposure (µs)",
+                                                   "10000", QIntValidator(1, 1_000_000))
+        self.inp_scale       = self._labeled_input(layout, "Scale / ratio",
+                                                   "1.0",   QDoubleValidator(0.1, 10.0, 3))
+        self.inp_col_offset  = self._labeled_input(layout, "Column offset (px)",
+                                                   "0",     QIntValidator(0, 2000))
+        self.inp_ic_b_x      = self._labeled_input(layout, "IC_B offset X (px)",
+                                                   "0",     QIntValidator(-4000, 4000))
+        self.inp_ic_b_y      = self._labeled_input(layout, "IC_B offset Y (px)",
+                                                   "0",     QIntValidator(-4000, 4000))
 
         self.btn_set_anchor  = QPushButton("Set Anchor")
         self.btn_preview_roi = QPushButton("Preview ROIs")
@@ -566,7 +573,7 @@ class MainWindow(QMainWindow):
 
     def _build_controls_section(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #455A64; border-radius: 8px;")
+        frame.setStyleSheet("background-color: #788BFF; border-radius: 8px;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -581,12 +588,12 @@ class MainWindow(QMainWindow):
 
     def _build_stats_section(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #455A64; border-radius: 8px;")
+        frame.setStyleSheet("background-color: #9BB1FF; border-radius: 8px;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
 
-        self.lbl_status     = QLabel("Status: Standby")
+        self.lbl_status = QLabel("Status: Standby")
         self.lbl_status.setFont(QFont("Segoe UI", 10, QFont.Bold))
         layout.addWidget(self.lbl_status)
 
@@ -607,29 +614,19 @@ class MainWindow(QMainWindow):
         lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
         return lbl
 
-    def _labeled_spinbox(self, layout: QVBoxLayout, label: str,
-                         min_val: int, max_val: int, default: int) -> QSpinBox:
+    def _labeled_input(self, layout: QVBoxLayout, label: str,
+                       default: str = "0", validator=None) -> QLineEdit:
         layout.addWidget(QLabel(label))
-        spin = QSpinBox()
-        spin.setRange(min_val, max_val)
-        spin.setValue(default)
-        layout.addWidget(spin)
-        return spin
-
-    def _labeled_double_spinbox(self, layout: QVBoxLayout, label: str,
-                                min_val: float, max_val: float, default: float) -> QDoubleSpinBox:
-        layout.addWidget(QLabel(label))
-        spin = QDoubleSpinBox()
-        spin.setRange(min_val, max_val)
-        spin.setValue(default)
-        spin.setSingleStep(0.1)
-        layout.addWidget(spin)
-        return spin
+        field = QLineEdit(default)
+        if validator is not None:
+            field.setValidator(validator)
+        layout.addWidget(field)
+        return field
 
     # ── Inspection cycle ──────────────────────────────────────────────────────
 
     def _on_start(self):
-        """Runs on the Qt main thread via _sig_start signal."""
+        """Runs on Qt main thread via _sig_start signal."""
         if self._stage == Stage.BUSY:
             print("[IO] START ignored — busy")
             return
@@ -647,27 +644,29 @@ class MainWindow(QMainWindow):
             img = self._cam.capture()
             self._display_image(img.frame)
 
-            # ── Detection placeholder ──────────────────────────────────────
+            # ── Detection placeholder ──────────────────────────────────────────
             # TODO: replace with real YOLO/OpenVINO inference
+            # Classes: "IC_Presence", "Text"
+            # Per cell: PASS = any detection present, FAIL = no detection found
+            # Per IC:   PASS = all 6 cells pass
             ic_a_passed  = True
             ic_b_passed  = True
             ic_a_missing: list = []
             ic_b_missing: list = []
-            # ──────────────────────────────────────────────────────────────
+            # ──────────────────────────────────────────────────────────────────
 
-            overall = ic_a_passed and ic_b_passed
             self._update_badge("A", ic_a_passed)
             self._update_badge("B", ic_b_passed)
 
             if self._rio:
                 self._rio.set_result(
-                    passed=overall,
                     fail_a=not ic_a_passed,
                     fail_b=not ic_b_passed,
                 )
                 self._rio.pulse_ack()
 
             cycle_ms = (time.time() - t0) * 1000
+            overall  = ic_a_passed and ic_b_passed
 
             if overall:
                 self._stat_pass += 1
@@ -681,7 +680,7 @@ class MainWindow(QMainWindow):
             self._stat_error += 1
             self._set_error(ErrorFlag.CAMERA_ERROR, f"Camera error: {exc}")
             if self._rio:
-                self._rio.set_result(passed=False, fail_a=False, fail_b=False)
+                self._rio.set_result(fail_a=False, fail_b=False)
                 self._rio.pulse_ack()
 
         except Exception as exc:
@@ -717,23 +716,24 @@ class MainWindow(QMainWindow):
         )
 
     def _update_badge(self, ic: str, passed: bool):
-        badge = self.badge_a if ic == "A" else self.badge_b
-        color = "#00BCD4" if passed else "#EF5350"
-        badge.setText(f"IC_{ic}\n{'PASS' if passed else 'FAIL'}")
+        badge  = self.badge_a if ic == "A" else self.badge_b
+        color  = "#BFD7FF" if passed else "#EF5350"
+        label  = "PASS" if passed else "FAIL"
+        badge.setText(f"IC_{ic}\n{label}")
         badge.setStyleSheet(
-            f"background-color: #37474F; color: {color}; border: 1px solid {color};"
-            "border-radius: 8px; padding: 4px;"
+            f"background-color: #788BFF; color: {color};"
+            f"border-radius: 8px; padding: 4px; border: 2px solid {color};"
         )
 
     def _refresh_status(self):
-        labels = {
+        mapping = {
             Stage.STANDBY: ("Standby", "#FFFFFF"),
-            Stage.BUSY:    ("Running", "#FFFFFF"),
+            Stage.BUSY:    ("Running", "#BFD7FF"),
             Stage.ERROR:   ("Error",   "#EF5350"),
         }
-        text, color = labels[self._stage]
+        text, color = mapping[self._stage]
         self.lbl_status.setText(f"Status: {text}")
-        self.lbl_status.setStyleSheet(f"color: {color};")
+        self.lbl_status.setStyleSheet(f"color: {color}; background-color: transparent;")
 
     def _refresh_stats(self, cycle_ms: float = None):
         self.lbl_pass.setText(f"Pass:  {self._stat_pass}")
@@ -749,12 +749,12 @@ class MainWindow(QMainWindow):
         self.error_banner.show()
         self._refresh_status()
 
-    # ── Public update API ─────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def show_fail_dialog(self, ic_a_missing: list, ic_b_missing: list):
         FailDialog(ic_a_missing, ic_b_missing, self).exec_()
 
-    # ── Slots (wired to buttons) ──────────────────────────────────────────────
+    # ── Slots ─────────────────────────────────────────────────────────────────
 
     def on_set_anchor(self):
         pass

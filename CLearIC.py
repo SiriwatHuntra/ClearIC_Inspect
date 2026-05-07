@@ -480,8 +480,9 @@ class Detector:
     def _run_inference(self, image_bgr: np.ndarray) -> list:
         """
         Letterbox → blob → infer → NMS.
-        Returns list of (x1, y1, w, h) in image coords.
-        Confidence = max(conf_IC_Presence, conf_Text).
+        Returns list of (x1, y1, w, h, class_idx) 5-tuples.
+          class_idx 0 = IC_Presence (large mold outline)
+          class_idx 1 = Text        (individual mark/character)
         """
         if not self._ready or self._compiled is None:
             return []
@@ -504,15 +505,17 @@ class Detector:
             result = self._compiled(blob)
             preds  = result[0][0].T                         # [8400, 6]
 
-            # confidence = max of class scores (cols 4 and 5)
-            conf   = preds[:, 4:6].max(axis=1)
-            mask   = conf >= self._conf_thr
-            preds  = preds[mask]
-            conf   = conf[mask]
+            # confidence = max of class scores; class = argmax of scores
+            conf      = preds[:, 4:6].max(axis=1)
+            class_idx = preds[:, 4:6].argmax(axis=1)
+            mask      = conf >= self._conf_thr
+            preds     = preds[mask]
+            conf      = conf[mask]
+            class_idx = class_idx[mask]
             if len(preds) == 0:
                 return []
 
-            raw_boxes, scores = [], []
+            raw_boxes, scores, classes = [], [], []
             for i, row in enumerate(preds):
                 cx, cy, bw, bh = row[:4]
                 x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
@@ -522,6 +525,7 @@ class Detector:
                 if x2 > x1 and y2 > y1:
                     raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
                     scores.append(float(conf[i]))
+                    classes.append(int(class_idx[i]))
 
             if not raw_boxes:
                 return []
@@ -531,33 +535,59 @@ class Detector:
             if len(indices) == 0:
                 return []
             kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
-            return [tuple(raw_boxes[i]) for i in kept]
+            return [(raw_boxes[i][0], raw_boxes[i][1],
+                     raw_boxes[i][2], raw_boxes[i][3], classes[i])
+                    for i in kept]
         except Exception as e:
             print(f"[Detector] Inference error: {e}")
             return []
 
-    def detect_cell(self, roi_bgr: np.ndarray) -> bool:
-        """Return True if any YOLO detection above conf_thr in the ROI (crop mode)."""
-        return len(self._run_inference(roi_bgr)) > 0
-
     def detect_full_image(self, image_bgr: np.ndarray) -> list:
         """
-        Run YOLO on the full image and return raw (x1,y1,w,h) boxes.
-        Used by Inspector to check cell intersections without re-cropping.
+        Run YOLO on the full image.
+        Returns only Text class (1) boxes as (x1, y1, w, h) 4-tuples.
+        IC_Presence (class 0) boxes are excluded — they cover the entire IC area
+        and would make every cell appear present even when fonts are absent.
         """
-        return self._run_inference(image_bgr)
+        return [(x, y, w, h) for x, y, w, h, cls in self._run_inference(image_bgr)
+                if cls == 1]
+
+    def locate_ics(self, image_bgr: np.ndarray) -> tuple:
+        """
+        Find the two IC_Presence bounding boxes (class 0) in the image.
+        Returns (ic_a_rect, ic_b_rect) sorted left→right by X position.
+        Either element is None if fewer than 2 IC_Presence boxes are found.
+
+        This is the key to correct A/B assignment: position in the current
+        image determines the label, not the saved template coordinates.
+        """
+        boxes = self._run_inference(image_bgr)
+        # Keep only IC_Presence class (0), sort by area descending to get full IC boxes
+        presence = [(x, y, w, h) for x, y, w, h, cls in boxes if cls == 0]
+        if not presence:
+            return None, None
+        # Among IC_Presence boxes, take the two largest (mold outlines)
+        presence.sort(key=lambda b: -(b[2] * b[3]))
+        top2 = presence[:2]
+        # Sort left→right by X position
+        top2.sort(key=lambda b: b[0])
+
+        if len(top2) == 2:
+            return QtCore.QRect(*top2[0]), QtCore.QRect(*top2[1])
+
+        # Only one IC found — return it in first slot; Inspector will assign correct A/B
+        return QtCore.QRect(*top2[0]), None
 
     def detect_all(self, image_bgr: np.ndarray) -> list:
         """
         Return all detections as QRects sorted by area descending then left→right.
-        Largest boxes (IC_Presence) come first so auto-detect picks them as IC_A / IC_B.
+        Used during template setup to preview IC_Presence boxes.
         """
         boxes = self._run_inference(image_bgr)
         if not boxes:
             return []
-        # sort: largest area first, then left→right within same area tier
         boxes_sorted = sorted(boxes, key=lambda b: (-b[2] * b[3], b[0]))
-        return [QtCore.QRect(x, y, w, h) for x, y, w, h in boxes_sorted]
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h, _ in boxes_sorted]
 
 # =========================================================
 # TEMPLATE MANAGER
@@ -632,11 +662,50 @@ class Inspector:
         """
         Returns (ic_a_pass, ic_b_pass, missing_a, missing_b, annotated_bgr).
         Raises MarkMissingError if either IC fails.
-        """
-        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(self._template)
-        annotated = image_bgr.copy()
 
-        # Single inference on full image
+        Two-phase approach to prevent A/B swap:
+          Phase 1 — locate_ics() finds IC_Presence boxes in the current image
+                     and assigns A=leftmost, B=rightmost by X position.
+          Phase 2 — all detection boxes are checked against each IC's cells.
+
+        If fewer than 2 IC_Presence boxes are detected, the missing IC position
+        falls back to the saved template coordinates so its cells all return FALSE.
+        """
+        tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template)
+        annotated  = image_bgr.copy()
+
+        # Phase 1: locate ICs dynamically in the current frame
+        rt_a, rt_b = self._detector.locate_ics(image_bgr)
+
+        # Single IC found: assign to correct A/B slot using template center proximity.
+        # Prevents: IC_A absent, IC_B present → YOLO finds 1 IC → incorrectly assigned to A.
+        if rt_a is not None and rt_b is None:
+            tmpl_a_cx = (self._template["ic_a"]["x"] +
+                         self._template["ic_a"]["w"] // 2)
+            tmpl_b_cx = (self._template["ic_b"]["x"] +
+                         self._template["ic_b"]["w"] // 2)
+            found_cx  = rt_a.x() + rt_a.width() // 2
+            if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
+                # Found IC is closer to IC_B template → IC_A is missing
+                rt_a, rt_b = None, rt_a
+
+        # Build cell grids: use runtime rect when found, template fallback when missing
+        ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
+        ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
+
+        if debug:
+            if rt_a:
+                print(f"[Inspector] IC_A located: "
+                      f"x={rt_a.x()} y={rt_a.y()} w={rt_a.width()} h={rt_a.height()}")
+            else:
+                print("[Inspector] IC_A not found → template fallback → FAIL")
+            if rt_b:
+                print(f"[Inspector] IC_B located: "
+                      f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
+            else:
+                print("[Inspector] IC_B not found → template fallback → FAIL")
+
+        # Phase 2: check all detection boxes against each IC's cells
         all_boxes = self._detector.detect_full_image(image_bgr)
 
         missing_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
@@ -646,6 +715,15 @@ class Inspector:
             raise MarkMissingError(missing_a, missing_b, annotated)
 
         return True, True, [], [], annotated
+
+    @staticmethod
+    def _rect_to_cells(rect: QtCore.QRect) -> list:
+        """Divide a QRect into a 3-row × 2-col grid of (x, y, w, h) cells."""
+        x, y  = rect.x(),     rect.y()
+        w, h  = rect.width(), rect.height()
+        cw, ch = w // 2,       h // 3
+        return [(x + col * cw, y + row * ch, cw, ch)
+                for row in range(3) for col in range(2)]
 
     @staticmethod
     def _boxes_intersect(bx1, by1, bw, bh, cx, cy, cw, ch) -> bool:

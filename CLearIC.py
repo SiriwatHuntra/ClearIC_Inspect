@@ -583,14 +583,20 @@ class Detector:
 
     def detect_all(self, image_bgr: np.ndarray) -> list:
         """
-        Return all detections as QRects sorted by area descending then left→right.
-        Used during template setup to preview IC_Presence boxes.
+        Return up to 2 IC_Presence QRects for template setup, sorted left→right by X.
+        Picks the two largest boxes first (to get the IC mold outlines),
+        then orders them by X so index 0 = IC_A (left), index 1 = IC_B (right).
         """
         boxes = self._run_inference(image_bgr)
         if not boxes:
             return []
-        boxes_sorted = sorted(boxes, key=lambda b: (-b[2] * b[3], b[0]))
-        return [QtCore.QRect(x, y, w, h) for x, y, w, h, _cls, _cf in boxes_sorted]
+        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
+        if not presence:
+            return []
+        presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
+        top2 = presence[:2]
+        top2.sort(key=lambda b: b[0])                  # left→right by X
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
 
 # =========================================================
 # TEMPLATE MANAGER
@@ -1777,15 +1783,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_result(self, ia_pass: bool, ib_pass: bool):
         self._update_badge(self._badge_a, ia_pass)
         self._update_badge(self._badge_b, ib_pass)
-        if ia_pass and ib_pass:
-            self._stats_pass += 1
+        self._stats_pass += (1 if ia_pass else 0) + (1 if ib_pass else 0)
         self._lbl_pass.setText(str(self._stats_pass))
         self._lbl_fail.setText(str(self._stats_fail))
 
     def _on_fail(self, err: MarkMissingError):
-        self._stats_fail += 1
-        self._update_badge(self._badge_a, len(err.missing_a) == 0)
-        self._update_badge(self._badge_b, len(err.missing_b) == 0)
+        ic_a_pass = len(err.missing_a) == 0
+        ic_b_pass = len(err.missing_b) == 0
+        self._update_badge(self._badge_a, ic_a_pass)
+        self._update_badge(self._badge_b, ic_b_pass)
+        self._stats_pass += (1 if ic_a_pass else 0) + (1 if ic_b_pass else 0)
+        self._stats_fail += (0 if ic_a_pass else 1) + (0 if ic_b_pass else 1)
+        self._lbl_pass.setText(str(self._stats_pass))
         self._lbl_fail.setText(str(self._stats_fail))
 
     def _on_worker_error(self, msg: str):

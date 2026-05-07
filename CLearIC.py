@@ -1,0 +1,1723 @@
+"""
+ClearIC Inspect
+===============
+Clear-package IC laser-mark inspection via YOLO/OpenVINO ROI presence detection.
+
+Sections (in order)
+-------------------
+  ConfigLoader        Config.json loader with defaults
+  Stage / ErrorFlag   State enums
+  Exceptions          InspectionError hierarchy
+  Image               Image dataclass + ID generator
+  Camera              Basler camera or directory source
+  RaspberryIO         BCM GPIO handler (mockable)
+  Detector            OpenVINO YOLO inference (2-class)
+  TemplateManager     Load/save IC bounding-box template
+  Inspector           12-cell ROI inspection logic
+  Logger              Daily-rotating JSON-lines log
+  STYLE               Qt stylesheet
+  FailDialog          Modal FAIL popup
+  ImageView           Zoomable image widget with overlays
+  SetupPanel          Floating auto-detect confirm panel
+  RunWorker           QThread inspection loop
+  MainWindow          Single-page PyQt5 UI
+  main / __main__     Entry point
+"""
+
+import sys
+import os
+import json
+import glob
+import time
+import math
+from enum import Enum
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import cv2
+import numpy as np
+from PyQt5 import QtWidgets, QtGui, QtCore
+
+# =========================================================
+# CONFIG LOADER
+# =========================================================
+class ConfigLoader:
+    CONFIG_FILE = "Config.json"
+    DEFAULT_CONFIG = {
+        "DEBUG":         True,
+        "CAMERA":        "directory",
+        "IO":            False,
+        "MODE":          "DEBUG",
+        "MANUAL":        True,
+        "CONF_THR":      0.9,
+        "NMS_IOU_THR":   0.45,
+        "CAMERA_SERIAL": "",
+        "EXPOSURE_US":   8000,
+    }
+    _VALID_CAMERA = {"camera", "directory"}
+    _VALID_MODE   = {"RUN", "DEBUG"}
+
+    @classmethod
+    def load(cls) -> dict:
+        if not os.path.exists(cls.CONFIG_FILE):
+            cls.save(cls.DEFAULT_CONFIG)
+            return dict(cls.DEFAULT_CONFIG)
+        try:
+            with open(cls.CONFIG_FILE, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            raise ConfigError(f"Config.json unreadable: {e}")
+        cfg = dict(cls.DEFAULT_CONFIG)
+        cfg.update(data)
+        if cfg["CAMERA"] not in cls._VALID_CAMERA:
+            raise ConfigError(f"CAMERA must be one of {cls._VALID_CAMERA}")
+        if cfg["MODE"] not in cls._VALID_MODE:
+            raise ConfigError(f"MODE must be one of {cls._VALID_MODE}")
+        if not (0.0 < cfg["CONF_THR"] <= 1.0):
+            raise ConfigError("CONF_THR must be in (0, 1]")
+        return cfg
+
+    @classmethod
+    def save(cls, data: dict):
+        with open(cls.CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+# =========================================================
+# STAGE & ERROR FLAGS
+# =========================================================
+class Stage(Enum):
+    STANDBY  = "STANDBY"
+    BUSY     = "BUSY"
+    ERROR    = "ERROR"
+    SHUTDOWN = "SHUTDOWN"
+
+class ErrorFlag(Enum):
+    NONE     = "NONE"
+    CAMERA   = "CAMERA"
+    MODEL    = "MODEL"
+    GPIO     = "GPIO"
+    TEMPLATE = "TEMPLATE"
+
+# =========================================================
+# EXCEPTIONS
+# =========================================================
+class InspectionError(Exception):
+    pass
+
+class MarkMissingError(InspectionError):
+    def __init__(self, ic_position: str, missing_cells: list):
+        self.ic_position  = ic_position
+        self.missing_cells = missing_cells
+        super().__init__(
+            f"IC_{ic_position} missing cells: {missing_cells}")
+
+class _SystemError(InspectionError):
+    pass
+
+class CameraError(_SystemError):
+    pass
+
+class ModelError(_SystemError):
+    pass
+
+class TemplateError(_SystemError):
+    pass
+
+class GPIOError(_SystemError):
+    pass
+
+class ConfigError(InspectionError):
+    pass
+
+# =========================================================
+# IMAGE DATACLASS + ID GENERATOR
+# =========================================================
+_img_counter = 0
+
+def _next_image_id() -> str:
+    global _img_counter
+    _img_counter += 1
+    return datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{_img_counter:03d}"
+
+@dataclass
+class Image:
+    id:        str
+    raw:       np.ndarray
+    annotated: np.ndarray = field(default=None)
+
+# =========================================================
+# CAMERA
+# =========================================================
+_CAMERA_WARMUP_FRAMES = 5
+_CAMERA_RETRY_DELAY   = 0.2
+_CAMERA_RETRIES       = 2
+
+class Camera:
+    """
+    Unified camera source.
+    CAMERA='camera'    : Basler pypylon InstantCamera
+    CAMERA='directory' : reads files from Input/ in sorted order, loops
+    """
+
+    def __init__(self, mode: str, serial: str = "",
+                 exposure_us: int = 8000, input_dir: str = "Input"):
+        self._mode        = mode
+        self._serial      = serial
+        self._exposure_us = exposure_us
+        self._input_dir   = input_dir
+
+        self._camera      = None
+        self._pylon       = None
+        self._basler_ok   = False
+
+        self._files:  list = []
+        self._idx:    int  = 0
+
+        if mode == "camera":
+            try:
+                from pypylon import pylon
+                self._pylon     = pylon
+                self._basler_ok = True
+            except ImportError:
+                raise CameraError("pypylon not installed — cannot use CAMERA='camera'")
+
+    # ---- open ----
+    def open(self):
+        if self._mode == "camera":
+            self._open_basler()
+        else:
+            self._open_directory()
+
+    def _open_basler(self):
+        try:
+            pylon = self._pylon
+            tl    = pylon.TlFactory.GetInstance()
+            devs  = tl.EnumerateDevices()
+            device = None
+            for d in devs:
+                if not self._serial or d.GetSerialNumber() == self._serial:
+                    device = tl.CreateDevice(d)
+                    break
+            if device is None:
+                raise CameraError(
+                    f"Basler camera not found (serial='{self._serial}')")
+            self._camera = pylon.InstantCamera(device)
+            self._camera.Open()
+            self._camera.ExposureAuto.SetValue("Off")
+            self._camera.ExposureTimeAbs.SetValue(float(self._exposure_us))
+            self._camera.PixelFormat.SetValue("Mono8")
+            self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            print(f"[Camera] Opened. Exposure={self._exposure_us} µs")
+        except CameraError:
+            raise
+        except Exception as e:
+            raise CameraError(f"Camera open failed: {e}")
+
+    def _open_directory(self):
+        exts  = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(self._input_dir, ext)))
+        files.sort()
+        if not files:
+            raise CameraError(
+                f"No images found in '{self._input_dir}/'")
+        self._files = files
+        self._idx   = 0
+        print(f"[Camera] Directory mode — {len(files)} image(s) in '{self._input_dir}/'")
+
+    # ---- grab ----
+    def grab(self) -> np.ndarray:
+        """Return BGR ndarray or raise CameraError."""
+        for attempt in range(_CAMERA_RETRIES + 1):
+            try:
+                img = self._grab_once()
+                if img is not None:
+                    return img
+            except CameraError:
+                raise
+            except Exception as e:
+                if attempt < _CAMERA_RETRIES:
+                    time.sleep(_CAMERA_RETRY_DELAY)
+                else:
+                    raise CameraError(f"Grab failed after retries: {e}")
+        raise CameraError("Grab returned None after retries")
+
+    def _grab_once(self) -> np.ndarray:
+        if self._mode == "camera":
+            return self._grab_basler()
+        else:
+            return self._grab_directory()
+
+    def _grab_basler(self) -> np.ndarray:
+        result = self._camera.RetrieveResult(
+            5000, self._pylon.TimeoutHandling_ThrowException)
+        try:
+            if result.GrabSucceeded():
+                gray = result.GetArray().copy()
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            raise CameraError(f"Grab failed: code {result.ErrorCode}")
+        finally:
+            result.Release()
+
+    def _grab_directory(self) -> np.ndarray:
+        if not self._files:
+            raise CameraError("No files loaded")
+        path = self._files[self._idx % len(self._files)]
+        self._idx += 1
+        img = cv2.imread(path)
+        if img is None:
+            raise CameraError(f"Cannot read image: {path}")
+        return img
+
+    def peek_filename(self) -> str:
+        """Return the filename that the next grab() will read (directory mode only)."""
+        if self._mode != "directory" or not self._files:
+            return ""
+        return os.path.basename(self._files[self._idx % len(self._files)])
+
+    # ---- misc ----
+    def warmup(self):
+        if self._mode == "camera":
+            for _ in range(_CAMERA_WARMUP_FRAMES):
+                try:
+                    self._grab_basler()
+                except Exception:
+                    pass
+            print(f"[Camera] Warmup done ({_CAMERA_WARMUP_FRAMES} frames).")
+
+    def set_exposure(self, us: int):
+        self._exposure_us = int(us)
+        if self._camera and self._camera.IsOpen():
+            try:
+                self._camera.ExposureTimeAbs.SetValue(float(us))
+            except Exception as e:
+                print(f"[Camera] Exposure set error: {e}")
+
+    def close(self):
+        if self._camera:
+            try:
+                self._camera.StopGrabbing()
+                self._camera.Close()
+            except Exception:
+                pass
+            self._camera = None
+        print("[Camera] Closed.")
+
+    def is_open(self) -> bool:
+        if self._mode == "camera":
+            return self._camera is not None and self._camera.IsOpen()
+        return bool(self._files)
+
+    def has_more(self) -> bool:
+        """Directory mode: True if there are still un-visited images this cycle."""
+        if self._mode != "directory":
+            return True
+        return self._idx < len(self._files)
+
+    def reset(self):
+        """Reset directory index to beginning."""
+        self._idx = 0
+
+# =========================================================
+# RASPBERRY IO
+# =========================================================
+START_PIN  = 17
+DONE_PIN   = 27
+ACK_PIN    = 22
+FAIL_A_PIN = 24
+FAIL_B_PIN = 25
+
+class RaspberryIO:
+    """
+    BCM-mode GPIO handler.
+    Falls back to mock logging when IO=False or RPi.GPIO unavailable.
+    """
+
+    def __init__(self, io_enabled: bool = True):
+        self._enabled = io_enabled
+        self._gpio_ok = False
+        self._GPIO    = None
+
+        if not io_enabled:
+            print("[IO] IO=False — mock mode.")
+            return
+
+        try:
+            import RPi.GPIO as GPIO
+            self._GPIO = GPIO
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(START_PIN,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
+            GPIO.setup(DONE_PIN,   GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
+            GPIO.setup(ACK_PIN,    GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(FAIL_A_PIN, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(FAIL_B_PIN, GPIO.OUT, initial=GPIO.LOW)
+            self._gpio_ok = True
+            print("[IO] GPIO initialised (BCM mode).")
+        except Exception as e:
+            raise GPIOError(f"GPIO init failed: {e}")
+
+    def _out(self, pin: int, high: bool, pin_name: str = ""):
+        if self._gpio_ok:
+            self._GPIO.output(pin, self._GPIO.HIGH if high else self._GPIO.LOW)
+        else:
+            state = "HIGH" if high else "LOW"
+            print(f"[IO MOCK] {pin_name or pin} → {state}")
+
+    def set_fail_a(self, v: bool):
+        self._out(FAIL_A_PIN, v, "FAIL_A_PIN")
+
+    def set_fail_b(self, v: bool):
+        self._out(FAIL_B_PIN, v, "FAIL_B_PIN")
+
+    def pulse_ack(self, ms: int = 50):
+        self._out(ACK_PIN, True,  "ACK_PIN")
+        time.sleep(ms / 1000.0)
+        self._out(ACK_PIN, False, "ACK_PIN")
+
+    def clear_outputs(self):
+        self._out(ACK_PIN,    False, "ACK_PIN")
+        self._out(FAIL_A_PIN, False, "FAIL_A_PIN")
+        self._out(FAIL_B_PIN, False, "FAIL_B_PIN")
+
+    def wait_for_start(self, stop_flag_fn) -> bool:
+        """Block until START_PIN rising edge or stop_flag_fn() returns True."""
+        if not self._gpio_ok:
+            while not stop_flag_fn():
+                time.sleep(0.02)
+                return True
+            return False
+        GPIO = self._GPIO
+        while not stop_flag_fn():
+            if GPIO.input(START_PIN) == GPIO.HIGH:
+                time.sleep(0.005)
+                if GPIO.input(START_PIN) == GPIO.HIGH:
+                    return True
+            time.sleep(0.005)
+        return False
+
+    def wait_for_done(self, stop_flag_fn) -> bool:
+        """Block until DONE_PIN rising edge or stop_flag_fn() returns True."""
+        if not self._gpio_ok:
+            return True
+        GPIO = self._GPIO
+        while not stop_flag_fn():
+            if GPIO.input(DONE_PIN) == GPIO.HIGH:
+                time.sleep(0.005)
+                if GPIO.input(DONE_PIN) == GPIO.HIGH:
+                    return True
+            time.sleep(0.005)
+        return False
+
+    def cleanup(self):
+        if self._gpio_ok:
+            try:
+                self._GPIO.cleanup()
+            except Exception:
+                pass
+
+# =========================================================
+# DETECTOR  (OpenVINO YOLO — 2-class)
+# =========================================================
+_INPUT_SIZE  = 640
+_NMS_IOU_THR = 0.45
+
+class Detector:
+    """
+    OpenVINO YOLO8 wrapper for ClearIC_Insp model.
+    Output: [1, 6, 8400]  (cx, cy, w, h, conf_IC_Presence, conf_Text)
+    No built-in NMS — applied manually.
+    """
+
+    MODEL_XML = "ClearIC_Insp_openvino_model/ClearIC_Insp.xml"
+
+    def __init__(self, conf_thr: float = 0.9, nms_thr: float = 0.45):
+        self._conf_thr  = conf_thr
+        self._nms_thr   = nms_thr
+        self._compiled  = None
+        self._ready     = False
+        try:
+            import openvino as ov
+            if not os.path.exists(self.MODEL_XML):
+                raise ModelError(f"Model not found: {self.MODEL_XML}")
+            core  = ov.Core()
+            model = core.read_model(self.MODEL_XML)
+            self._compiled = core.compile_model(model, "CPU", {
+                "INFERENCE_PRECISION_HINT": "f32",
+                "PERFORMANCE_HINT":         "LATENCY",
+            })
+            self._ready = True
+            print(f"[Detector] OpenVINO model loaded: {self.MODEL_XML}")
+        except ModelError:
+            raise
+        except Exception as e:
+            raise ModelError(f"Model load failed: {e}")
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def warmup(self):
+        blank = np.zeros((_INPUT_SIZE, _INPUT_SIZE, 3), dtype=np.uint8)
+        self._run_inference(blank)
+        print("[Detector] Warmup done.")
+
+    def _run_inference(self, image_bgr: np.ndarray) -> list:
+        """
+        Letterbox → blob → infer → NMS.
+        Returns list of (x1, y1, w, h) in image coords.
+        Confidence = max(conf_IC_Presence, conf_Text).
+        """
+        if not self._ready or self._compiled is None:
+            return []
+        try:
+            if image_bgr.ndim == 2:
+                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+            ih, iw = image_bgr.shape[:2]
+            sz = _INPUT_SIZE
+
+            scale   = min(sz / iw, sz / ih)
+            nw, nh  = int(iw * scale), int(ih * scale)
+            resized = cv2.resize(image_bgr, (nw, nh))
+            pad_buf = np.full((sz, sz, 3), 114, dtype=np.uint8)
+            pad_x   = (sz - nw) // 2
+            pad_y   = (sz - nh) // 2
+            pad_buf[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+            blob   = pad_buf[:, :, ::-1].astype(np.float32) / 255.0
+            blob   = blob.transpose(2, 0, 1)[np.newaxis]
+            result = self._compiled(blob)
+            preds  = result[0][0].T                         # [8400, 6]
+
+            # confidence = max of class scores (cols 4 and 5)
+            conf   = preds[:, 4:6].max(axis=1)
+            mask   = conf >= self._conf_thr
+            preds  = preds[mask]
+            conf   = conf[mask]
+            if len(preds) == 0:
+                return []
+
+            raw_boxes, scores = [], []
+            for i, row in enumerate(preds):
+                cx, cy, bw, bh = row[:4]
+                x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
+                y1 = max(0,  int((cy - bh / 2 - pad_y) / scale))
+                x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
+                y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
+                if x2 > x1 and y2 > y1:
+                    raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
+                    scores.append(float(conf[i]))
+
+            if not raw_boxes:
+                return []
+
+            indices = cv2.dnn.NMSBoxes(
+                raw_boxes, scores, self._conf_thr, self._nms_thr)
+            if len(indices) == 0:
+                return []
+            kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
+            return [tuple(raw_boxes[i]) for i in kept]
+        except Exception as e:
+            print(f"[Detector] Inference error: {e}")
+            return []
+
+    def detect_cell(self, roi_bgr: np.ndarray) -> bool:
+        """Return True if any YOLO detection above conf_thr in the ROI (crop mode)."""
+        return len(self._run_inference(roi_bgr)) > 0
+
+    def detect_full_image(self, image_bgr: np.ndarray) -> list:
+        """
+        Run YOLO on the full image and return raw (x1,y1,w,h) boxes.
+        Used by Inspector to check cell intersections without re-cropping.
+        """
+        return self._run_inference(image_bgr)
+
+    def detect_all(self, image_bgr: np.ndarray) -> list:
+        """
+        Return all detections as QRects sorted by area descending then left→right.
+        Largest boxes (IC_Presence) come first so auto-detect picks them as IC_A / IC_B.
+        """
+        boxes = self._run_inference(image_bgr)
+        if not boxes:
+            return []
+        # sort: largest area first, then left→right within same area tier
+        boxes_sorted = sorted(boxes, key=lambda b: (-b[2] * b[3], b[0]))
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h in boxes_sorted]
+
+# =========================================================
+# TEMPLATE MANAGER
+# =========================================================
+_TEMPLATE_FILE = "templates/template.json"
+
+class TemplateManager:
+
+    @staticmethod
+    def load() -> dict:
+        if not os.path.exists(_TEMPLATE_FILE):
+            raise TemplateError(f"Template not found: {_TEMPLATE_FILE}")
+        try:
+            with open(_TEMPLATE_FILE, "r") as f:
+                data = json.load(f)
+            for key in ("ic_a", "ic_b"):
+                for sub in ("x", "y", "w", "h"):
+                    _ = data[key][sub]
+            return data
+        except TemplateError:
+            raise
+        except Exception as e:
+            raise TemplateError(f"Template corrupt: {e}")
+
+    @staticmethod
+    def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000):
+        os.makedirs("templates", exist_ok=True)
+        data = {
+            "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
+                     "w": ic_a.width(), "h": ic_a.height()},
+            "ic_b": {"x": ic_b.x(), "y": ic_b.y(),
+                     "w": ic_b.width(), "h": ic_b.height()},
+            "exposure_us": exposure_us,
+        }
+        with open(_TEMPLATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def compute_rois(template: dict) -> tuple:
+        """
+        Returns (ic_a_cells, ic_b_cells).
+        Each is a list of 6 (x, y, w, h) tuples — 3 rows × 2 cols.
+        Left col = left half, right col = right half; rows = thirds.
+        """
+        def _cells(box: dict) -> list:
+            x, y = box["x"], box["y"]
+            w, h = box["w"], box["h"]
+            cw   = w // 2
+            ch   = h // 3
+            cells = []
+            for row in range(3):
+                for col in range(2):
+                    cells.append((x + col * cw, y + row * ch, cw, ch))
+            return cells
+        return _cells(template["ic_a"]), _cells(template["ic_b"])
+
+# =========================================================
+# INSPECTOR
+# =========================================================
+class Inspector:
+    """
+    Runs YOLO once on the full image then checks each ROI cell for box intersections.
+    Raises MarkMissingError if either IC has any cell without an overlapping detection.
+    """
+
+    def __init__(self, detector: Detector, template: dict):
+        self._detector = detector
+        self._template = template
+
+    def inspect(self, image_bgr: np.ndarray,
+                debug: bool = False) -> tuple:
+        """
+        Returns (ic_a_pass, ic_b_pass, missing_a, missing_b, annotated_bgr).
+        Raises MarkMissingError if either IC fails.
+        """
+        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(self._template)
+        annotated = image_bgr.copy()
+
+        # Single inference on full image
+        all_boxes = self._detector.detect_full_image(image_bgr)
+
+        missing_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
+        missing_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
+
+        if missing_a:
+            raise MarkMissingError("A", missing_a)
+        if missing_b:
+            raise MarkMissingError("B", missing_b)
+
+        return True, True, [], [], annotated
+
+    @staticmethod
+    def _boxes_intersect(bx1, by1, bw, bh, cx, cy, cw, ch) -> bool:
+        """True if box (bx1,by1,bw,bh) overlaps cell (cx,cy,cw,ch)."""
+        return (bx1 < cx + cw and bx1 + bw > cx and
+                by1 < cy + ch and by1 + bh > cy)
+
+    def _check_ic(self, boxes: list, cells: list,
+                  annotated: np.ndarray, debug: bool) -> list:
+        missing = []
+        for idx, (cx, cy, cw, ch) in enumerate(cells):
+            row = idx // 2 + 1
+            col = idx %  2 + 1
+            present = any(
+                self._boxes_intersect(bx, by, bw, bh, cx, cy, cw, ch)
+                for bx, by, bw, bh in boxes
+            )
+            color = (0, 200, 0) if present else (0, 0, 220)
+            x2 = min(annotated.shape[1], cx + cw)
+            y2 = min(annotated.shape[0], cy + ch)
+            cv2.rectangle(annotated, (max(0, cx), max(0, cy)), (x2, y2), color, 2)
+            if debug:
+                cv2.putText(annotated, f"R{row}C{col}",
+                            (max(0, cx) + 2, max(0, cy) + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                            (0, 200, 0) if present else (0, 0, 220), 1)
+            if not present:
+                missing.append([row, col])
+        return missing
+
+# =========================================================
+# LOGGER
+# =========================================================
+_LOG_DIR = "logs"
+_LOG_RETENTION = 365
+
+class Logger:
+
+    def __init__(self, log_dir: str = _LOG_DIR):
+        self._dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self._rotate()
+
+    def _log_path(self) -> str:
+        return os.path.join(self._dir,
+                            f"inspect_{datetime.now():%Y%m%d}.log")
+
+    def _rotate(self):
+        logs = sorted(glob.glob(os.path.join(self._dir, "inspect_*.log")))
+        while len(logs) > _LOG_RETENTION:
+            try:
+                os.remove(logs.pop(0))
+            except OSError:
+                pass
+
+    def _append(self, record: dict):
+        try:
+            with open(self._log_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f"[Logger] Write failed: {e}", file=sys.stderr)
+
+    def log_inspection(self, image_id: str,
+                       ic_a_result: str, ic_a_missing: list,
+                       ic_b_result: str, ic_b_missing: list,
+                       cycle_ms: float, mode: str, io_mock: bool):
+        self._rotate()
+        self._append({
+            "timestamp":   datetime.now().isoformat(),
+            "image_id":    image_id,
+            "ic_a_result": ic_a_result,
+            "ic_a_missing": ic_a_missing,
+            "ic_b_result": ic_b_result,
+            "ic_b_missing": ic_b_missing,
+            "cycle_time_ms": round(cycle_ms, 1),
+            "mode":        mode,
+            "io_mock":     io_mock,
+        })
+
+    def log_error(self, error_type: str, message: str, cycle_ms: float = 0):
+        self._append({
+            "timestamp":     datetime.now().isoformat(),
+            "event":         "ERROR",
+            "error_type":    error_type,
+            "error_message": message,
+            "cycle_time_ms": round(cycle_ms, 1),
+        })
+
+    def log_io_mock(self, pin_name: str, state: str):
+        print(f"[IO MOCK] {pin_name} → {state}")
+        self._append({
+            "timestamp": datetime.now().isoformat(),
+            "event":     "IO_MOCK",
+            "pin":       pin_name,
+            "state":     state,
+        })
+
+# =========================================================
+# STYLESHEET
+# =========================================================
+STYLE = """
+QMainWindow, QWidget#root {
+    background: #5465FF;
+}
+QFrame#panel_right {
+    background: #5465FF;
+}
+QFrame#setup_frame, QFrame#controls_frame {
+    background: #788BFF;
+    border-radius: 8px;
+    padding: 8px;
+}
+QFrame#main_view {
+    background: #788BFF;
+    border-radius: 8px;
+}
+QFrame#image_area {
+    background: #E2FDFF;
+    border-radius: 8px;
+}
+QFrame#badge_area, QFrame#stats_area {
+    background: #9BB1FF;
+    border-radius: 8px;
+    padding: 8px;
+}
+QFrame#badge_pass {
+    background: #BFD7FF;
+    border-radius: 8px;
+    padding: 8px;
+}
+QFrame#badge_fail {
+    background: #EF5350;
+    border-radius: 8px;
+    padding: 8px;
+}
+QFrame#badge_idle {
+    background: #9BB1FF;
+    border-radius: 8px;
+    padding: 8px;
+}
+QFrame#error_banner {
+    background: #EF5350;
+    border-radius: 8px;
+    padding: 6px;
+}
+QPushButton {
+    background: #5465FF;
+    color: #FFFFFF;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-weight: bold;
+    border: none;
+}
+QPushButton:disabled {
+    background: #788BFF;
+    color: #BFD7FF;
+}
+QLineEdit {
+    background: #FFFFFF;
+    color: #5465FF;
+    border: 2px solid #5465FF;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+QLabel {
+    color: #FFFFFF;
+}
+QLabel#stat_value {
+    color: #E2FDFF;
+    font-weight: bold;
+}
+"""
+
+# =========================================================
+# FAIL DIALOG
+# =========================================================
+class FailDialog(QtWidgets.QDialog):
+
+    def __init__(self, missing_a: list, missing_b: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Inspection Failed")
+        self.setModal(True)
+        self.setStyleSheet(
+            "QDialog { background: #5465FF; border-radius: 10px; }"
+            "QLabel  { color: #FFFFFF; }"
+            "QPushButton { background:#FFFFFF; color:#5465FF; font-weight:bold;"
+            "  border-radius:6px; padding:6px 24px; }"
+        )
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(20, 20, 20, 20)
+
+        title = QtWidgets.QLabel("Inspection Failed")
+        title.setStyleSheet("font-size:16px;font-weight:bold;color:#FFFFFF")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(title)
+
+        if missing_a:
+            cells = ", ".join(f"[R{r}C{c}]" for r, c in missing_a)
+            lbl = QtWidgets.QLabel(f"IC_A — missing: {cells}")
+            lbl.setStyleSheet("color:#EF5350;font-weight:bold")
+            lbl.setWordWrap(True)
+            lay.addWidget(lbl)
+
+        if missing_b:
+            cells = ", ".join(f"[R{r}C{c}]" for r, c in missing_b)
+            lbl = QtWidgets.QLabel(f"IC_B — missing: {cells}")
+            lbl.setStyleSheet("color:#EF5350;font-weight:bold")
+            lbl.setWordWrap(True)
+            lay.addWidget(lbl)
+
+        btn = QtWidgets.QPushButton("Acknowledge")
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn, alignment=QtCore.Qt.AlignCenter)
+
+        self.adjustSize()
+
+# =========================================================
+# IMAGE VIEW
+# =========================================================
+class ImageView(QtWidgets.QLabel):
+    """
+    Zoomable image display with overlay support and stamp mode.
+    Ported from Ref_sample.py ImageView (L3597–3833).
+    """
+    anchor_clicked = QtCore.pyqtSignal(QtCore.QPoint)   # unused but kept for future
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setObjectName("image_area")
+        self._orig        = None
+        self._scale       = 1.0
+        self._offset      = QtCore.QPoint(0, 0)
+        self._overlays    = []    # (QRect, QColor, label)
+        self._stamp_mode  = False
+        self._stamp_w     = 100
+        self._stamp_h     = 60
+        self.setMouseTracking(True)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Expanding)
+
+    # ---- image ----
+    def set_image(self, img: np.ndarray):
+        if img is None:
+            return
+        if img.ndim == 2:
+            self._orig = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            self._orig = img.copy()
+        QtCore.QTimer.singleShot(0, self._refresh)
+
+    def _refresh(self):
+        if self._orig is None:
+            return
+        h, w = self._orig.shape[:2]
+        rgb  = cv2.cvtColor(self._orig, cv2.COLOR_BGR2RGB)
+        qi   = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix  = QtGui.QPixmap.fromImage(qi)
+        lw, lh = self.width(), self.height()
+        if lw > 0 and lh > 0:
+            pix = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
+                             QtCore.Qt.SmoothTransformation)
+        if self._orig.shape[1] > 0:
+            self._scale = pix.width() / self._orig.shape[1]
+        self._offset = QtCore.QPoint((lw - pix.width())  // 2,
+                                     (lh - pix.height()) // 2)
+        self.setPixmap(pix)
+        if self._overlays:
+            self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QtCore.QTimer.singleShot(0, self._refresh)
+
+    # ---- coordinate helper ----
+    def _to_img(self, pt: QtCore.QPoint) -> QtCore.QPoint:
+        if self.pixmap() is None or self._orig is None:
+            return pt
+        return QtCore.QPoint(
+            int((pt.x() - self._offset.x()) / self._scale),
+            int((pt.y() - self._offset.y()) / self._scale),
+        )
+
+    def _to_widget(self, rect: QtCore.QRect) -> QtCore.QRect:
+        x = int(rect.x() * self._scale) + self._offset.x()
+        y = int(rect.y() * self._scale) + self._offset.y()
+        w = int(rect.width()  * self._scale)
+        h = int(rect.height() * self._scale)
+        return QtCore.QRect(x, y, w, h)
+
+    # ---- overlays ----
+    def add_overlay(self, rect: QtCore.QRect, color: QtGui.QColor, label: str = ""):
+        self._overlays.append((rect, color, label))
+        self.update()
+
+    def clear_overlays(self):
+        self._overlays.clear()
+        self.update()
+
+    # ---- stamp mode ----
+    def set_stamp_mode(self, on: bool, w: int = 100, h: int = 60):
+        self._stamp_mode = on
+        self._stamp_w    = w
+        self._stamp_h    = h
+        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+        self.update()
+
+    # ---- paint ----
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self._overlays and not self._stamp_mode:
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        for rect, color, label in self._overlays:
+            wr = self._to_widget(rect)
+            pen = QtGui.QPen(color, 2)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRect(wr)
+            if label:
+                painter.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
+                painter.setPen(color)
+                painter.drawText(wr.topLeft() + QtCore.QPoint(3, 14), label)
+
+        painter.end()
+
+    def mouseMoveEvent(self, e):
+        if self._stamp_mode:
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == QtCore.Qt.LeftButton and self._stamp_mode:
+            img_pt = self._to_img(e.pos())
+            w2, h2 = self._stamp_w // 2, self._stamp_h // 2
+            rect   = QtCore.QRect(img_pt.x() - w2, img_pt.y() - h2,
+                                  self._stamp_w, self._stamp_h)
+            self.anchor_clicked.emit(img_pt)
+            self.add_overlay(rect, QtGui.QColor("#FFD700"), "")
+
+# =========================================================
+# SETUP PANEL  (Auto Detect flow: Click → Visual → Retry → Confirm)
+# =========================================================
+class SetupPanel(QtWidgets.QWidget):
+    """
+    Floating panel for template creation.
+    Ported/adapted from Ref_sample.py FrameLayoutPanel (L3935–4015).
+    """
+    confirmed = QtCore.pyqtSignal(QtCore.QRect, QtCore.QRect)   # ic_a, ic_b
+
+    def __init__(self, on_cancel, parent=None):
+        super().__init__(
+            parent,
+            QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint |
+            QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint,
+        )
+        self.setWindowTitle("Template Setup — Auto Detect")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.setFixedWidth(320)
+        self.setStyleSheet(
+            "QWidget { background:#5465FF; color:#FFFFFF; }"
+            "QPushButton { background:#788BFF; color:#FFFFFF; border-radius:6px;"
+            "  padding:5px 12px; font-weight:bold; }"
+            "QPushButton:disabled { background:#9BB1FF; color:#BFD7FF; }"
+        )
+
+        self._on_cancel = on_cancel
+        self._ic_a: QtCore.QRect | None = None
+        self._ic_b: QtCore.QRect | None = None
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        title = QtWidgets.QLabel("Auto Detect IC Positions")
+        title.setStyleSheet("font-size:13px;font-weight:bold;color:#E2FDFF")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(title)
+
+        self._lbl_status = QtWidgets.QLabel("Run detection to locate IC_A and IC_B.")
+        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:10px")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self._lbl_status)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_retry   = QtWidgets.QPushButton("Retry")
+        self._btn_confirm = QtWidgets.QPushButton("Confirm & Save")
+        self._btn_cancel  = QtWidgets.QPushButton("Cancel")
+
+        self._btn_confirm.setStyleSheet(
+            "background:#5465FF;color:#FFFFFF;border-radius:6px;"
+            "padding:5px 12px;font-weight:bold;")
+        self._btn_confirm.setEnabled(False)
+        self._btn_retry.setEnabled(False)
+
+        self._btn_retry.clicked.connect(self._on_retry)
+        self._btn_confirm.clicked.connect(self._on_confirm)
+        self._btn_cancel.clicked.connect(self._do_cancel)
+
+        btn_row.addWidget(self._btn_retry)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_confirm)
+        btn_row.addWidget(self._btn_cancel)
+        lay.addLayout(btn_row)
+
+        self._retry_fn = None
+        self.adjustSize()
+
+    def set_retry_fn(self, fn):
+        self._retry_fn = fn
+
+    def show_result(self, ic_a: QtCore.QRect | None, ic_b: QtCore.QRect | None,
+                    n_detected: int):
+        self._ic_a = ic_a
+        self._ic_b = ic_b
+        both = (ic_a is not None and ic_b is not None)
+        if both:
+            self._lbl_status.setText(
+                "IC_A and IC_B detected.\nVerify overlays then Confirm.")
+            self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:10px")
+        else:
+            self._lbl_status.setText(
+                f"Only {n_detected} IC(s) detected. Retry or adjust image.")
+            self._lbl_status.setStyleSheet("color:#EF5350;font-size:10px")
+        self._btn_confirm.setEnabled(both)
+        self._btn_retry.setEnabled(True)
+
+    def _on_retry(self):
+        if self._retry_fn:
+            self._retry_fn()
+
+    def _on_confirm(self):
+        if self._ic_a and self._ic_b:
+            self.confirmed.emit(self._ic_a, self._ic_b)
+            self.hide()
+
+    def _do_cancel(self):
+        self._on_cancel()
+        self.hide()
+
+    def closeEvent(self, e):
+        self._on_cancel()
+        e.accept()
+
+# =========================================================
+# RUN WORKER
+# =========================================================
+class RunWorker(QtCore.QThread):
+    """
+    Background inspection loop.
+
+    MANUAL=True  + CAMERA='directory': waits for trigger() call per cycle
+    MANUAL=False + CAMERA='directory': auto-loops with short delay between cycles
+    CAMERA='camera': waits for GPIO START_PIN (or trigger() if MANUAL=True)
+    """
+    sig_image    = QtCore.pyqtSignal(object)     # annotated BGR ndarray
+    sig_result   = QtCore.pyqtSignal(bool, bool) # ic_a_pass, ic_b_pass
+    sig_fail     = QtCore.pyqtSignal(object)     # MarkMissingError
+    sig_error    = QtCore.pyqtSignal(str)
+    sig_status   = QtCore.pyqtSignal(str)
+    sig_cycle_ms = QtCore.pyqtSignal(float)
+
+    def __init__(self, camera: Camera, inspector: Inspector,
+                 gpio: RaspberryIO, logger: Logger,
+                 cfg: dict, parent=None):
+        super().__init__(parent)
+        self._camera    = camera
+        self._inspector = inspector
+        self._gpio      = gpio
+        self._logger    = logger
+        self._cfg       = cfg
+        self._stop      = False
+        self._trigger   = QtCore.QSemaphore(0)
+
+    def trigger(self):
+        """Called from UI thread to start one inspection cycle."""
+        self._trigger.release()
+
+    def stop(self):
+        self._stop = True
+        self._trigger.release()
+
+    def run(self):
+        manual  = self._cfg.get("MANUAL", True)
+        cam_mode = self._cfg.get("CAMERA", "directory")
+        mode    = self._cfg.get("MODE", "DEBUG")
+        io_mock = not self._cfg.get("IO", False)
+        output_dir = "output"
+        os.makedirs(output_dir, exist_ok=True)
+
+        self.sig_status.emit("Running…")
+
+        while not self._stop:
+            # --- wait for trigger ---
+            if manual or cam_mode == "camera":
+                if cam_mode == "camera":
+                    self.sig_status.emit("Waiting for START signal…")
+                    triggered = self._gpio.wait_for_start(lambda: self._stop)
+                    if not triggered or self._stop:
+                        break
+                else:
+                    self.sig_status.emit("Waiting for trigger…")
+                    self._trigger.acquire()
+                    if self._stop:
+                        break
+            else:
+                # auto mode: short pause between cycles
+                time.sleep(0.05)
+                if self._stop:
+                    break
+
+            t0 = time.perf_counter()
+            try:
+                img_bgr  = self._camera.grab()
+                img_id   = _next_image_id()
+                image    = Image(id=img_id, raw=img_bgr.copy())
+
+                self.sig_status.emit("Inspecting…")
+                try:
+                    ia_pass, ib_pass, miss_a, miss_b, annotated = \
+                        self._inspector.inspect(img_bgr, debug=self._cfg.get("DEBUG", False))
+                    image.annotated = annotated
+
+                    cycle_ms = (time.perf_counter() - t0) * 1000
+                    self.sig_image.emit(annotated)
+                    self.sig_result.emit(ia_pass, ib_pass)
+                    self.sig_cycle_ms.emit(cycle_ms)
+                    self._logger.log_inspection(
+                        img_id, "PASS", [], "PASS", [],
+                        cycle_ms, mode, io_mock)
+
+                    self._gpio.set_fail_a(False)
+                    self._gpio.set_fail_b(False)
+                    self._gpio.pulse_ack()
+
+                except MarkMissingError as e:
+                    cycle_ms = (time.perf_counter() - t0) * 1000
+                    miss_a = e.missing_cells if e.ic_position == "A" else []
+                    miss_b = e.missing_cells if e.ic_position == "B" else []
+
+                    # draw ROI overlays on raw image for annotation
+                    _, _, _, _, annotated = self._run_annotate_fail(
+                        img_bgr, miss_a, miss_b)
+                    image.annotated = annotated
+                    self.sig_image.emit(annotated)
+                    self.sig_fail.emit(e)
+                    self.sig_cycle_ms.emit(cycle_ms)
+
+                    self._logger.log_inspection(
+                        img_id,
+                        "FAIL" if miss_a else "PASS", miss_a,
+                        "FAIL" if miss_b else "PASS", miss_b,
+                        cycle_ms, mode, io_mock)
+
+                    raw_path = os.path.join(output_dir, f"{img_id}_R.png")
+                    ann_path = os.path.join(output_dir, f"{img_id}.png")
+                    cv2.imwrite(raw_path, img_bgr)
+                    cv2.imwrite(ann_path, annotated)
+
+                    self._gpio.set_fail_a(bool(miss_a))
+                    self._gpio.set_fail_b(bool(miss_b))
+                    self._gpio.pulse_ack()
+
+            except CameraError as e:
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                self._logger.log_error("CAMERA_ERROR", str(e), cycle_ms)
+                self.sig_error.emit(f"Camera error: {e}")
+                break
+            except Exception as e:
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
+                self.sig_error.emit(f"Unexpected error: {e}")
+                break
+
+            # DONE signal (camera mode) or auto-advance
+            if cam_mode == "camera":
+                self._gpio.wait_for_done(lambda: self._stop)
+                self._gpio.clear_outputs()
+            elif not manual and not self._camera.has_more():
+                self._camera.reset()
+
+        self._gpio.clear_outputs()
+        self.sig_status.emit("Stopped.")
+
+    def _run_annotate_fail(self, image_bgr, miss_a, miss_b):
+        """Draw all ROI boxes — green=present, red=missing — without running inference again."""
+        try:
+            tmpl = TemplateManager.load()
+        except TemplateError:
+            return False, False, miss_a, miss_b, image_bgr.copy()
+        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(tmpl)
+        annotated = image_bgr.copy()
+        for idx, (x, y, w, h) in enumerate(ic_a_cells):
+            row, col = idx // 2 + 1, idx % 2 + 1
+            fail = [row, col] in miss_a
+            color = (0, 0, 220) if fail else (0, 200, 0)
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+        for idx, (x, y, w, h) in enumerate(ic_b_cells):
+            row, col = idx // 2 + 1, idx % 2 + 1
+            fail = [row, col] in miss_b
+            color = (0, 0, 220) if fail else (0, 200, 0)
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+        return False, False, miss_a, miss_b, annotated
+
+# =========================================================
+# MAIN WINDOW
+# =========================================================
+_OUTPUT_DIR = "output"
+
+class MainWindow(QtWidgets.QMainWindow):
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.setWindowTitle("ClearIC Inspect")
+        self._cfg      = cfg
+        self._camera:  Camera | None = None
+        self._detector: Detector | None = None
+        self._gpio     = None
+        self._logger   = Logger()
+        self._worker:  RunWorker | None = None
+
+        self._stats_pass  = 0
+        self._stats_fail  = 0
+        self._stats_error = 0
+
+        # setup state
+        self._setup_panel:  SetupPanel | None = None
+        self._pending_ic_a: QtCore.QRect | None = None
+        self._pending_ic_b: QtCore.QRect | None = None
+
+        screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
+        self.move(screen.x() + int(screen.width() * 0.05),
+                  screen.y() + int(screen.height() * 0.05))
+
+        self._build_ui()
+        self._init_system()
+
+    # ----------------------------------------------------------
+    # UI construction
+    # ----------------------------------------------------------
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        central.setObjectName("root")
+        self.setCentralWidget(central)
+
+        root = QtWidgets.QHBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        # ── Left panel ───────────────────────────────────────
+        left_frame = QtWidgets.QFrame()
+        left_frame.setObjectName("main_view")
+        left_lay = QtWidgets.QVBoxLayout(left_frame)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+        left_lay.setSpacing(6)
+
+        self._view = ImageView()
+        left_lay.addWidget(self._view, stretch=1)
+
+        # Error banner (hidden by default)
+        self._error_banner = QtWidgets.QFrame()
+        self._error_banner.setObjectName("error_banner")
+        eb_lay = QtWidgets.QHBoxLayout(self._error_banner)
+        eb_lay.setContentsMargins(8, 4, 8, 4)
+        self._error_lbl = QtWidgets.QLabel("")
+        self._error_lbl.setStyleSheet("color:#FFFFFF;font-weight:bold")
+        eb_lay.addWidget(self._error_lbl)
+        self._error_banner.hide()
+        left_lay.addWidget(self._error_banner)
+
+        # Badge area
+        badge_frame = QtWidgets.QFrame()
+        badge_frame.setObjectName("badge_area")
+        badge_lay = QtWidgets.QHBoxLayout(badge_frame)
+        badge_lay.setSpacing(10)
+
+        self._badge_a = self._make_badge("IC_A")
+        self._badge_b = self._make_badge("IC_B")
+        badge_lay.addWidget(self._badge_a)
+        badge_lay.addWidget(self._badge_b)
+        badge_lay.addStretch()
+        left_lay.addWidget(badge_frame)
+
+        # Stats area
+        stats_frame = QtWidgets.QFrame()
+        stats_frame.setObjectName("stats_area")
+        stats_lay = QtWidgets.QHBoxLayout(stats_frame)
+        stats_lay.setSpacing(16)
+
+        self._lbl_status   = self._stat_pair(stats_lay, "Status",    "IDLE")
+        self._lbl_pass     = self._stat_pair(stats_lay, "Pass",      "0")
+        self._lbl_fail     = self._stat_pair(stats_lay, "Fail",      "0")
+        self._lbl_error    = self._stat_pair(stats_lay, "Error",     "0")
+        self._lbl_cycle_ms = self._stat_pair(stats_lay, "Last (ms)", "—")
+        stats_lay.addStretch()
+        left_lay.addWidget(stats_frame)
+
+        root.addWidget(left_frame, stretch=1)
+
+        # ── Right panel ──────────────────────────────────────
+        right_frame = QtWidgets.QFrame()
+        right_frame.setObjectName("panel_right")
+        right_frame.setFixedWidth(240)
+        right_lay = QtWidgets.QVBoxLayout(right_frame)
+        right_lay.setContentsMargins(8, 8, 8, 8)
+        right_lay.setSpacing(8)
+
+        # Setup section
+        setup_frame = QtWidgets.QFrame()
+        setup_frame.setObjectName("setup_frame")
+        setup_lay = QtWidgets.QVBoxLayout(setup_frame)
+        setup_lay.setSpacing(6)
+
+        lbl_setup = QtWidgets.QLabel("Setup")
+        lbl_setup.setStyleSheet("font-weight:bold;font-size:13px")
+        setup_lay.addWidget(lbl_setup)
+
+        lbl_exp = QtWidgets.QLabel("Exposure (µs)")
+        lbl_exp.setStyleSheet("font-weight:bold")
+        setup_lay.addWidget(lbl_exp)
+        self._input_exposure = QtWidgets.QLineEdit(
+            str(self._cfg.get("EXPOSURE_US", 8000)))
+        setup_lay.addWidget(self._input_exposure)
+
+        self._btn_detect = QtWidgets.QPushButton("Auto Detect")
+        self._btn_detect.clicked.connect(self._start_auto_detect)
+        setup_lay.addWidget(self._btn_detect)
+
+        self._btn_save_tmpl = QtWidgets.QPushButton("Save Template")
+        self._btn_save_tmpl.setEnabled(False)
+        self._btn_save_tmpl.clicked.connect(self._save_template)
+        setup_lay.addWidget(self._btn_save_tmpl)
+
+        right_lay.addWidget(setup_frame)
+
+        # Controls section
+        ctrl_frame = QtWidgets.QFrame()
+        ctrl_frame.setObjectName("controls_frame")
+        ctrl_lay = QtWidgets.QVBoxLayout(ctrl_frame)
+        ctrl_lay.setSpacing(6)
+
+        lbl_ctrl = QtWidgets.QLabel("Controls")
+        lbl_ctrl.setStyleSheet("font-weight:bold;font-size:13px")
+        ctrl_lay.addWidget(lbl_ctrl)
+
+        self._btn_run = QtWidgets.QPushButton("▶  Start Run")
+        self._btn_run.clicked.connect(self._start_run)
+        ctrl_lay.addWidget(self._btn_run)
+
+        self._btn_trigger = QtWidgets.QPushButton("Manual Trigger")
+        self._btn_trigger.setEnabled(False)
+        self._btn_trigger.clicked.connect(self._manual_trigger)
+        ctrl_lay.addWidget(self._btn_trigger)
+
+        self._btn_stop = QtWidgets.QPushButton("■  Stop")
+        self._btn_stop.setEnabled(False)
+        self._btn_stop.clicked.connect(self._stop_run)
+        ctrl_lay.addWidget(self._btn_stop)
+
+        right_lay.addWidget(ctrl_frame)
+        right_lay.addStretch()
+
+        root.addWidget(right_frame)
+
+    def _make_badge(self, label: str) -> QtWidgets.QFrame:
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("badge_idle")
+        lay = QtWidgets.QVBoxLayout(frame)
+        lay.setContentsMargins(8, 6, 8, 6)
+        top = QtWidgets.QLabel(label)
+        top.setStyleSheet("font-weight:bold;font-size:12px")
+        top.setAlignment(QtCore.Qt.AlignCenter)
+        result = QtWidgets.QLabel("—")
+        result.setObjectName("stat_value")
+        result.setStyleSheet("font-size:16px;font-weight:bold")
+        result.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(top)
+        lay.addWidget(result)
+        frame._result_lbl = result
+        return frame
+
+    def _update_badge(self, frame: QtWidgets.QFrame, passed: bool | None):
+        if passed is None:
+            frame.setObjectName("badge_idle")
+            frame._result_lbl.setText("—")
+        elif passed:
+            frame.setObjectName("badge_pass")
+            frame._result_lbl.setText("PASS")
+            frame._result_lbl.setStyleSheet(
+                "font-size:16px;font-weight:bold;color:#5465FF")
+        else:
+            frame.setObjectName("badge_fail")
+            frame._result_lbl.setText("FAIL")
+            frame._result_lbl.setStyleSheet(
+                "font-size:16px;font-weight:bold;color:#FFFFFF")
+        frame.style().unpolish(frame)
+        frame.style().polish(frame)
+
+    def _stat_pair(self, parent_lay, label: str, value: str) -> QtWidgets.QLabel:
+        col = QtWidgets.QVBoxLayout()
+        lbl = QtWidgets.QLabel(label)
+        lbl.setStyleSheet("font-size:9px;color:#E2FDFF")
+        val = QtWidgets.QLabel(value)
+        val.setObjectName("stat_value")
+        val.setStyleSheet("font-size:12px;font-weight:bold;color:#E2FDFF")
+        col.addWidget(lbl, alignment=QtCore.Qt.AlignCenter)
+        col.addWidget(val, alignment=QtCore.Qt.AlignCenter)
+        parent_lay.addLayout(col)
+        return val
+
+    # ----------------------------------------------------------
+    # System init
+    # ----------------------------------------------------------
+    def _init_system(self):
+        cfg = self._cfg
+        try:
+            self._detector = Detector(
+                conf_thr=cfg.get("CONF_THR", 0.9),
+                nms_thr=cfg.get("NMS_IOU_THR", 0.45),
+            )
+        except ModelError as e:
+            self._show_error(f"Model load failed: {e}")
+
+        try:
+            self._gpio = RaspberryIO(io_enabled=cfg.get("IO", False))
+        except GPIOError as e:
+            self._show_error(f"GPIO init failed: {e}")
+
+        try:
+            self._camera = Camera(
+                mode=cfg.get("CAMERA", "directory"),
+                serial=cfg.get("CAMERA_SERIAL", ""),
+                exposure_us=cfg.get("EXPOSURE_US", 8000),
+            )
+            self._camera.open()
+        except CameraError as e:
+            self._show_error(f"Camera init failed: {e}")
+
+        if self._camera and cfg.get("CAMERA") == "camera":
+            self._camera.warmup()
+        if self._detector and self._detector.is_ready():
+            self._detector.warmup()
+
+        try:
+            tmpl = TemplateManager.load()
+            self._show_template_overlays(tmpl)
+            self._btn_save_tmpl.setEnabled(True)
+        except TemplateError:
+            pass
+
+        manual = cfg.get("MANUAL", True)
+        self._btn_trigger.setEnabled(False)
+
+    # ----------------------------------------------------------
+    # Auto Detect flow
+    # ----------------------------------------------------------
+    def _start_auto_detect(self):
+        if not self._detector or not self._detector.is_ready():
+            self._show_error("Detector not ready — check model file.")
+            return
+        if self._camera is None:
+            self._show_error("Camera not ready.")
+            return
+
+        try:
+            img = self._camera.grab()
+        except CameraError as e:
+            self._show_error(str(e))
+            return
+
+        self._current_detect_image = img
+        self._view.set_image(img)
+        self._view.clear_overlays()
+        self._run_detection(img)
+
+        if self._setup_panel is None or not self._setup_panel.isVisible():
+            self._setup_panel = SetupPanel(
+                on_cancel=self._cancel_detect, parent=self)
+            self._setup_panel.set_retry_fn(lambda: self._run_detection(
+                self._current_detect_image))
+            self._setup_panel.confirmed.connect(self._on_detect_confirmed)
+            geo = self.geometry()
+            pw  = self._setup_panel.sizeHint().width()
+            self._setup_panel.move(geo.right() - pw - 20, geo.top() + 60)
+            self._setup_panel.show()
+
+    def _run_detection(self, img: np.ndarray):
+        if not self._detector:
+            return
+        rects = self._detector.detect_all(img)
+        self._view.clear_overlays()
+        ic_a = ic_b = None
+        for i, rect in enumerate(rects[:2]):
+            color = QtGui.QColor("#FFD700") if i == 0 else QtGui.QColor("#00E5FF")
+            label = "IC_A" if i == 0 else "IC_B"
+            self._view.add_overlay(rect, color, label)
+            if i == 0:
+                ic_a = rect
+            else:
+                ic_b = rect
+        if self._setup_panel:
+            self._setup_panel.show_result(ic_a, ic_b, len(rects))
+        self._pending_ic_a = ic_a
+        self._pending_ic_b = ic_b
+
+    def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
+        self._pending_ic_a = ic_a
+        self._pending_ic_b = ic_b
+        self._btn_save_tmpl.setEnabled(True)
+
+    def _cancel_detect(self):
+        self._view.clear_overlays()
+        self._pending_ic_a = None
+        self._pending_ic_b = None
+
+    def _save_template(self):
+        if not self._pending_ic_a or not self._pending_ic_b:
+            QtWidgets.QMessageBox.warning(
+                self, "No Detection",
+                "Run 'Auto Detect' and confirm IC_A and IC_B first.")
+            return
+        try:
+            exposure = int(self._input_exposure.text())
+        except ValueError:
+            exposure = 8000
+        TemplateManager.save(self._pending_ic_a, self._pending_ic_b, exposure)
+        QtWidgets.QMessageBox.information(
+            self, "Saved", "Template saved to templates/template.json")
+        try:
+            tmpl = TemplateManager.load()
+            self._show_template_overlays(tmpl)
+        except TemplateError:
+            pass
+
+    def _show_template_overlays(self, tmpl: dict):
+        self._view.clear_overlays()
+        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(tmpl)
+        for x, y, w, h in ic_a_cells:
+            self._view.add_overlay(
+                QtCore.QRect(x, y, w, h), QtGui.QColor("#BFD7FF"), "")
+        for x, y, w, h in ic_b_cells:
+            self._view.add_overlay(
+                QtCore.QRect(x, y, w, h), QtGui.QColor("#9BB1FF"), "")
+
+    # ----------------------------------------------------------
+    # Run / Stop
+    # ----------------------------------------------------------
+    def _start_run(self):
+        if self._worker and self._worker.isRunning():
+            return
+        try:
+            tmpl = TemplateManager.load()
+        except TemplateError as e:
+            self._show_error(str(e))
+            return
+        if not self._detector or not self._detector.is_ready():
+            self._show_error("Detector not ready.")
+            return
+
+        inspector = Inspector(self._detector, tmpl)
+        gpio      = self._gpio or RaspberryIO(io_enabled=False)
+
+        self._worker = RunWorker(
+            self._camera, inspector, gpio, self._logger, self._cfg)
+        self._worker.sig_image.connect(self._on_image)
+        self._worker.sig_result.connect(self._on_result)
+        self._worker.sig_fail.connect(self._on_fail)
+        self._worker.sig_error.connect(self._on_worker_error)
+        self._worker.sig_status.connect(self._lbl_status.setText)
+        self._worker.sig_cycle_ms.connect(
+            lambda ms: self._lbl_cycle_ms.setText(f"{ms:.0f}"))
+        self._worker.start()
+
+        self._btn_run.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        manual = self._cfg.get("MANUAL", True)
+        self._btn_trigger.setEnabled(manual)
+
+    def _stop_run(self):
+        if self._worker:
+            self._worker.stop()
+            self._worker.wait(3000)
+        self._btn_run.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._btn_trigger.setEnabled(False)
+        self._lbl_status.setText("Stopped.")
+
+    def _manual_trigger(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.trigger()
+
+    # ----------------------------------------------------------
+    # Worker signal handlers
+    # ----------------------------------------------------------
+    def _on_image(self, img: np.ndarray):
+        self._view.set_image(img)
+
+    def _on_result(self, ia_pass: bool, ib_pass: bool):
+        self._update_badge(self._badge_a, ia_pass)
+        self._update_badge(self._badge_b, ib_pass)
+        if ia_pass and ib_pass:
+            self._stats_pass += 1
+        self._lbl_pass.setText(str(self._stats_pass))
+        self._lbl_fail.setText(str(self._stats_fail))
+
+    def _on_fail(self, err: MarkMissingError):
+        self._stats_fail += 1
+        miss_a = err.missing_cells if err.ic_position == "A" else []
+        miss_b = err.missing_cells if err.ic_position == "B" else []
+        self._update_badge(self._badge_a, len(miss_a) == 0)
+        self._update_badge(self._badge_b, len(miss_b) == 0)
+        self._lbl_fail.setText(str(self._stats_fail))
+        dlg = FailDialog(miss_a, miss_b, self)
+        dlg.exec_()
+
+    def _on_worker_error(self, msg: str):
+        self._stats_error += 1
+        self._lbl_error.setText(str(self._stats_error))
+        self._show_error(msg)
+        self._btn_run.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._btn_trigger.setEnabled(False)
+
+    # ----------------------------------------------------------
+    # Error banner
+    # ----------------------------------------------------------
+    def _show_error(self, msg: str):
+        self._error_lbl.setText(f"Error: {msg}")
+        self._error_banner.show()
+
+    def _clear_error(self):
+        self._error_banner.hide()
+
+    # ----------------------------------------------------------
+    # Close
+    # ----------------------------------------------------------
+    def closeEvent(self, e):
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(3000)
+        if self._camera:
+            self._camera.close()
+        if self._gpio:
+            self._gpio.cleanup()
+        e.accept()
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
+def main():
+    try:
+        cfg = ConfigLoader.load()
+    except ConfigError as e:
+        print(f"[Config] {e}")
+        sys.exit(1)
+
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    os.makedirs("templates", exist_ok=True)
+
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(STYLE)
+
+    pal = QtGui.QPalette()
+    for role, col in [
+        (QtGui.QPalette.Window,          (84,  101, 255)),
+        (QtGui.QPalette.WindowText,      (255, 255, 255)),
+        (QtGui.QPalette.Base,            (120, 139, 255)),
+        (QtGui.QPalette.Text,            (255, 255, 255)),
+        (QtGui.QPalette.Button,          (84,  101, 255)),
+        (QtGui.QPalette.ButtonText,      (255, 255, 255)),
+        (QtGui.QPalette.Highlight,       (191, 215, 255)),
+        (QtGui.QPalette.HighlightedText, ( 84, 101, 255)),
+    ]:
+        pal.setColor(role, QtGui.QColor(*col))
+    app.setPalette(pal)
+
+    win = MainWindow(cfg)
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

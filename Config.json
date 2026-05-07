@@ -1,0 +1,11 @@
+{
+  "DEBUG": true,
+  "CAMERA": "directory",
+  "IO": false,
+  "MODE": "DEBUG",
+  "MANUAL": true,
+  "CONF_THR": 0.9,
+  "NMS_IOU_THR": 0.45,
+  "CAMERA_SERIAL": "",
+  "EXPOSURE_US": 8000
+}

@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QDoubleSpinBox, QSpinBox, QHBoxLayout, QVBoxLayout,
     QDialog, QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QFont
 
 try:
@@ -34,14 +34,14 @@ CAMERA = "directory"   # "camera" | "directory"
 IO     = False          # True = real GPIO pins, False = mock / log
 MODE   = "DEBUG"        # "RUN" | "DEBUG"
 
-IMAGE_DIR = "test_images/"
+IMAGE_DIR = "Input" #Debug mode image folder 
 
 # ─── GPIO Pin Assignment (BCM) ────────────────────────────────────────────────
 
 START_PIN  = 17   # IN  — rising edge = start inspection
 DONE_PIN   = 27   # IN  — rising edge from machine = stop / return to standby
 ACK_PIN    = 22   # OUT — pulse HIGH when result is ready
-RESULT_PIN = 23   # OUT — HIGH = PASS, LOW = FAIL
+# RESULT_PIN = 23   # OUT — HIGH = PASS, LOW = FAIL
 FAIL_A_PIN = 24   # OUT — HIGH = IC_A failed
 FAIL_B_PIN = 25   # OUT — HIGH = IC_B failed
 
@@ -133,7 +133,7 @@ class Image:
 # ─── Camera ───────────────────────────────────────────────────────────────────
 
 class Camera:
-    """Acquires frames from a Basler camera or a directory of images.
+    """Acquires frames from a Basler camera or image files in the 'input/' folder.
 
     CAMERA="camera"    — live Basler feed via Pylon SDK.
     CAMERA="directory" — loads image files from IMAGE_DIR in sorted order,
@@ -170,7 +170,7 @@ class Camera:
 
     def _open_directory(self):
         if not os.path.isdir(IMAGE_DIR):
-            raise CameraError(f"Image directory not found: '{IMAGE_DIR}'")
+            raise CameraError(f"Input folder not found: '{IMAGE_DIR}'")
         _EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
         self._files = sorted(
             os.path.join(IMAGE_DIR, name)
@@ -264,7 +264,8 @@ class RaspberryIO:
             GPIO.setwarnings(False)
             GPIO.setup(START_PIN, GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
             GPIO.setup(DONE_PIN,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            for pin in (ACK_PIN, RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN):
+            # for pin in (ACK_PIN, RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN):
+            for pin in (ACK_PIN, FAIL_A_PIN, FAIL_B_PIN):
                 GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
             GPIO.add_event_detect(START_PIN, GPIO.RISING,
                                   callback=self._on_start_edge, bouncetime=50)
@@ -292,14 +293,15 @@ class RaspberryIO:
     def set_result(self, passed: bool, fail_a: bool, fail_b: bool):
         """Set RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN before pulse_ack()."""
         if IO and _GPIO_AVAILABLE:
-            GPIO.output(RESULT_PIN, GPIO.HIGH if passed else GPIO.LOW)
+            #GPIO.output(RESULT_PIN, GPIO.HIGH if passed else GPIO.LOW)
             GPIO.output(FAIL_A_PIN, GPIO.HIGH if fail_a  else GPIO.LOW)
             GPIO.output(FAIL_B_PIN, GPIO.HIGH if fail_b  else GPIO.LOW)
         else:
-            r = "HIGH" if passed else "LOW"
+            # r = "HIGH" if passed else "LOW"
             a = "HIGH" if fail_a  else "LOW"
             b = "HIGH" if fail_b  else "LOW"
-            print(f"[IO MOCK] RESULT_PIN → {r}  FAIL_A_PIN → {a}  FAIL_B_PIN → {b}")
+            # print(f"[IO MOCK] RESULT_PIN → {r}  FAIL_A_PIN → {a}  FAIL_B_PIN → {b}")
+            print(f"[IO MOCK] FAIL_A_PIN → {a}  FAIL_B_PIN → {b}")
 
     def pulse_ack(self):
         """Pulse ACK_PIN HIGH for 100 ms — machine reads outputs on this edge."""
@@ -313,10 +315,13 @@ class RaspberryIO:
     def clear_outputs(self):
         """Drive all output pins LOW — called on DONE or graceful shutdown."""
         if IO and _GPIO_AVAILABLE:
-            for pin in (RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN, ACK_PIN):
+            #for pin in (RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN, ACK_PIN):
+            for pin in (FAIL_A_PIN, FAIL_B_PIN, ACK_PIN):
                 GPIO.output(pin, GPIO.LOW)
         else:
-            for name in ("RESULT_PIN", "FAIL_A_PIN", "FAIL_B_PIN", "ACK_PIN"):
+            #for name in ("RESULT_PIN", "FAIL_A_PIN", "FAIL_B_PIN", "ACK_PIN"):
+            for name in ("FAIL_A_PIN", "FAIL_B_PIN", "ACK_PIN"):
+                
                 print(f"[IO MOCK] {name} → LOW")
 
     def release(self):
@@ -344,12 +349,17 @@ STYLE = """
         color: #263238;
         border-radius: 8px;
         padding: 6px 12px;
-        border: 1px solid #00BCD4;
+        border: 1px solid #546E7A;
     }
     QPushButton:hover {
         background-color: #00BCD4;
         color: #FFFFFF;
         border: 1px solid #00BCD4;
+    }
+    QPushButton:disabled {
+        background-color: #546E7A;
+        color: #90A4AE;
+        border: 1px solid #455A64;
     }
     QDoubleSpinBox, QSpinBox {
         background-color: #37474F;
@@ -362,7 +372,7 @@ STYLE = """
         border: 1px solid #00BCD4;
     }
     QLabel {
-        color: #ECEFF1;
+        color: #FFFFFF;
     }
 """
 
@@ -376,7 +386,10 @@ class FailDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Inspection Failed")
         self.setModal(True)
-        self.setStyleSheet("background-color: #37474F; color: #FFFFFF; border-radius: 8px; border: 1px solid #00BCD4;")
+        self.setStyleSheet(
+            "QDialog { background-color: #37474F; border-radius: 8px; }"
+            "QLabel  { color: #FFFFFF; }"
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -392,9 +405,6 @@ class FailDialog(QDialog):
             layout.addWidget(QLabel(f"IC_B FAIL — missing cells: {ic_b_missing}"))
 
         ack_btn = QPushButton("Acknowledge")
-        ack_btn.setStyleSheet(
-            "background-color: #37474F; color: #00BCD4; border-radius: 8px; padding: 6px 24px; border: 1px solid #00BCD4;"
-        )
         ack_btn.clicked.connect(self.accept)
         layout.addWidget(ack_btn, alignment=Qt.AlignCenter)
 
@@ -406,6 +416,10 @@ class FailDialog(QDialog):
 # ─── Main Window ──────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+
+    # Class-level signals so GPIO background thread can safely call Qt UI
+    _sig_start = pyqtSignal()
+    _sig_done  = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -422,6 +436,35 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_main_view(), stretch=3)
         root.addWidget(self._build_right_panel(), stretch=1)
 
+        # ── System state ──────────────────────────────────────────────────────
+        self._stage      = Stage.STANDBY
+        self._error_flag = ErrorFlag.NONE
+        self._stat_pass  = 0
+        self._stat_fail  = 0
+        self._stat_error = 0
+
+        # ── Wire Qt signals (thread-safe GPIO → UI bridge) ────────────────────
+        self._sig_start.connect(self._on_start)
+        self._sig_done.connect(self._on_done)
+
+        # ── Init GPIO ────────────────────────────────────────────────────────
+        try:
+            self._rio = RaspberryIO()
+            self._rio.register_start_callback(self._sig_start.emit)
+            self._rio.register_done_callback(self._sig_done.emit)
+        except GPIOError as exc:
+            self._rio = None
+            self._set_error(ErrorFlag.GPIO_ERROR, str(exc))
+
+        # ── Init Camera ───────────────────────────────────────────────────────
+        try:
+            self._cam = Camera()
+        except CameraError as exc:
+            self._cam = None
+            self._set_error(ErrorFlag.CAMERA_ERROR, str(exc))
+
+        self._refresh_status()
+
     # ── Main view (left) ──────────────────────────────────────────────────────
 
     def _build_main_view(self) -> QFrame:
@@ -434,7 +477,9 @@ class MainWindow(QMainWindow):
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.image_label.setStyleSheet("background-color: #263238; border-radius: 8px; border: 1px solid #455A64;")
+        self.image_label.setStyleSheet(
+            "background-color: #263238; border-radius: 8px; border: 1px solid #455A64;"
+        )
         self.image_label.setText("No image")
         layout.addWidget(self.image_label, stretch=1)
 
@@ -471,14 +516,16 @@ class MainWindow(QMainWindow):
         badge.setAlignment(Qt.AlignCenter)
         badge.setFixedSize(110, 56)
         badge.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        badge.setStyleSheet("background-color: #37474F; border-radius: 8px; padding: 4px; border: 1px solid #455A64;")
+        badge.setStyleSheet(
+            "background-color: #37474F; border-radius: 8px; padding: 4px; border: 1px solid #455A64;"
+        )
         return badge
 
     # ── Right panel ───────────────────────────────────────────────────────────
 
     def _build_right_panel(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("background-color: #37474F; border-radius: 8px; border: 1px solid #00BCD4;")
+        frame.setStyleSheet("background-color: #37474F; border-radius: 8px; border: 1px solid #455A64;")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
@@ -539,18 +586,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
 
-        self.lbl_status = QLabel("Status: Idle")
+        self.lbl_status     = QLabel("Status: Standby")
         self.lbl_status.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.lbl_status.setStyleSheet("color: #00BCD4;")
         layout.addWidget(self.lbl_status)
 
-        self.lbl_pass       = QLabel("Pass:       0")
-        self.lbl_fail       = QLabel("Fail:       0")
-        self.lbl_start_time = QLabel("Start at:  —")
+        self.lbl_pass       = QLabel("Pass:  0")
+        self.lbl_fail       = QLabel("Fail:  0")
+        self.lbl_error_cnt  = QLabel("Error: 0")
         self.lbl_cycle_time = QLabel("Last cycle: — ms")
 
-        for lbl in (self.lbl_pass, self.lbl_fail, self.lbl_start_time, self.lbl_cycle_time):
-            lbl.setStyleSheet("color: #ECEFF1;")
+        for lbl in (self.lbl_pass, self.lbl_fail, self.lbl_error_cnt, self.lbl_cycle_time):
             layout.addWidget(lbl)
 
         return frame
@@ -560,7 +605,6 @@ class MainWindow(QMainWindow):
     def _section_title(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        lbl.setStyleSheet("color: #00BCD4;")
         return lbl
 
     def _labeled_spinbox(self, layout: QVBoxLayout, label: str,
@@ -582,48 +626,130 @@ class MainWindow(QMainWindow):
         layout.addWidget(spin)
         return spin
 
-    # ── Public update API (called by inspection logic) ────────────────────────
+    # ── Inspection cycle ──────────────────────────────────────────────────────
 
-    def update_image(self, frame: np.ndarray):
-        """Display a BGR numpy frame in the image label."""
+    def _on_start(self):
+        """Runs on the Qt main thread via _sig_start signal."""
+        if self._stage == Stage.BUSY:
+            print("[IO] START ignored — busy")
+            return
+
+        self._stage = Stage.BUSY
+        self.error_banner.hide()
+        self._refresh_status()
+        self.btn_trigger.setEnabled(False)
+
+        t0 = time.time()
+        try:
+            if self._cam is None:
+                raise CameraError("Camera not initialized")
+
+            img = self._cam.capture()
+            self._display_image(img.frame)
+
+            # ── Detection placeholder ──────────────────────────────────────
+            # TODO: replace with real YOLO/OpenVINO inference
+            ic_a_passed  = True
+            ic_b_passed  = True
+            ic_a_missing: list = []
+            ic_b_missing: list = []
+            # ──────────────────────────────────────────────────────────────
+
+            overall = ic_a_passed and ic_b_passed
+            self._update_badge("A", ic_a_passed)
+            self._update_badge("B", ic_b_passed)
+
+            if self._rio:
+                self._rio.set_result(
+                    passed=overall,
+                    fail_a=not ic_a_passed,
+                    fail_b=not ic_b_passed,
+                )
+                self._rio.pulse_ack()
+
+            cycle_ms = (time.time() - t0) * 1000
+
+            if overall:
+                self._stat_pass += 1
+            else:
+                self._stat_fail += 1
+                self.show_fail_dialog(ic_a_missing, ic_b_missing)
+
+            self._refresh_stats(cycle_ms)
+
+        except CameraError as exc:
+            self._stat_error += 1
+            self._set_error(ErrorFlag.CAMERA_ERROR, f"Camera error: {exc}")
+            if self._rio:
+                self._rio.set_result(passed=False, fail_a=False, fail_b=False)
+                self._rio.pulse_ack()
+
+        except Exception as exc:
+            self._stat_error += 1
+            self._set_error(ErrorFlag.CAMERA_ERROR, str(exc))
+
+        finally:
+            if self._error_flag == ErrorFlag.NONE:
+                self._stage = Stage.STANDBY
+            self.btn_trigger.setEnabled(True)
+            self._refresh_status()
+
+    def _on_done(self):
+        """DONE_PIN handler — clear outputs and return to standby."""
+        if self._rio:
+            self._rio.clear_outputs()
+        self._stage      = Stage.STANDBY
+        self._error_flag = ErrorFlag.NONE
+        self.error_banner.hide()
+        self._refresh_status()
+        print("[IO] Returning to standby")
+
+    # ── Internal UI updaters ──────────────────────────────────────────────────
+
+    def _display_image(self, frame: np.ndarray):
         rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.image_label.setPixmap(
-            QPixmap.fromImage(img).scaled(
+            QPixmap.fromImage(qimg).scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
         )
 
-    def update_result(self, ic: str, passed: bool):
-        """Update IC_A or IC_B badge. ic = 'A' or 'B'."""
-        badge  = self.badge_a if ic == "A" else self.badge_b
-        text   = f"IC_{ic}\n{'PASS' if passed else 'FAIL'}"
-        color  = "#00BCD4" if passed else "#EF5350"
-        badge.setText(text)
+    def _update_badge(self, ic: str, passed: bool):
+        badge = self.badge_a if ic == "A" else self.badge_b
+        color = "#00BCD4" if passed else "#EF5350"
+        badge.setText(f"IC_{ic}\n{'PASS' if passed else 'FAIL'}")
         badge.setStyleSheet(
             f"background-color: #37474F; color: {color}; border: 1px solid {color};"
             "border-radius: 8px; padding: 4px;"
         )
 
-    def show_error(self, message: str):
-        self.error_banner.setText(message)
-        self.error_banner.show()
-
-    def clear_error(self):
-        self.error_banner.hide()
-
-    def update_status(self, state: str):
-        """state: 'Idle', 'Run', or 'Error'"""
-        color = {"Idle": "#00BCD4", "Run": "#FFFFFF", "Error": "#EF5350"}.get(state, "#00BCD4")
-        self.lbl_status.setText(f"Status: {state}")
+    def _refresh_status(self):
+        labels = {
+            Stage.STANDBY: ("Standby", "#FFFFFF"),
+            Stage.BUSY:    ("Running", "#FFFFFF"),
+            Stage.ERROR:   ("Error",   "#EF5350"),
+        }
+        text, color = labels[self._stage]
+        self.lbl_status.setText(f"Status: {text}")
         self.lbl_status.setStyleSheet(f"color: {color};")
 
-    def update_stats(self, passed: int, failed: int, start_time: str, cycle_ms: float):
-        self.lbl_pass.setText(f"Pass:       {passed}")
-        self.lbl_fail.setText(f"Fail:       {failed}")
-        self.lbl_start_time.setText(f"Start at:  {start_time}")
-        self.lbl_cycle_time.setText(f"Last cycle: {cycle_ms:.0f} ms")
+    def _refresh_stats(self, cycle_ms: float = None):
+        self.lbl_pass.setText(f"Pass:  {self._stat_pass}")
+        self.lbl_fail.setText(f"Fail:  {self._stat_fail}")
+        self.lbl_error_cnt.setText(f"Error: {self._stat_error}")
+        if cycle_ms is not None:
+            self.lbl_cycle_time.setText(f"Last cycle: {cycle_ms:.0f} ms")
+
+    def _set_error(self, flag: ErrorFlag, message: str):
+        self._error_flag = flag
+        self._stage      = Stage.ERROR
+        self.error_banner.setText(message)
+        self.error_banner.show()
+        self._refresh_status()
+
+    # ── Public update API ─────────────────────────────────────────────────────
 
     def show_fail_dialog(self, ic_a_missing: list, ic_b_missing: list):
         FailDialog(ic_a_missing, ic_b_missing, self).exec_()
@@ -640,7 +766,17 @@ class MainWindow(QMainWindow):
         pass
 
     def on_manual_trigger(self):
-        pass
+        self._sig_start.emit()
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        if self._rio:
+            self._rio.clear_outputs()
+            self._rio.release()
+        if self._cam:
+            self._cam.release()
+        event.accept()
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────

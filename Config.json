@@ -1,6 +1,6 @@
 {
   "CAMERA": "directory",
-  "CONF_THR": 0.9,
+  "CONF_THR": 0.85,
   "NMS_IOU_THR": 0.45,
   "CAMERA_SERIAL": "",
   "EXPOSURE_US": 8000

@@ -747,10 +747,18 @@ class Inspector:
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
-            present = any(
-                self._boxes_intersect(bx, by, bw, bh, cx, cy, cw, ch)
-                for bx, by, bw, bh, *_ in boxes   # ignore conf when checking
-            )
+            # Collect every box that intersects this cell (for debug count)
+            hits = [
+                (bx, by, bw, bh, cf)
+                for bx, by, bw, bh, cf in boxes
+                if self._boxes_intersect(bx, by, bw, bh, cx, cy, cw, ch)
+            ]
+            present = len(hits) > 0
+            if debug:
+                hit_confs = [f"{cf:.3f}" for *_, cf in hits]
+                print(f"[Cell R{row}C{col}] "
+                      f"{'PRESENT' if present else 'ABSENT '} "
+                      f"hits={len(hits)} confs=[{', '.join(hit_confs)}]")
             color = (0, 200, 0) if present else (0, 0, 220)
             x2 = min(annotated.shape[1], cx + cw)
             y2 = min(annotated.shape[0], cy + ch)

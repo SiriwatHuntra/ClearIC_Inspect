@@ -52,7 +52,7 @@ class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
         "CAMERA":        "directory",
-        "CONF_THR":      0.9,
+        "CONF_THR":      0.5,
         "NMS_IOU_THR":   0.45,
         "CAMERA_SERIAL": "",
         "EXPOSURE_US":   8000,
@@ -535,8 +535,10 @@ class Detector:
             if len(indices) == 0:
                 return []
             kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
+            # Returns (x, y, w, h, class_idx, conf) 6-tuples
             return [(raw_boxes[i][0], raw_boxes[i][1],
-                     raw_boxes[i][2], raw_boxes[i][3], classes[i])
+                     raw_boxes[i][2], raw_boxes[i][3],
+                     classes[i], scores[i])
                     for i in kept]
         except Exception as e:
             print(f"[Detector] Inference error: {e}")
@@ -545,11 +547,12 @@ class Detector:
     def detect_full_image(self, image_bgr: np.ndarray) -> list:
         """
         Run YOLO on the full image.
-        Returns only Text class (1) boxes as (x1, y1, w, h) 4-tuples.
+        Returns only Text class (1) boxes as (x1, y1, w, h, conf) 5-tuples.
         IC_Presence (class 0) boxes are excluded — they cover the entire IC area
         and would make every cell appear present even when fonts are absent.
+        Confidence is included so Inspector can annotate each detection.
         """
-        return [(x, y, w, h) for x, y, w, h, cls in self._run_inference(image_bgr)
+        return [(x, y, w, h, cf) for x, y, w, h, cls, cf in self._run_inference(image_bgr)
                 if cls == 1]
 
     def locate_ics(self, image_bgr: np.ndarray) -> tuple:
@@ -563,7 +566,7 @@ class Detector:
         """
         boxes = self._run_inference(image_bgr)
         # Keep only IC_Presence class (0), sort by area descending to get full IC boxes
-        presence = [(x, y, w, h) for x, y, w, h, cls in boxes if cls == 0]
+        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
         if not presence:
             return None, None
         # Among IC_Presence boxes, take the two largest (mold outlines)
@@ -587,7 +590,7 @@ class Detector:
         if not boxes:
             return []
         boxes_sorted = sorted(boxes, key=lambda b: (-b[2] * b[3], b[0]))
-        return [QtCore.QRect(x, y, w, h) for x, y, w, h, _ in boxes_sorted]
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h, _cls, _cf in boxes_sorted]
 
 # =========================================================
 # TEMPLATE MANAGER
@@ -705,8 +708,15 @@ class Inspector:
             else:
                 print("[Inspector] IC_B not found → template fallback → FAIL")
 
-        # Phase 2: check all detection boxes against each IC's cells
-        all_boxes = self._detector.detect_full_image(image_bgr)
+        # Phase 2: check all Text detection boxes against each IC's cells
+        all_boxes = self._detector.detect_full_image(image_bgr)  # (x,y,w,h,conf)
+
+        # Draw every Text detection with cyan box + confidence label
+        for bx, by, bw, bh, bc in all_boxes:
+            cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (255, 200, 0), 1)
+            cv2.putText(annotated, f"{bc:.2f}",
+                        (bx, by - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        (255, 200, 0), 1)
 
         missing_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
         missing_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
@@ -739,7 +749,7 @@ class Inspector:
             col = idx %  2 + 1
             present = any(
                 self._boxes_intersect(bx, by, bw, bh, cx, cy, cw, ch)
-                for bx, by, bw, bh in boxes
+                for bx, by, bw, bh, *_ in boxes   # ignore conf when checking
             )
             color = (0, 200, 0) if present else (0, 0, 220)
             x2 = min(annotated.shape[1], cx + cw)
@@ -1769,8 +1779,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_badge(self._badge_a, len(err.missing_a) == 0)
         self._update_badge(self._badge_b, len(err.missing_b) == 0)
         self._lbl_fail.setText(str(self._stats_fail))
-        dlg = FailDialog(err.missing_a, err.missing_b, self)
-        dlg.exec_()
 
     def _on_worker_error(self, msg: str):
         self._stats_error += 1

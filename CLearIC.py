@@ -1160,6 +1160,8 @@ class RunWorker(QtCore.QThread):
         io_mock  = not IO
         debug    = DEBUG
         os.makedirs("output", exist_ok=True)
+        os.makedirs(os.path.join("Input", "results"), exist_ok=True)
+        input_results = os.path.join("Input", "results")
 
         self.sig_status.emit("Running…")
 
@@ -1207,6 +1209,10 @@ class RunWorker(QtCore.QThread):
                     img_id, "PASS", [], "PASS", [],
                     cycle_ms, mode, io_mock)
 
+                # Save annotated PASS image to output/ and Input/results/
+                cv2.imwrite(os.path.join("output",       f"{img_id}.png"), annotated)
+                cv2.imwrite(os.path.join(input_results,  f"{img_id}.png"), annotated)
+
                 # GPIO: both FAIL pins LOW → pulse ACK
                 self._gpio.set_fail_a(False)
                 self._gpio.set_fail_b(False)
@@ -1226,9 +1232,10 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if e.missing_b else "PASS", e.missing_b,
                     cycle_ms, mode, io_mock)
 
-                # Save raw + annotated images on every FAIL
-                cv2.imwrite(os.path.join("output", f"{img_id}_R.png"), img_bgr)
-                cv2.imwrite(os.path.join("output", f"{img_id}.png"),   annotated)
+                # FAIL: save raw + annotated to output/ and annotated to Input/results/
+                cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
+                cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   annotated)
+                cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   annotated)
 
                 # GPIO: set FAIL pins then pulse ACK
                 self._gpio.set_fail_a(bool(e.missing_a))

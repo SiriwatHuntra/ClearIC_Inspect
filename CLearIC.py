@@ -48,7 +48,7 @@ class ConfigLoader:
         "CAMERA":        "directory",
         "IO":            False,
         "MODE":          "DEBUG",
-        "MANUAL":        True,
+        "MANUAL":        False,
         "CONF_THR":      0.9,
         "NMS_IOU_THR":   0.45,
         "CAMERA_SERIAL": "",
@@ -415,6 +415,12 @@ class RaspberryIO:
                     return True
             time.sleep(0.005)
         return False
+
+    def is_done_signaled(self) -> bool:
+        """Non-blocking: True if DONE_PIN is currently HIGH. Always False in mock mode."""
+        if not self._gpio_ok:
+            return False
+        return self._GPIO.input(DONE_PIN) == self._GPIO.HIGH
 
     def cleanup(self):
         if self._gpio_ok:
@@ -1107,6 +1113,7 @@ class RunWorker(QtCore.QThread):
     sig_error    = QtCore.pyqtSignal(str)
     sig_status   = QtCore.pyqtSignal(str)
     sig_cycle_ms = QtCore.pyqtSignal(float)
+    sig_done     = QtCore.pyqtSignal()           # all directory images processed → standby
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
@@ -1142,22 +1149,26 @@ class RunWorker(QtCore.QThread):
 
             # ── Wait for next cycle trigger ──────────────────────────
             if cam_mode == "camera":
-                # Production / non-debug: wait for GPIO START_PIN rising edge
+                # Production: wait for GPIO START_PIN rising edge
                 self.sig_status.emit("Waiting for START signal…")
                 if not self._gpio.wait_for_start(lambda: self._stop):
-                    break                   # stop() was called
+                    break
                 if self._stop:
                     break
+
             elif manual:
-                # Manual directory mode: wait for Trigger button
+                # Manual directory: wait for Trigger button OR DONE_PIN/Stop
                 self.sig_status.emit("Waiting for trigger…")
-                self._trigger.acquire()
-                if self._stop:
-                    break
+                while not self._stop and not self._gpio.is_done_signaled():
+                    if self._trigger.tryAcquire(1, 50):   # 50 ms poll
+                        break                             # got trigger → inspect
+                else:
+                    break   # _stop=True (Stop button) or DONE_PIN → exit loop
+
             else:
-                # Auto directory mode: brief yield between cycles
+                # Auto directory: brief yield, then check DONE_PIN / Stop
                 time.sleep(0.05)
-                if self._stop:
+                if self._stop or self._gpio.is_done_signaled():
                     break
 
             # ── Capture ─────────────────────────────────────────────
@@ -1227,12 +1238,17 @@ class RunWorker(QtCore.QThread):
                 self._gpio.wait_for_done(lambda: self._stop)
                 self._gpio.clear_outputs()
             else:
-                # Directory mode: reset index when last image reached (auto only)
-                if not manual and not self._camera.has_more():
-                    self._camera.reset()
+                # Directory mode: stop on last image or DONE_PIN signal
+                if not self._camera.has_more():
+                    self._camera.reset()   # rewind for next run
+                    break                  # natural end → sig_done
+                if self._gpio.is_done_signaled():
+                    break                  # machine stop signal → sig_done
 
         self._gpio.clear_outputs()
-        self.sig_status.emit("Stopped.")
+        if not self._stop and cam_mode != "camera":
+            self.sig_done.emit()
+        self.sig_status.emit("Standby.")
 
 # =========================================================
 # MAIN WINDOW
@@ -1597,6 +1613,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_status.connect(self._lbl_status.setText)
         self._worker.sig_cycle_ms.connect(
             lambda ms: self._lbl_cycle_ms.setText(f"{ms:.0f}"))
+        self._worker.sig_done.connect(self._on_run_done)
         self._worker.start()
 
         self._btn_run.setEnabled(False)
@@ -1605,13 +1622,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_trigger.setEnabled(manual)
 
     def _stop_run(self):
+        """Called by Stop button — early stop, no sig_done."""
         if self._worker:
             self._worker.stop()
             self._worker.wait(3000)
+        self._enter_standby()
+
+    def _on_run_done(self):
+        """Called when all images processed naturally OR DONE_PIN received."""
+        self._enter_standby()
+
+    def _enter_standby(self):
         self._btn_run.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._btn_trigger.setEnabled(False)
-        self._lbl_status.setText("Stopped.")
+        self._update_badge(self._badge_a, None)
+        self._update_badge(self._badge_b, None)
+        self._lbl_status.setText("Standby.")
 
     def _manual_trigger(self):
         if self._worker and self._worker.isRunning():

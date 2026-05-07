@@ -223,3 +223,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local
+Input/
+output/
+logs/
+Ref_sample.py

@@ -34,7 +34,7 @@ CAMERA = "directory"   # "camera" | "directory"
 IO     = False          # True = real GPIO pins, False = mock / log
 MODE   = "DEBUG"        # "RUN" | "DEBUG"
 
-IMAGE_DIR = "Input"    # folder used when CAMERA="directory"
+IMAGE_DIR = "Input/"    # folder used when CAMERA="directory"
 
 # ─── GPIO Pin Assignment (BCM) ────────────────────────────────────────────────
 
@@ -172,17 +172,19 @@ class Camera:
         except Exception as exc:
             raise CameraError(f"Basler camera open failed: {exc}") from exc
 
+    _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
     def _open_directory(self):
-        if not os.path.isdir(IMAGE_DIR):
-            raise CameraError(f"'Input' folder not found")
-        _EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        os.makedirs(IMAGE_DIR, exist_ok=True)   # create Input/ if absent
+        self._scan_directory()                   # populate self._files (may be empty)
+
+    def _scan_directory(self):
+        """Refresh the file list — picks up images added after startup."""
         self._files = sorted(
             os.path.join(IMAGE_DIR, name)
             for name in os.listdir(IMAGE_DIR)
-            if os.path.splitext(name)[1].lower() in _EXTS
+            if os.path.splitext(name)[1].lower() in self._IMG_EXTS
         )
-        if not self._files:
-            raise CameraError(f"No images found in '{IMAGE_DIR}'")
 
     def capture(self) -> Image:
         """Grab one frame. Retries up to 2× on transient failure."""
@@ -197,6 +199,10 @@ class Camera:
                 last_exc = exc
                 if attempt < _CAPTURE_RETRIES:
                     time.sleep(_RETRY_DELAY_S)
+        # All retries exhausted — skip this entry so the next cycle doesn't
+        # loop on the same corrupt file indefinitely.
+        if CAMERA == "directory":
+            self._index += 1
         raise CameraError(
             f"Capture failed after {_CAPTURE_RETRIES} retries: {last_exc}"
         ) from last_exc
@@ -216,11 +222,16 @@ class Camera:
         return arr
 
     def _grab_directory(self) -> np.ndarray:
+        # Rescan on every wrap-around so new files dropped into Input/ are picked up
+        if self._index % max(len(self._files), 1) == 0:
+            self._scan_directory()
+        if not self._files:
+            raise CameraError(f"No images in '{IMAGE_DIR}' — add image files to Input/")
         path = self._files[self._index % len(self._files)]
-        self._index += 1
         frame = cv.imread(path)
         if frame is None:
-            raise RuntimeError(f"Failed to decode image: {path}")
+            raise RuntimeError(f"Failed to decode: {path}")
+        self._index += 1   # advance only on success — retries stay on same file
         return frame
 
     def release(self):
@@ -336,8 +347,9 @@ def _float_val(field: QLineEdit, default: float = 0.0) -> float:
 #  #5465FF  deepest  — window bg, button fill
 #  #788BFF  dark     — panel / frame bg
 #  #9BB1FF  base     — card surface bg
-#  #BFD7FF  light    — input field bg
-#  #E2FDFF  lightest — image area, focus highlight
+#  #BFD7FF  light    — badge / accent surfaces
+#  #E2FDFF  lightest — image area
+#  #FFFFFF   white   — input field background
 
 STYLE = """
     QMainWindow, QWidget {
@@ -362,15 +374,15 @@ STYLE = """
         border: 1px solid #9BB1FF;
     }
     QLineEdit {
-        background-color: #BFD7FF;
+        background-color: #FFFFFF;
         color: #5465FF;
         border-radius: 6px;
-        border: none;
+        border: 2px solid #5465FF;
         padding: 4px 8px;
         min-height: 26px;
     }
     QLineEdit:focus {
-        background-color: #E2FDFF;
+        border: 2px solid #9BB1FF;
     }
     QLabel {
         color: #FFFFFF;
@@ -616,8 +628,21 @@ class MainWindow(QMainWindow):
 
     def _labeled_input(self, layout: QVBoxLayout, label: str,
                        default: str = "0", validator=None) -> QLineEdit:
-        layout.addWidget(QLabel(label))
+        lbl = QLabel(label)
+        lbl.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        layout.addWidget(lbl)
         field = QLineEdit(default)
+        field.setStyleSheet(
+            "QLineEdit {"
+            "  background-color: #FFFFFF;"
+            "  color: #5465FF;"
+            "  border-radius: 6px;"
+            "  border: 2px solid #5465FF;"
+            "  padding: 4px 8px;"
+            "  min-height: 26px;"
+            "}"
+            "QLineEdit:focus { border: 2px solid #9BB1FF; }"
+        )
         if validator is not None:
             field.setValidator(validator)
         layout.addWidget(field)
@@ -692,9 +717,20 @@ class MainWindow(QMainWindow):
                 self._stage = Stage.STANDBY
             self.btn_trigger.setEnabled(True)
             self._refresh_status()
+            # DEBUG auto-cycle: emit done so _on_done feeds the next image.
+            # Only continue if this cycle succeeded — stop on error so bad
+            # states don't loop endlessly.
+            if (DEBUG and CAMERA == "directory"
+                    and self._cam is not None
+                    and self._error_flag == ErrorFlag.NONE):
+                self._sig_done.emit()
 
     def _on_done(self):
-        """DONE_PIN handler — clear outputs and return to standby."""
+        """DONE_PIN handler — clear outputs and return to standby.
+
+        In DEBUG + CAMERA="directory": auto-advance to the next image so the
+        directory acts as a continuous frame source without manual triggers.
+        """
         if self._rio:
             self._rio.clear_outputs()
         self._stage      = Stage.STANDBY
@@ -702,6 +738,9 @@ class MainWindow(QMainWindow):
         self.error_banner.hide()
         self._refresh_status()
         print("[IO] Returning to standby")
+
+        if DEBUG and CAMERA == "directory" and self._cam is not None:
+            self._sig_start.emit()
 
     # ── Internal UI updaters ──────────────────────────────────────────────────
 

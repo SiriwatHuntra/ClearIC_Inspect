@@ -77,10 +77,11 @@ Each image contains **two ICs**. IC_A is the template anchor; IC_B position is d
 
 - **Model:** YOLO via OpenVINO (model ready)
 - **Post-processing:** NMS (Non-Maximum Suppression) applied after OpenVINO inference to filter overlapping bounding boxes before per-cell evaluation
-- **Classes:** `letter`, `number`
+- **Classes:** `IC_Presence`, `Text`
 - **Per ROI cell result:**
-  - Mark detected → `TRUE` + class label
-  - No mark → `FALSE` (None)
+  - Any detection found (either class) → `TRUE`
+  - No detection → `FALSE`
+  - Class label is not used for pass/fail — presence only
 - **Per IC result:**
   - **PASS** — all 6 cells return TRUE
   - **FAIL** — any cell returns FALSE → trigger output + save images + log
@@ -101,7 +102,6 @@ Each image contains **two ICs**. IC_A is the template anchor; IC_B position is d
 | Pin | BCM | Direction | Description |
 |---|---|---|---|
 | `ACK_PIN` | GPIO 22 | OUT | Pulse HIGH when result is ready — machine reads result pins on this edge |
-| `RESULT_PIN` | GPIO 23 | OUT | HIGH = PASS, LOW = FAIL (held until next ACK pulse) |
 | `FAIL_A_PIN` | GPIO 24 | OUT | HIGH = IC_A failed (held until next ACK pulse) |
 | `FAIL_B_PIN` | GPIO 25 | OUT | HIGH = IC_B failed (held until next ACK pulse) |
 
@@ -163,24 +163,26 @@ Machine sends DONE_PIN (rising edge)
 
 ### RUN / DEBUG Inspection Loop
 ```
-Receive START_PIN (or manual trigger in DEBUG)
+Receive START_PIN (or Manual Trigger button in DEBUG)
   → If BUSY: drop signal
   → Set BUSY = True
-  → Capture image  [or load next image from directory if CAMERA="directory"]
+  → Capture image  [CAMERA="directory": load next file from Input/ folder]
   → Map 12 ROI cells using saved template
   → Run YOLO/OpenVINO inference on all 12 cells → apply NMS
-  → Per cell: TRUE+class or FALSE (raise MarkMissingError if any FALSE)
+  → Per cell: any detection present → TRUE, no detection → FALSE
+             (classes "IC_Presence" / "Text" — presence only, not type)
   → IC_A: PASS if all 6 TRUE, else FAIL
   → IC_B: PASS if all 6 TRUE, else FAIL
-  → Set RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN → Pulse ACK_PIN
-       [IO=False: log "[IO MOCK] RESULT=X FAIL_A=X FAIL_B=X ACK→HIGH"]
+  → Set FAIL_A_PIN, FAIL_B_PIN → Pulse ACK_PIN
+       [IO=False: log "[IO MOCK] FAIL_A=X FAIL_B=X ACK→HIGH"]
   → If any FAIL:
       - Save IMAGE_ID_R.png  (original image)
-      - Save IMAGE_ID.png    (annotated: ROI boxes, failed cells in red, class labels)
+      - Save IMAGE_ID.png    (annotated: ROI boxes, failed cells in red)
       - Log entry (see Logging section)
-  → Update UI (result banner, stats)
+  → Update UI (badges, stats)
   → Set BUSY = False
-  → If STOP_PIN received: end loop
+  → Receive DONE_PIN (or auto-emitted in DEBUG directory mode)
+      [DEBUG + CAMERA="directory": DONE auto-fires → loads next image → loops]
   → Else: wait for next START_PIN
 ```
 
@@ -245,20 +247,21 @@ When `IO = False`: each signal change appended as a separate log line:
 ### Design System
 
 **Color Palette**
-| Role | Color | Hex |
+| Role | Hex | Used for |
 |---|---|---|
-| Accent / highlight | Cyan | `#00BCD4` |
-| Panel background | Grey Blue | `#546E7A` |
-| Primary surface | Steel Blue | `#4472C4` |
-| Text / base | White | `#FFFFFF` |
-| PASS indicator | Cyan | `#00BCD4` |
-| FAIL indicator | Red (standard) | `#EF5350` |
-| Error banner | Red (standard) | `#EF5350` |
+| Deepest | `#5465FF` | Window bg, button fill |
+| Dark | `#788BFF` | Panel / frame bg |
+| Base | `#9BB1FF` | Card surface bg (Setup, Controls, Stats, Badges) |
+| Light | `#BFD7FF` | PASS badge color, accent |
+| Lightest | `#E2FDFF` | Image display area bg |
+| White | `#FFFFFF` | Input field bg, text on dark |
+| FAIL / Error | `#EF5350` | FAIL badge, error banner |
 
 **Component Style**
-- All containers: `QFrame` with `border-radius: 8px` (rounded edges)
-- Buttons: rounded rectangles, Steel Blue fill, White text, Cyan hover
-- Input fields: Grey Blue background, White text, Cyan focus border
+- All containers: `QFrame` with `border-radius: 8px`
+- Buttons: `#5465FF` fill, white text, rounded — **no hover effect**
+- Input fields: `QLineEdit`, white bg (`#FFFFFF`), `#5465FF` text + border, rounded
+- Label topics above inputs: bold white
 - No decorative icons, no gradients — flat and clean
 - Consistent 8px padding inside all panels
 
@@ -266,34 +269,34 @@ When `IO = False`: each signal change appended as a separate log line:
 
 ```
 ┌────────────────────────────────────┬─────────────────────┐
-│  MAIN VIEW  (Grey Blue bg)         │  RIGHT PANEL        │
-│                                    │  (Steel Blue bg)    │
+│  MAIN VIEW  (#788BFF bg)           │  RIGHT PANEL        │
+│                                    │  (#5465FF bg)       │
 │  Live camera / last image          │                     │
-│  Overlay: ROI boxes (all 12)       │  [Setup]            │
-│  Overlay: detection labels (cyan)  │  Exposure time      │
-│  Overlay: failed cells (red)       │  Scale / ratio      │
-│                                    │  Column offset      │
-│  ┌──────────┐  ┌──────────┐        │  IC_B offset        │
-│  │ IC_A     │  │ IC_B     │        │  Set anchor btn     │
-│  │ PASS/FAIL│  │ PASS/FAIL│        │  Preview ROIs btn   │
-│  └──────────┘  └──────────┘        │  Save template btn  │
-│  (rounded badge, cyan or red)      │                     │
-│                                    │  [Controls]         │
-│  [ERROR BANNER — red, rounded]     │  Manual trigger btn │
+│  (#E2FDFF area)                    │  [Setup] #788BFF    │
+│                                    │  Exposure (µs)      │
+│  [ERROR BANNER — red, rounded]     │  Scale / ratio      │
+│                                    │  Column offset (px) │
+│  ┌─────────────┐  ┌─────────────┐  │  IC_B offset X (px) │
+│  │ IC_A  PASS  │  │ IC_B  FAIL  │  │  IC_B offset Y (px) │
+│  └─────────────┘  └─────────────┘  │  Set Anchor btn     │
+│  (#9BB1FF area, badge border:      │  Preview ROIs btn   │
+│   #BFD7FF=PASS / #EF5350=FAIL)     │  Save Template btn  │
 │                                    │                     │
-│                                    │  [Stats]            │
-│                                    │  Pass / Fail count  │
-│                                    │  Error count        │
-│                                    │  Last cycle (ms)    │
+│  [Stats] #9BB1FF                   │  [Controls] #788BFF │
+│  Status / Pass / Fail /            │  Manual Trigger btn │
+│  Error / Last cycle (ms)           │                     │
 └────────────────────────────────────┴─────────────────────┘
 ```
 
+> In **DEBUG mode** (`CAMERA="directory"`): after each inspection the DONE signal
+> automatically feeds the next image from `Input/` and re-runs the cycle.
+
 ### Modal Popup on FAIL
-- Rounded `QDialog`, Steel Blue background
+- Rounded `QDialog`, `#5465FF` background
 - Title: "Inspection Failed"
 - List which IC (A / B) failed
 - List missing cells as `[row, col]` per IC
-- Single "Acknowledge" button (Cyan, rounded)
+- Single "Acknowledge" button (white, rounded)
 
 ---
 

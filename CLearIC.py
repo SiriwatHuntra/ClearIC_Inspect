@@ -105,11 +105,17 @@ class InspectionError(Exception):
     pass
 
 class MarkMissingError(InspectionError):
-    def __init__(self, ic_position: str, missing_cells: list):
-        self.ic_position  = ic_position
-        self.missing_cells = missing_cells
-        super().__init__(
-            f"IC_{ic_position} missing cells: {missing_cells}")
+    def __init__(self, missing_a: list, missing_b: list,
+                 annotated: "np.ndarray | None" = None):
+        self.missing_a = missing_a
+        self.missing_b = missing_b
+        self.annotated = annotated
+        parts = []
+        if missing_a:
+            parts.append(f"IC_A={missing_a}")
+        if missing_b:
+            parts.append(f"IC_B={missing_b}")
+        super().__init__("Missing cells: " + ", ".join(parts))
 
 class _SystemError(InspectionError):
     pass
@@ -420,8 +426,7 @@ class RaspberryIO:
 # =========================================================
 # DETECTOR  (OpenVINO YOLO — 2-class)
 # =========================================================
-_INPUT_SIZE  = 640
-_NMS_IOU_THR = 0.45
+_INPUT_SIZE = 640
 
 class Detector:
     """
@@ -457,10 +462,11 @@ class Detector:
     def is_ready(self) -> bool:
         return self._ready
 
-    def warmup(self):
+    def warmup(self, frames: int = 5):
         blank = np.zeros((_INPUT_SIZE, _INPUT_SIZE, 3), dtype=np.uint8)
-        self._run_inference(blank)
-        print("[Detector] Warmup done.")
+        for _ in range(frames):
+            self._run_inference(blank)
+        print(f"[Detector] Warmup done ({frames} frames).")
 
     def _run_inference(self, image_bgr: np.ndarray) -> list:
         """
@@ -627,10 +633,8 @@ class Inspector:
         missing_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
         missing_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
 
-        if missing_a:
-            raise MarkMissingError("A", missing_a)
-        if missing_b:
-            raise MarkMissingError("B", missing_b)
+        if missing_a or missing_b:
+            raise MarkMissingError(missing_a, missing_b, annotated)
 
         return True, True, [], [], annotated
 
@@ -962,7 +966,7 @@ class ImageView(QtWidgets.QLabel):
 
         painter.end()
 
-    def mouseMoveEvent(self, e):
+    def mouseMoveEvent(self, _e):
         if self._stamp_mode:
             self.update()
 
@@ -976,64 +980,68 @@ class ImageView(QtWidgets.QLabel):
             self.add_overlay(rect, QtGui.QColor("#FFD700"), "")
 
 # =========================================================
-# SETUP PANEL  (Auto Detect flow: Click → Visual → Retry → Confirm)
+# SETUP DIALOG  (Auto Detect flow: Auto-Detect → Popup → Retry / Confirm)
 # =========================================================
-class SetupPanel(QtWidgets.QWidget):
+class SetupDialog(QtWidgets.QDialog):
     """
-    Floating panel for template creation.
-    Ported/adapted from Ref_sample.py FrameLayoutPanel (L3935–4015).
+    Non-modal popup for template creation.
+    Opens after "Auto Detect" runs; shows detection status and
+    lets the user Retry (re-runs detection) or Confirm (saves template).
+    Overlays on the main ImageView update live while the dialog is open.
     """
     confirmed = QtCore.pyqtSignal(QtCore.QRect, QtCore.QRect)   # ic_a, ic_b
 
-    def __init__(self, on_cancel, parent=None):
-        super().__init__(
-            parent,
-            QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint |
-            QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint,
-        )
-        self.setWindowTitle("Template Setup — Auto Detect")
-        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
-        self.setFixedWidth(320)
+    def __init__(self, retry_fn, cancel_fn, parent=None):
+        super().__init__(parent, QtCore.Qt.WindowTitleHint |
+                         QtCore.Qt.WindowCloseButtonHint)
+        self.setWindowTitle("Auto Detect — IC Template")
+        self.setModal(False)
+        self.setMinimumWidth(340)
         self.setStyleSheet(
-            "QWidget { background:#5465FF; color:#FFFFFF; }"
+            "QDialog  { background:#5465FF; }"
+            "QLabel   { color:#FFFFFF; }"
             "QPushButton { background:#788BFF; color:#FFFFFF; border-radius:6px;"
-            "  padding:5px 12px; font-weight:bold; }"
+            "  padding:6px 14px; font-weight:bold; border:none; }"
             "QPushButton:disabled { background:#9BB1FF; color:#BFD7FF; }"
         )
 
-        self._on_cancel = on_cancel
+        self._retry_fn  = retry_fn
+        self._cancel_fn = cancel_fn
         self._ic_a: QtCore.QRect | None = None
         self._ic_b: QtCore.QRect | None = None
 
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setSpacing(10)
-        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(12)
+        lay.setContentsMargins(20, 20, 20, 20)
 
         title = QtWidgets.QLabel("Auto Detect IC Positions")
-        title.setStyleSheet("font-size:13px;font-weight:bold;color:#E2FDFF")
+        title.setStyleSheet("font-size:14px;font-weight:bold;color:#E2FDFF")
         title.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(title)
 
-        self._lbl_status = QtWidgets.QLabel("Run detection to locate IC_A and IC_B.")
-        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:10px")
+        self._lbl_status = QtWidgets.QLabel("Detecting…")
+        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_status.setMinimumHeight(36)
         lay.addWidget(self._lbl_status)
 
         btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+
         self._btn_retry   = QtWidgets.QPushButton("Retry")
-        self._btn_confirm = QtWidgets.QPushButton("Confirm & Save")
+        self._btn_confirm = QtWidgets.QPushButton("Confirm")
         self._btn_cancel  = QtWidgets.QPushButton("Cancel")
 
         self._btn_confirm.setStyleSheet(
-            "background:#5465FF;color:#FFFFFF;border-radius:6px;"
-            "padding:5px 12px;font-weight:bold;")
+            "background:#FFFFFF;color:#5465FF;border-radius:6px;"
+            "padding:6px 14px;font-weight:bold;")
         self._btn_confirm.setEnabled(False)
         self._btn_retry.setEnabled(False)
 
         self._btn_retry.clicked.connect(self._on_retry)
         self._btn_confirm.clicked.connect(self._on_confirm)
-        self._btn_cancel.clicked.connect(self._do_cancel)
+        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
 
         btn_row.addWidget(self._btn_retry)
         btn_row.addStretch()
@@ -1041,43 +1049,45 @@ class SetupPanel(QtWidgets.QWidget):
         btn_row.addWidget(self._btn_cancel)
         lay.addLayout(btn_row)
 
-        self._retry_fn = None
         self.adjustSize()
-
-    def set_retry_fn(self, fn):
-        self._retry_fn = fn
 
     def show_result(self, ic_a: QtCore.QRect | None, ic_b: QtCore.QRect | None,
                     n_detected: int):
         self._ic_a = ic_a
         self._ic_b = ic_b
-        both = (ic_a is not None and ic_b is not None)
+        both = ic_a is not None and ic_b is not None
         if both:
             self._lbl_status.setText(
-                "IC_A and IC_B detected.\nVerify overlays then Confirm.")
-            self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:10px")
+                "IC_A and IC_B detected.\nVerify overlays on image, then Confirm.")
+            self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
         else:
             self._lbl_status.setText(
-                f"Only {n_detected} IC(s) detected. Retry or adjust image.")
-            self._lbl_status.setStyleSheet("color:#EF5350;font-size:10px")
+                f"Only {n_detected} IC(s) detected.\nAdjust image or click Retry.")
+            self._lbl_status.setStyleSheet("color:#EF5350;font-size:11px")
         self._btn_confirm.setEnabled(both)
         self._btn_retry.setEnabled(True)
 
     def _on_retry(self):
+        self._btn_retry.setEnabled(False)
+        self._btn_confirm.setEnabled(False)
+        self._lbl_status.setText("Detecting…")
+        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
         if self._retry_fn:
             self._retry_fn()
 
     def _on_confirm(self):
         if self._ic_a and self._ic_b:
             self.confirmed.emit(self._ic_a, self._ic_b)
-            self.hide()
+            self.accept()
 
-    def _do_cancel(self):
-        self._on_cancel()
-        self.hide()
+    def _on_cancel_clicked(self):
+        if self._cancel_fn:
+            self._cancel_fn()
+        self.reject()
 
     def closeEvent(self, e):
-        self._on_cancel()
+        if self._cancel_fn:
+            self._cancel_fn()
         e.accept()
 
 # =========================================================
@@ -1119,126 +1129,110 @@ class RunWorker(QtCore.QThread):
         self._trigger.release()
 
     def run(self):
-        manual  = self._cfg.get("MANUAL", True)
+        manual   = self._cfg.get("MANUAL", True)
         cam_mode = self._cfg.get("CAMERA", "directory")
-        mode    = self._cfg.get("MODE", "DEBUG")
-        io_mock = not self._cfg.get("IO", False)
-        output_dir = "output"
-        os.makedirs(output_dir, exist_ok=True)
+        mode     = self._cfg.get("MODE", "DEBUG")
+        io_mock  = not self._cfg.get("IO", False)
+        debug    = self._cfg.get("DEBUG", False)
+        os.makedirs("output", exist_ok=True)
 
         self.sig_status.emit("Running…")
 
         while not self._stop:
-            # --- wait for trigger ---
-            if manual or cam_mode == "camera":
-                if cam_mode == "camera":
-                    self.sig_status.emit("Waiting for START signal…")
-                    triggered = self._gpio.wait_for_start(lambda: self._stop)
-                    if not triggered or self._stop:
-                        break
-                else:
-                    self.sig_status.emit("Waiting for trigger…")
-                    self._trigger.acquire()
-                    if self._stop:
-                        break
+
+            # ── Wait for next cycle trigger ──────────────────────────
+            if cam_mode == "camera":
+                # Production / non-debug: wait for GPIO START_PIN rising edge
+                self.sig_status.emit("Waiting for START signal…")
+                if not self._gpio.wait_for_start(lambda: self._stop):
+                    break                   # stop() was called
+                if self._stop:
+                    break
+            elif manual:
+                # Manual directory mode: wait for Trigger button
+                self.sig_status.emit("Waiting for trigger…")
+                self._trigger.acquire()
+                if self._stop:
+                    break
             else:
-                # auto mode: short pause between cycles
+                # Auto directory mode: brief yield between cycles
                 time.sleep(0.05)
                 if self._stop:
                     break
 
+            # ── Capture ─────────────────────────────────────────────
             t0 = time.perf_counter()
             try:
-                img_bgr  = self._camera.grab()
-                img_id   = _next_image_id()
-                image    = Image(id=img_id, raw=img_bgr.copy())
-
-                self.sig_status.emit("Inspecting…")
-                try:
-                    ia_pass, ib_pass, miss_a, miss_b, annotated = \
-                        self._inspector.inspect(img_bgr, debug=self._cfg.get("DEBUG", False))
-                    image.annotated = annotated
-
-                    cycle_ms = (time.perf_counter() - t0) * 1000
-                    self.sig_image.emit(annotated)
-                    self.sig_result.emit(ia_pass, ib_pass)
-                    self.sig_cycle_ms.emit(cycle_ms)
-                    self._logger.log_inspection(
-                        img_id, "PASS", [], "PASS", [],
-                        cycle_ms, mode, io_mock)
-
-                    self._gpio.set_fail_a(False)
-                    self._gpio.set_fail_b(False)
-                    self._gpio.pulse_ack()
-
-                except MarkMissingError as e:
-                    cycle_ms = (time.perf_counter() - t0) * 1000
-                    miss_a = e.missing_cells if e.ic_position == "A" else []
-                    miss_b = e.missing_cells if e.ic_position == "B" else []
-
-                    # draw ROI overlays on raw image for annotation
-                    _, _, _, _, annotated = self._run_annotate_fail(
-                        img_bgr, miss_a, miss_b)
-                    image.annotated = annotated
-                    self.sig_image.emit(annotated)
-                    self.sig_fail.emit(e)
-                    self.sig_cycle_ms.emit(cycle_ms)
-
-                    self._logger.log_inspection(
-                        img_id,
-                        "FAIL" if miss_a else "PASS", miss_a,
-                        "FAIL" if miss_b else "PASS", miss_b,
-                        cycle_ms, mode, io_mock)
-
-                    raw_path = os.path.join(output_dir, f"{img_id}_R.png")
-                    ann_path = os.path.join(output_dir, f"{img_id}.png")
-                    cv2.imwrite(raw_path, img_bgr)
-                    cv2.imwrite(ann_path, annotated)
-
-                    self._gpio.set_fail_a(bool(miss_a))
-                    self._gpio.set_fail_b(bool(miss_b))
-                    self._gpio.pulse_ack()
-
+                img_bgr = self._camera.grab()
             except CameraError as e:
-                cycle_ms = (time.perf_counter() - t0) * 1000
-                self._logger.log_error("CAMERA_ERROR", str(e), cycle_ms)
+                self._logger.log_error("CAMERA_ERROR", str(e),
+                                       (time.perf_counter() - t0) * 1000)
                 self.sig_error.emit(f"Camera error: {e}")
                 break
+
+            img_id = _next_image_id()
+            self.sig_status.emit("Inspecting…")
+
+            # ── Inspect ─────────────────────────────────────────────
+            try:
+                _ia, _ib, _ma, _mb, annotated = \
+                    self._inspector.inspect(img_bgr, debug=debug)
+
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                self.sig_image.emit(annotated)
+                self.sig_result.emit(True, True)
+                self.sig_cycle_ms.emit(cycle_ms)
+                self._logger.log_inspection(
+                    img_id, "PASS", [], "PASS", [],
+                    cycle_ms, mode, io_mock)
+
+                # GPIO: both FAIL pins LOW → pulse ACK
+                self._gpio.set_fail_a(False)
+                self._gpio.set_fail_b(False)
+                self._gpio.pulse_ack()
+
+            except MarkMissingError as e:
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                annotated = e.annotated if e.annotated is not None \
+                            else img_bgr.copy()
+
+                self.sig_image.emit(annotated)
+                self.sig_fail.emit(e)
+                self.sig_cycle_ms.emit(cycle_ms)
+                self._logger.log_inspection(
+                    img_id,
+                    "FAIL" if e.missing_a else "PASS", e.missing_a,
+                    "FAIL" if e.missing_b else "PASS", e.missing_b,
+                    cycle_ms, mode, io_mock)
+
+                # Save raw + annotated images on every FAIL
+                cv2.imwrite(os.path.join("output", f"{img_id}_R.png"), img_bgr)
+                cv2.imwrite(os.path.join("output", f"{img_id}.png"),   annotated)
+
+                # GPIO: set FAIL pins then pulse ACK
+                self._gpio.set_fail_a(bool(e.missing_a))
+                self._gpio.set_fail_b(bool(e.missing_b))
+                self._gpio.pulse_ack()
+
             except Exception as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
                 self.sig_error.emit(f"Unexpected error: {e}")
                 break
 
-            # DONE signal (camera mode) or auto-advance
+            # ── End-of-cycle handshake ───────────────────────────────
             if cam_mode == "camera":
+                # Production: hold outputs until machine signals DONE
+                self.sig_status.emit("Holding — waiting for DONE signal…")
                 self._gpio.wait_for_done(lambda: self._stop)
                 self._gpio.clear_outputs()
-            elif not manual and not self._camera.has_more():
-                self._camera.reset()
+            else:
+                # Directory mode: reset index when last image reached (auto only)
+                if not manual and not self._camera.has_more():
+                    self._camera.reset()
 
         self._gpio.clear_outputs()
         self.sig_status.emit("Stopped.")
-
-    def _run_annotate_fail(self, image_bgr, miss_a, miss_b):
-        """Draw all ROI boxes — green=present, red=missing — without running inference again."""
-        try:
-            tmpl = TemplateManager.load()
-        except TemplateError:
-            return False, False, miss_a, miss_b, image_bgr.copy()
-        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(tmpl)
-        annotated = image_bgr.copy()
-        for idx, (x, y, w, h) in enumerate(ic_a_cells):
-            row, col = idx // 2 + 1, idx % 2 + 1
-            fail = [row, col] in miss_a
-            color = (0, 0, 220) if fail else (0, 200, 0)
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-        for idx, (x, y, w, h) in enumerate(ic_b_cells):
-            row, col = idx // 2 + 1, idx % 2 + 1
-            fail = [row, col] in miss_b
-            color = (0, 0, 220) if fail else (0, 200, 0)
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-        return False, False, miss_a, miss_b, annotated
 
 # =========================================================
 # MAIN WINDOW
@@ -1262,7 +1256,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_error = 0
 
         # setup state
-        self._setup_panel:  SetupPanel | None = None
+        self._setup_dlg:    SetupDialog | None = None
         self._pending_ic_a: QtCore.QRect | None = None
         self._pending_ic_b: QtCore.QRect | None = None
 
@@ -1365,11 +1359,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_detect.clicked.connect(self._start_auto_detect)
         setup_lay.addWidget(self._btn_detect)
 
-        self._btn_save_tmpl = QtWidgets.QPushButton("Save Template")
-        self._btn_save_tmpl.setEnabled(False)
-        self._btn_save_tmpl.clicked.connect(self._save_template)
-        setup_lay.addWidget(self._btn_save_tmpl)
-
         right_lay.addWidget(setup_frame)
 
         # Controls section
@@ -1382,16 +1371,16 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_ctrl.setStyleSheet("font-weight:bold;font-size:13px")
         ctrl_lay.addWidget(lbl_ctrl)
 
-        self._btn_run = QtWidgets.QPushButton("▶  Start Run")
+        self._btn_run = QtWidgets.QPushButton("Start")
         self._btn_run.clicked.connect(self._start_run)
         ctrl_lay.addWidget(self._btn_run)
 
-        self._btn_trigger = QtWidgets.QPushButton("Manual Trigger")
+        self._btn_trigger = QtWidgets.QPushButton("Trigger")
         self._btn_trigger.setEnabled(False)
         self._btn_trigger.clicked.connect(self._manual_trigger)
         ctrl_lay.addWidget(self._btn_trigger)
 
-        self._btn_stop = QtWidgets.QPushButton("■  Stop")
+        self._btn_stop = QtWidgets.QPushButton("Stop")
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._stop_run)
         ctrl_lay.addWidget(self._btn_stop)
@@ -1478,16 +1467,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._camera and cfg.get("CAMERA") == "camera":
             self._camera.warmup()
         if self._detector and self._detector.is_ready():
-            self._detector.warmup()
+            self._detector.warmup(frames=5)
 
-        try:
-            tmpl = TemplateManager.load()
-            self._show_template_overlays(tmpl)
-            self._btn_save_tmpl.setEnabled(True)
-        except TemplateError:
-            pass
+        # Load and display first image on startup (no overlays yet)
+        if self._camera:
+            try:
+                img = self._camera.grab()
+                self._view.set_image(img)
+                self._current_detect_image = img
+                if cfg.get("CAMERA") == "directory":
+                    self._camera.reset()   # rewind so run starts from image 1
+            except CameraError:
+                pass
 
-        manual = cfg.get("MANUAL", True)
         self._btn_trigger.setEnabled(False)
 
     # ----------------------------------------------------------
@@ -1503,6 +1495,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             img = self._camera.grab()
+            if self._cfg.get("CAMERA") == "directory":
+                self._camera.reset()
         except CameraError as e:
             self._show_error(str(e))
             return
@@ -1510,18 +1504,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_detect_image = img
         self._view.set_image(img)
         self._view.clear_overlays()
+
+        # Open the popup dialog before running detection so it's visible immediately
+        if self._setup_dlg is None or not self._setup_dlg.isVisible():
+            self._setup_dlg = SetupDialog(
+                retry_fn=self._retry_detection,
+                cancel_fn=self._cancel_detect,
+                parent=self,
+            )
+            self._setup_dlg.confirmed.connect(self._on_detect_confirmed)
+            # Centre popup over main window
+            self._setup_dlg.adjustSize()
+            geo   = self.geometry()
+            dlg_w = self._setup_dlg.width()
+            dlg_h = self._setup_dlg.height()
+            self._setup_dlg.move(
+                geo.x() + (geo.width()  - dlg_w) // 2,
+                geo.y() + (geo.height() - dlg_h) // 2,
+            )
+            self._setup_dlg.show()
+
         self._run_detection(img)
 
-        if self._setup_panel is None or not self._setup_panel.isVisible():
-            self._setup_panel = SetupPanel(
-                on_cancel=self._cancel_detect, parent=self)
-            self._setup_panel.set_retry_fn(lambda: self._run_detection(
-                self._current_detect_image))
-            self._setup_panel.confirmed.connect(self._on_detect_confirmed)
-            geo = self.geometry()
-            pw  = self._setup_panel.sizeHint().width()
-            self._setup_panel.move(geo.right() - pw - 20, geo.top() + 60)
-            self._setup_panel.show()
+    def _retry_detection(self):
+        """Re-run detection on the same grabbed image (called by Retry button)."""
+        if hasattr(self, "_current_detect_image") and \
+                self._current_detect_image is not None:
+            self._run_detection(self._current_detect_image)
 
     def _run_detection(self, img: np.ndarray):
         if not self._detector:
@@ -1537,49 +1546,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 ic_a = rect
             else:
                 ic_b = rect
-        if self._setup_panel:
-            self._setup_panel.show_result(ic_a, ic_b, len(rects))
+        if self._setup_dlg and self._setup_dlg.isVisible():
+            self._setup_dlg.show_result(ic_a, ic_b, len(rects))
         self._pending_ic_a = ic_a
         self._pending_ic_b = ic_b
 
     def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         self._pending_ic_a = ic_a
         self._pending_ic_b = ic_b
-        self._btn_save_tmpl.setEnabled(True)
+        self._view.clear_overlays()
+        try:
+            exposure = int(self._input_exposure.text())
+        except ValueError:
+            exposure = 8000
+        TemplateManager.save(ic_a, ic_b, exposure)
+        QtWidgets.QMessageBox.information(
+            self, "Template Saved",
+            "Template saved to templates/template.json")
 
     def _cancel_detect(self):
         self._view.clear_overlays()
         self._pending_ic_a = None
         self._pending_ic_b = None
 
-    def _save_template(self):
-        if not self._pending_ic_a or not self._pending_ic_b:
-            QtWidgets.QMessageBox.warning(
-                self, "No Detection",
-                "Run 'Auto Detect' and confirm IC_A and IC_B first.")
-            return
-        try:
-            exposure = int(self._input_exposure.text())
-        except ValueError:
-            exposure = 8000
-        TemplateManager.save(self._pending_ic_a, self._pending_ic_b, exposure)
-        QtWidgets.QMessageBox.information(
-            self, "Saved", "Template saved to templates/template.json")
-        try:
-            tmpl = TemplateManager.load()
-            self._show_template_overlays(tmpl)
-        except TemplateError:
-            pass
-
-    def _show_template_overlays(self, tmpl: dict):
-        self._view.clear_overlays()
-        ic_a_cells, ic_b_cells = TemplateManager.compute_rois(tmpl)
-        for x, y, w, h in ic_a_cells:
-            self._view.add_overlay(
-                QtCore.QRect(x, y, w, h), QtGui.QColor("#BFD7FF"), "")
-        for x, y, w, h in ic_b_cells:
-            self._view.add_overlay(
-                QtCore.QRect(x, y, w, h), QtGui.QColor("#9BB1FF"), "")
 
     # ----------------------------------------------------------
     # Run / Stop
@@ -1644,12 +1633,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_fail(self, err: MarkMissingError):
         self._stats_fail += 1
-        miss_a = err.missing_cells if err.ic_position == "A" else []
-        miss_b = err.missing_cells if err.ic_position == "B" else []
-        self._update_badge(self._badge_a, len(miss_a) == 0)
-        self._update_badge(self._badge_b, len(miss_b) == 0)
+        self._update_badge(self._badge_a, len(err.missing_a) == 0)
+        self._update_badge(self._badge_b, len(err.missing_b) == 0)
         self._lbl_fail.setText(str(self._stats_fail))
-        dlg = FailDialog(miss_a, miss_b, self)
+        dlg = FailDialog(err.missing_a, err.missing_b, self)
         dlg.exec_()
 
     def _on_worker_error(self, msg: str):

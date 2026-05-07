@@ -39,23 +39,25 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 # =========================================================
+# HARDCODED DEV FLAGS  (edit here before running — not in Config.json)
+# =========================================================
+DEBUG  = True      # verbose logs, annotated output
+IO     = False     # True = drive GPIO / False = mock (log only)
+MODE   = "DEBUG"   # "DEBUG" or "RUN"
+
+# =========================================================
 # CONFIG LOADER
 # =========================================================
 class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
-        "DEBUG":         True,
         "CAMERA":        "directory",
-        "IO":            False,
-        "MODE":          "DEBUG",
-        "MANUAL":        False,
         "CONF_THR":      0.9,
         "NMS_IOU_THR":   0.45,
         "CAMERA_SERIAL": "",
         "EXPOSURE_US":   8000,
     }
     _VALID_CAMERA = {"camera", "directory"}
-    _VALID_MODE   = {"RUN", "DEBUG"}
 
     @classmethod
     def load(cls) -> dict:
@@ -68,11 +70,12 @@ class ConfigLoader:
         except Exception as e:
             raise ConfigError(f"Config.json unreadable: {e}")
         cfg = dict(cls.DEFAULT_CONFIG)
-        cfg.update(data)
+        # Only apply keys that belong in Config.json (ignore dev flags if present)
+        for k in cls.DEFAULT_CONFIG:
+            if k in data:
+                cfg[k] = data[k]
         if cfg["CAMERA"] not in cls._VALID_CAMERA:
             raise ConfigError(f"CAMERA must be one of {cls._VALID_CAMERA}")
-        if cfg["MODE"] not in cls._VALID_MODE:
-            raise ConfigError(f"MODE must be one of {cls._VALID_MODE}")
         if not (0.0 < cfg["CONF_THR"] <= 1.0):
             raise ConfigError("CONF_THR must be in (0, 1]")
         return cfg
@@ -814,6 +817,28 @@ QLabel#stat_value {
     color: #E2FDFF;
     font-weight: bold;
 }
+QCheckBox {
+    color: #FFFFFF;
+    font-weight: bold;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #FFFFFF;
+    border-radius: 3px;
+    background: transparent;
+}
+QCheckBox::indicator:checked {
+    background: #FFFFFF;
+    image: none;
+}
+QCheckBox:disabled {
+    color: #BFD7FF;
+}
+QCheckBox::indicator:disabled {
+    border-color: #BFD7FF;
+}
 """
 
 # =========================================================
@@ -1124,23 +1149,16 @@ class RunWorker(QtCore.QThread):
         self._gpio      = gpio
         self._logger    = logger
         self._cfg       = cfg
-        self._stop      = False
-        self._trigger   = QtCore.QSemaphore(0)
-
-    def trigger(self):
-        """Called from UI thread to start one inspection cycle."""
-        self._trigger.release()
+        self._stop = False
 
     def stop(self):
         self._stop = True
-        self._trigger.release()
 
     def run(self):
-        manual   = self._cfg.get("MANUAL", True)
         cam_mode = self._cfg.get("CAMERA", "directory")
-        mode     = self._cfg.get("MODE", "DEBUG")
-        io_mock  = not self._cfg.get("IO", False)
-        debug    = self._cfg.get("DEBUG", False)
+        mode     = MODE
+        io_mock  = not IO
+        debug    = DEBUG
         os.makedirs("output", exist_ok=True)
 
         self.sig_status.emit("Running…")
@@ -1155,23 +1173,15 @@ class RunWorker(QtCore.QThread):
                     break
                 if self._stop:
                     break
-
-            elif manual:
-                # Manual directory: wait for Trigger button OR DONE_PIN/Stop
-                self.sig_status.emit("Waiting for trigger…")
-                while not self._stop and not self._gpio.is_done_signaled():
-                    if self._trigger.tryAcquire(1, 50):   # 50 ms poll
-                        break                             # got trigger → inspect
-                else:
-                    break   # _stop=True (Stop button) or DONE_PIN → exit loop
-
             else:
                 # Auto directory: brief yield, then check DONE_PIN / Stop
                 time.sleep(0.05)
                 if self._stop or self._gpio.is_done_signaled():
                     break
 
-            # ── Capture ─────────────────────────────────────────────
+            # ── Capture guard ────────────────────────────────────────
+            if self._stop:
+                break
             t0 = time.perf_counter()
             try:
                 img_bgr = self._camera.grab()
@@ -1330,26 +1340,12 @@ class MainWindow(QtWidgets.QMainWindow):
         badge_lay.addStretch()
         left_lay.addWidget(badge_frame)
 
-        # Stats area
-        stats_frame = QtWidgets.QFrame()
-        stats_frame.setObjectName("stats_area")
-        stats_lay = QtWidgets.QHBoxLayout(stats_frame)
-        stats_lay.setSpacing(16)
-
-        self._lbl_status   = self._stat_pair(stats_lay, "Status",    "IDLE")
-        self._lbl_pass     = self._stat_pair(stats_lay, "Pass",      "0")
-        self._lbl_fail     = self._stat_pair(stats_lay, "Fail",      "0")
-        self._lbl_error    = self._stat_pair(stats_lay, "Error",     "0")
-        self._lbl_cycle_ms = self._stat_pair(stats_lay, "Last (ms)", "—")
-        stats_lay.addStretch()
-        left_lay.addWidget(stats_frame)
-
         root.addWidget(left_frame, stretch=1)
 
         # ── Right panel ──────────────────────────────────────
         right_frame = QtWidgets.QFrame()
         right_frame.setObjectName("panel_right")
-        right_frame.setFixedWidth(240)
+        right_frame.setFixedWidth(280)
         right_lay = QtWidgets.QVBoxLayout(right_frame)
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(8)
@@ -1391,17 +1387,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_run.clicked.connect(self._start_run)
         ctrl_lay.addWidget(self._btn_run)
 
-        self._btn_trigger = QtWidgets.QPushButton("Trigger")
-        self._btn_trigger.setEnabled(False)
-        self._btn_trigger.clicked.connect(self._manual_trigger)
-        ctrl_lay.addWidget(self._btn_trigger)
-
         self._btn_stop = QtWidgets.QPushButton("Stop")
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._stop_run)
         ctrl_lay.addWidget(self._btn_stop)
 
         right_lay.addWidget(ctrl_frame)
+
+        # Stats section
+        stats_frame = QtWidgets.QFrame()
+        stats_frame.setObjectName("setup_frame")
+        stats_lay = QtWidgets.QVBoxLayout(stats_frame)
+        stats_lay.setSpacing(4)
+
+        lbl_stats = QtWidgets.QLabel("Stats")
+        lbl_stats.setStyleSheet("font-weight:bold;font-size:13px")
+        stats_lay.addWidget(lbl_stats)
+
+        self._lbl_status   = self._stat_row(stats_lay, "Status",   "Standby.")
+        self._lbl_pass     = self._stat_row(stats_lay, "Pass",     "0")
+        self._lbl_fail     = self._stat_row(stats_lay, "Fail",     "0")
+        self._lbl_error    = self._stat_row(stats_lay, "Error",    "0")
+        self._lbl_cycle_ms = self._stat_row(stats_lay, "Last ms",  "—")
+
+        right_lay.addWidget(stats_frame)
         right_lay.addStretch()
 
         root.addWidget(right_frame)
@@ -1440,16 +1449,19 @@ class MainWindow(QtWidgets.QMainWindow):
         frame.style().unpolish(frame)
         frame.style().polish(frame)
 
-    def _stat_pair(self, parent_lay, label: str, value: str) -> QtWidgets.QLabel:
-        col = QtWidgets.QVBoxLayout()
+    def _stat_row(self, parent_lay, label: str, value: str) -> QtWidgets.QLabel:
+        """One horizontal row: bold label on left, value on right."""
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         lbl = QtWidgets.QLabel(label)
-        lbl.setStyleSheet("font-size:9px;color:#E2FDFF")
+        lbl.setStyleSheet("font-size:11px;color:#E2FDFF;font-weight:bold")
         val = QtWidgets.QLabel(value)
-        val.setObjectName("stat_value")
-        val.setStyleSheet("font-size:12px;font-weight:bold;color:#E2FDFF")
-        col.addWidget(lbl, alignment=QtCore.Qt.AlignCenter)
-        col.addWidget(val, alignment=QtCore.Qt.AlignCenter)
-        parent_lay.addLayout(col)
+        val.setStyleSheet("font-size:11px;color:#FFFFFF")
+        val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        row.addWidget(lbl)
+        row.addStretch()
+        row.addWidget(val)
+        parent_lay.addLayout(row)
         return val
 
     # ----------------------------------------------------------
@@ -1466,7 +1478,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error(f"Model load failed: {e}")
 
         try:
-            self._gpio = RaspberryIO(io_enabled=cfg.get("IO", False))
+            self._gpio = RaspberryIO(io_enabled=IO)
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
 
@@ -1496,7 +1508,6 @@ class MainWindow(QtWidgets.QMainWindow):
             except CameraError:
                 pass
 
-        self._btn_trigger.setEnabled(False)
 
     # ----------------------------------------------------------
     # Auto Detect flow
@@ -1618,8 +1629,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._btn_run.setEnabled(False)
         self._btn_stop.setEnabled(True)
-        manual = self._cfg.get("MANUAL", True)
-        self._btn_trigger.setEnabled(manual)
 
     def _stop_run(self):
         """Called by Stop button — early stop, no sig_done."""
@@ -1635,14 +1644,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _enter_standby(self):
         self._btn_run.setEnabled(True)
         self._btn_stop.setEnabled(False)
-        self._btn_trigger.setEnabled(False)
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)
         self._lbl_status.setText("Standby.")
+        self._reload_default_image()
 
-    def _manual_trigger(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.trigger()
+    def _reload_default_image(self):
+        """Display the first image (or a live grab) and rewind the index."""
+        if not self._camera:
+            return
+        try:
+            if self._cfg.get("CAMERA") == "directory":
+                self._camera.reset()          # ensure index at 0
+            img = self._camera.grab()
+            self._view.set_image(img)
+            self._view.clear_overlays()
+            self._current_detect_image = img
+            if self._cfg.get("CAMERA") == "directory":
+                self._camera.reset()          # rewind again so next run starts at 0
+        except CameraError:
+            pass
 
     # ----------------------------------------------------------
     # Worker signal handlers
@@ -1672,7 +1693,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_error(msg)
         self._btn_run.setEnabled(True)
         self._btn_stop.setEnabled(False)
-        self._btn_trigger.setEnabled(False)
 
     # ----------------------------------------------------------
     # Error banner

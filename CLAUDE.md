@@ -409,28 +409,35 @@ On unhandled crash (unexpected exception):
 
 ---
 
-## Project Structure (suggested)
+## Single-File Rule
+
+> **All code lives in `CLearIC.py`. Do not split into modules.**
+> Every class, enum, helper, and entry point belongs in this one file.
+
+## File Structure
 
 ```
 ClearIC_Inspect/
-├── config.py              # FLAGS: DEBUG, CAMERA, IO, MODE + GPIO pin constants
-├── main.py                # Entry point + startup sequence + graceful shutdown
-├── exceptions.py          # Custom exception hierarchy (InspectionError subclasses)
-├── inspection/
-│   ├── detector.py        # YOLO/OpenVINO inference — raises MarkMissingError on FALSE
-│   ├── roi.py             # Template load, ROI mapping, cell extraction
-│   └── result.py          # PASS/FAIL logic, result dataclass
-├── io_handler/
-│   ├── gpio_handler.py    # GPIO read/write; respects IO flag; raises GPIOError
-│   └── camera.py          # Basler capture or directory loader; retry 2× on fail; raises CameraError
-├── ui/
-│   └── app.py             # Frontend (single page)
-├── logger/
-│   └── log.py             # Structured log writer (inspection + error records)
+├── CLearIC.py             # ← entire program: config, IO, camera, UI, inspection
 ├── output/                # Saved FAIL images (auto-created)
 ├── logs/                  # Log files (auto-created)
 ├── templates/             # Saved product templates
 └── models/                # OpenVINO model files
+```
+
+### Sections inside CLearIC.py (in order)
+
+```
+# Config Flags            DEBUG, CAMERA, IO, MODE, GPIO pin constants
+# Stage & Error Flags     Stage enum, ErrorFlag enum
+# Exceptions              InspectionError hierarchy
+# Image                   Image dataclass + _next_image_id()
+# Camera                  Camera class (Basler / directory)
+# RaspberryIO             GPIO handler class
+# Stylesheet              STYLE string
+# FailDialog              Modal FAIL popup
+# MainWindow              PyQt5 single-page UI
+# Entry Point             main() + __main__ guard
 ```
 
 ---

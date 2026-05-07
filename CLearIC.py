@@ -34,7 +34,14 @@ CAMERA = "directory"   # "camera" | "directory"
 IO     = False          # True = real GPIO pins, False = mock / log
 MODE   = "DEBUG"        # "RUN" | "DEBUG"
 
-IMAGE_DIR = "Input"    # folder used when CAMERA="directory"
+# Absolute paths so the app works from any working directory
+_BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR     = os.path.join(_BASE_DIR, "Input")
+OUTPUT_NG_DIR = os.path.join(_BASE_DIR, "output", "Ng")
+OUTPUT_OK_DIR = os.path.join(_BASE_DIR, "output", "GooD")
+
+for _d in (IMAGE_DIR, OUTPUT_NG_DIR, OUTPUT_OK_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 # ─── GPIO Pin Assignment (BCM) ────────────────────────────────────────────────
 
@@ -48,6 +55,14 @@ _ACK_PULSE_S     = 0.1   # 100 ms pulse width
 _CAPTURE_RETRIES = 2
 _RETRY_DELAY_S   = 0.2
 _BASLER_TIMEOUT  = 5000  # ms
+
+# ─── Camera / Processing Constants ───────────────────────────────────────────
+
+CAMERA_SERIAL      = ""       # Basler serial number; empty = first available device
+CAMERA_EXPOSURE_US = 10000    # µs default — overridden live from UI Exposure field
+CAMERA_WARMUP      = 3        # frames to discard after open (sensor stabilise)
+
+PROC_W, PROC_H = 640, 640     # resize target fed to OpenVINO YOLO model
 
 # ─── Model Classes ────────────────────────────────────────────────────────────
 # Detection logic: PASS if any bounding box present in cell (class irrelevant)
@@ -134,6 +149,46 @@ class Image:
         return f"<Image id={self.image_id} size={w}×{h}>"
 
 
+# ─── ImageIO ─────────────────────────────────────────────────────────────────
+
+class ImageIO:
+    """Load / save / list images — mirrors Ref_sample ImageIO pattern.
+
+    load()        → BGR ndarray normalised to (PROC_H × PROC_W)
+    save()        → writes BGR or grayscale as-is
+    list_images() → sorted absolute paths for all image files in a folder
+    """
+
+    _EXTS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+
+    def load(self, path: str) -> np.ndarray:
+        img = cv.imread(path, cv.IMREAD_COLOR)   # force BGR 3-channel
+        if img is None:
+            raise FileNotFoundError(f"Cannot load: {path}")
+        # Normalise channel count (imread IMREAD_COLOR rarely produces these,
+        # but guard for edge cases from exotic decoders)
+        if img.ndim == 2:
+            img = cv.cvtColor(img, cv.COLOR_GRAY2BGR)
+        elif img.shape[2] == 4:
+            img = cv.cvtColor(img, cv.COLOR_BGRA2BGR)
+        # Normalise size to processing resolution
+        if img.shape[:2] != (PROC_H, PROC_W):
+            img = cv.resize(img, (PROC_W, PROC_H), interpolation=cv.INTER_AREA)
+        return img
+
+    def save(self, path: str, img: np.ndarray):
+        cv.imwrite(path, img)
+
+    def list_images(self, folder: str) -> list:
+        if not os.path.isdir(folder):
+            return []
+        return sorted(
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in self._EXTS
+        )
+
+
 # ─── Camera ───────────────────────────────────────────────────────────────────
 
 class Camera:
@@ -148,9 +203,10 @@ class Camera:
     """
 
     def __init__(self):
-        self._cam   = None
-        self._files: list = []
-        self._index = 0
+        self._cam      = None
+        self._files:list = []
+        self._index    = 0
+        self._image_io = ImageIO()
 
         if CAMERA == "camera":
             self._open_basler()
@@ -165,26 +221,47 @@ class Camera:
         if not _PYLON_AVAILABLE:
             raise CameraError("pypylon not installed — cannot use CAMERA='camera'")
         try:
-            self._cam = pylon.InstantCamera(
-                pylon.TlFactory.GetInstance().CreateFirstDevice()
-            )
+            tl   = pylon.TlFactory.GetInstance()
+            devs = tl.EnumerateDevices()
+            device = None
+            if CAMERA_SERIAL:
+                for d in devs:
+                    if d.GetSerialNumber() == CAMERA_SERIAL:
+                        device = tl.CreateDevice(d)
+                        break
+            if device is None:
+                device = tl.CreateFirstDevice()
+
+            self._cam = pylon.InstantCamera(device)
             self._cam.Open()
+            self._cam.ExposureAuto.SetValue("Off")
+            self._cam.ExposureTimeAbs.SetValue(float(CAMERA_EXPOSURE_US))
+            self._cam.PixelFormat.SetValue("Mono8")
+            self._cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+            for _ in range(CAMERA_WARMUP):
+                r = self._cam.RetrieveResult(
+                    _BASLER_TIMEOUT, pylon.TimeoutHandling_ThrowException)
+                r.Release()
+            print(f"[Camera] Opened serial={CAMERA_SERIAL or 'first'}"
+                  f" exposure={CAMERA_EXPOSURE_US}µs warmup={CAMERA_WARMUP}")
         except Exception as exc:
             raise CameraError(f"Basler camera open failed: {exc}") from exc
 
-    _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    def set_exposure(self, us: int):
+        """Update exposure live — only effective when CAMERA='camera'."""
+        if CAMERA == "camera" and self._cam is not None:
+            try:
+                self._cam.ExposureTimeAbs.SetValue(float(us))
+            except Exception as e:
+                print(f"[Camera] Exposure set error: {e}")
 
     def _open_directory(self):
-        os.makedirs(IMAGE_DIR, exist_ok=True)   # create Input/ if absent
-        self._scan_directory()                   # populate self._files (may be empty)
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+        self._scan_directory()
 
     def _scan_directory(self):
-        """Refresh the file list — picks up images added after startup."""
-        self._files = sorted(
-            os.path.join(IMAGE_DIR, name)
-            for name in os.listdir(IMAGE_DIR)
-            if os.path.splitext(name)[1].lower() in self._IMG_EXTS
-        )
+        self._files = self._image_io.list_images(IMAGE_DIR)
 
     def capture(self) -> Image:
         """Grab one frame. Retries up to 2× on transient failure."""
@@ -213,30 +290,35 @@ class Camera:
         return self._grab_directory()
 
     def _grab_basler(self) -> np.ndarray:
-        result = self._cam.GrabOne(_BASLER_TIMEOUT)
+        result = self._cam.RetrieveResult(
+            _BASLER_TIMEOUT, pylon.TimeoutHandling_ThrowException)
         if not result.GrabSucceeded():
-            raise RuntimeError(result.GetErrorDescription())
-        arr = result.GetArray()
-        if arr.ndim == 2:
-            arr = cv.cvtColor(arr, cv.COLOR_GRAY2BGR)
-        return arr
+            desc = result.GetErrorDescription()
+            result.Release()
+            raise RuntimeError(desc)
+        arr = result.GetArray().copy()   # Mono8 H×W uint8
+        result.Release()
+        bgr = cv.cvtColor(arr, cv.COLOR_GRAY2BGR)
+        return cv.resize(bgr, (PROC_W, PROC_H), interpolation=cv.INTER_AREA)
 
     def _grab_directory(self) -> np.ndarray:
-        # Rescan on every wrap-around so new files dropped into Input/ are picked up
+        # Rescan on wrap-around so images added to Input/ are picked up mid-run
         if self._index % max(len(self._files), 1) == 0:
             self._scan_directory()
         if not self._files:
-            raise CameraError(f"No images in '{IMAGE_DIR}' — add image files to Input/")
+            raise CameraError("No images in Input/ — add image files to continue")
         path = self._files[self._index % len(self._files)]
-        frame = cv.imread(path)
-        if frame is None:
-            raise RuntimeError(f"Failed to decode: {path}")
+        try:
+            frame = self._image_io.load(path)   # normalise channels + resize
+        except FileNotFoundError as exc:
+            raise RuntimeError(str(exc)) from exc
         self._index += 1   # advance only on success — retries stay on same file
         return frame
 
     def release(self):
         if self._cam is not None:
             try:
+                self._cam.StopGrabbing()
                 self._cam.Close()
             except Exception:
                 pass
@@ -277,11 +359,11 @@ class RaspberryIO:
         except Exception as exc:
             raise GPIOError(f"GPIO init failed: {exc}") from exc
 
-    def _on_start_edge(self, _channel):
+    def _on_start_edge(self, _):
         if self._start_cb:
             self._start_cb()
 
-    def _on_done_edge(self, _channel):
+    def _on_done_edge(self, _):
         if self._done_cb:
             self._done_cb()
 
@@ -332,12 +414,6 @@ class RaspberryIO:
 def _int_val(field: QLineEdit, default: int = 0) -> int:
     try:
         return int(field.text())
-    except ValueError:
-        return default
-
-def _float_val(field: QLineEdit, default: float = 0.0) -> float:
-    try:
-        return float(field.text())
     except ValueError:
         return default
 
@@ -437,7 +513,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ClearIC Inspect")
-        self.setMinimumSize(1100, 680)
+        self.setMinimumSize(1280, 720)
+        self.resize(1400, 800)
         self.setStyleSheet(STYLE)
 
         central = QWidget()
@@ -448,6 +525,13 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._build_main_view(), stretch=3)
         root.addWidget(self._build_right_panel(), stretch=1)
+
+        # ── Output folders ────────────────────────────────────────────────────
+        os.makedirs(OUTPUT_NG_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_OK_DIR, exist_ok=True)
+
+        # ── Image state ───────────────────────────────────────────────────────
+        self._orig_frame: np.ndarray | None = None   # last captured BGR frame
 
         # ── System state ──────────────────────────────────────────────────────
         self._stage      = Stage.STANDBY
@@ -560,7 +644,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._section_title("Setup"))
 
         self.inp_exposure    = self._labeled_input(layout, "Exposure (µs)",
-                                                   "10000", QIntValidator(1, 1_000_000))
+                                                   str(CAMERA_EXPOSURE_US),
+                                                   QIntValidator(1, 1_000_000))
+        self.inp_exposure.editingFinished.connect(self._on_exposure_changed)
         self.inp_scale       = self._labeled_input(layout, "Scale / ratio",
                                                    "1.0",   QDoubleValidator(0.1, 10.0, 3))
         self.inp_col_offset  = self._labeled_input(layout, "Column offset (px)",
@@ -648,6 +734,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(field)
         return field
 
+    def _on_exposure_changed(self):
+        us = _int_val(self.inp_exposure, CAMERA_EXPOSURE_US)
+        if self._cam is not None:
+            self._cam.set_exposure(us)
+
     # ── Inspection cycle ──────────────────────────────────────────────────────
 
     def _on_start(self):
@@ -717,13 +808,12 @@ class MainWindow(QMainWindow):
                 self._stage = Stage.STANDBY
             self.btn_trigger.setEnabled(True)
             self._refresh_status()
-            # DEBUG auto-cycle: emit done so _on_done feeds the next image.
-            # Only continue if this cycle succeeded — stop on error so bad
-            # states don't loop endlessly.
+            # DEBUG auto-cycle: defer via singleShot(0) so Qt event loop gets
+            # one iteration to repaint before the next capture starts.
             if (DEBUG and CAMERA == "directory"
                     and self._cam is not None
                     and self._error_flag == ErrorFlag.NONE):
-                self._sig_done.emit()
+                QTimer.singleShot(0, self._sig_done.emit)
 
     def _on_done(self):
         """DONE_PIN handler — clear outputs and return to standby.
@@ -740,19 +830,42 @@ class MainWindow(QMainWindow):
         print("[IO] Returning to standby")
 
         if DEBUG and CAMERA == "directory" and self._cam is not None:
-            self._sig_start.emit()
+            QTimer.singleShot(0, self._sig_start.emit)
+
+    # ── resizeEvent — rescale stored frame when window is resized ─────────────
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_image()
 
     # ── Internal UI updaters ──────────────────────────────────────────────────
 
     def _display_image(self, frame: np.ndarray):
-        rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.image_label.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
+        """Store BGR frame and defer scaling to the next event-loop cycle.
+
+        Mirrors Ref_sample ImageView: store first, refresh after layout settles.
+        """
+        self._orig_frame = frame.copy()
+        QTimer.singleShot(0, self._refresh_image)
+
+    def _refresh_image(self):
+        """Scale _orig_frame to the label's current rendered size and paint it.
+
+        Called by _display_image (deferred) and resizeEvent (on window resize).
+        Reads label.width() / label.height() — actual layout dimensions, always
+        valid because we only arrive here via the Qt event loop.
+        """
+        if self._orig_frame is None:
+            return
+        rgb = cv.cvtColor(self._orig_frame, cv.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        pix  = QPixmap.fromImage(qimg)
+        lw, lh = self.image_label.width(), self.image_label.height()
+        if lw > 0 and lh > 0:
+            pix = pix.scaled(lw, lh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setPixmap(pix)
 
     def _update_badge(self, ic: str, passed: bool):
         badge  = self.badge_a if ic == "A" else self.badge_b

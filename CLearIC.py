@@ -34,7 +34,7 @@ CAMERA = "directory"   # "camera" | "directory"
 IO     = False          # True = real GPIO pins, False = mock / log
 MODE   = "DEBUG"        # "RUN" | "DEBUG"
 
-IMAGE_DIR = "Input/"    # folder used when CAMERA="directory"
+IMAGE_DIR = "Input"    # folder used when CAMERA="directory"
 
 # ─── GPIO Pin Assignment (BCM) ────────────────────────────────────────────────
 

@@ -652,8 +652,8 @@ class TemplateManager:
         Given IC at (X, Y) with size (W, H):
           H1 = H2 = H * 0.5
           W1 = W2 = W
-          Y1 = Y - (Y*0.5 + H1*0.25)   (top strip, may be above IC)
-          Y2 = Y + (Y*0.5 + H1*0.25)   (bottom strip, below IC origin)
+          Y1 = Y - H * 0.75   (top strip origin, above IC)
+          Y2 = Y + H * 0.75   (bottom strip origin, straddles IC bottom edge)
 
         Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
         where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
@@ -661,9 +661,10 @@ class TemplateManager:
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
         h1 = max(1, int(h * 0.5))
+        y_center = y + h // 2
 
-        y1 = int(y - (y * 0.5 + h1 * 0.25))
-        y2 = int(y + (y * 0.5 + h1 * 0.25))
+        y1 = int(y_center - h * 0.75)
+        y2 = int(y_center + h * 0.75)
 
         img_h, img_w = image_bgr.shape[:2]
         y1c = max(0, y1)
@@ -719,7 +720,7 @@ class TemplateManager:
         preview = image_bgr.copy()
 
         for rect, color, label in [
-            (ic_a, (0, 215, 255), "IC_A"),   # yellow in BGR
+            (ic_a, (0, 255, 255), "IC_A"),   # yellow in BGR
             (ic_b, (255, 215, 0), "IC_B"),   # cyan in BGR
         ]:
             x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
@@ -736,10 +737,16 @@ class TemplateManager:
                     cv2.putText(preview, f"R{row+1}C{col+1}",
                                 (cx + 2, cy + 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+            # Center cross at IC centroid
+            cx, cy = x + w // 2, y + h // 2
+            arm = max(12, min(w, h) // 6)
+            cv2.line(preview, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2)
+            cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
+            cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
             # Strip ROI positions — same formula as extract_patches
             h1 = max(1, int(h * 0.5))
-            y1 = max(0, int(y - (h * 0.75)))
-            y2 = max(0, int(y + (h * 0.75)))
+            y1 = int(cy - h * 0.8)
+            y2 = int(y + h * 0.8)
             cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
             cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
             cv2.putText(preview, f"TOP y={y1}", (x + 2, y1 + 14),

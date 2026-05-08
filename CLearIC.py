@@ -601,17 +601,40 @@ class Detector:
 # =========================================================
 # CELL GRID CONSTANTS
 # =========================================================
-_CELL_SHRINK = 0.90   # IC rect shrunk to 90% before slicing (keeps grid off raw edges)
-_CELL_EXPAND = 1.10   # each cell expanded 10% after slicing (overlapping neighbours)
+_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
+_CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
+_COL_GAP_PCT    = 15.0   # column gap as % of (shrunk) IC width
 
-def _build_cells(x: int, y: int, w: int, h: int, col_gap_pct: float = 15.0) -> list:
+_DATA_DIR = "Text"       # root folder for cell crop data collection
+
+def _save_cell_crops(image_bgr: np.ndarray, cells: list, ic_label: str):
+    """
+    Crop each cell ROI from image_bgr and save to Text/R{row}C{col}/.
+    Filename: YYYYMMDD_HHMMSS_mmm_IC{label}.png
+    Creates subdirectories on first call.
+    """
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S_") + \
+           f"{datetime.now().microsecond // 1000:03d}"
+    ih, iw = image_bgr.shape[:2]
+    for idx, (cx, cy, cw, ch) in enumerate(cells):
+        row = idx // 2 + 1
+        col = idx %  2 + 1
+        folder = os.path.join(_DATA_DIR, f"R{row}C{col}")
+        os.makedirs(folder, exist_ok=True)
+        x1, y1 = max(0, cx),      max(0, cy)
+        x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
+        crop = image_bgr[y1:y2, x1:x2]
+        if crop.size > 0:
+            cv2.imwrite(os.path.join(folder, f"{ts}_IC{ic_label}.png"), crop)
+
+def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
     Build the 3-row × 2-col cell list for one IC bounding rect.
 
     Steps:
       1. Shrink the IC rect to _CELL_SHRINK (centred), so the grid sits
          slightly inside the mold boundary.
-      2. Slice the shrunk rect into a 3×2 grid with col_gap applied.
+      2. Slice the shrunk rect into a 3×2 grid with _COL_GAP_PCT applied.
       3. Expand every cell to _CELL_EXPAND (centred), so adjacent cells
          overlap — text marks near a boundary are covered by both cells.
     """
@@ -622,7 +645,7 @@ def _build_cells(x: int, y: int, w: int, h: int, col_gap_pct: float = 15.0) -> l
     sy = y + (h - sh) // 2
 
     # Step 2 — grid on shrunk rect
-    col_gap = int(sw * col_gap_pct / 100.0)
+    col_gap = int(sw * _COL_GAP_PCT / 100.0)
     cw = max(1, (sw - col_gap) // 2)
     ch = max(1, sh // 3)
     divider = sx + cw + col_gap          # left col end + gap = right col start
@@ -672,7 +695,7 @@ class TemplateManager:
     def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
              match_threshold: float = 0.6,
              strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
-             strip_h: int = 0, col_gap_pct: float = 0.0):
+             strip_h: int = 0):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
@@ -684,7 +707,6 @@ class TemplateManager:
             "strip_top_y_offset": strip_top_y_offset,
             "strip_bot_y_offset": strip_bot_y_offset,
             "strip_h":            strip_h,
-            "col_gap_pct":        col_gap_pct,
         }
         with open(_TEMPLATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -805,17 +827,9 @@ class TemplateManager:
 
     @staticmethod
     def compute_rois(template: dict) -> tuple:
-        """
-        Returns (ic_a_cells, ic_b_cells).
-        Each is a list of 6 (x, y, w, h) tuples — 3 rows × 2 cols.
-        col_gap shifts the column divider: positive = right col moves right,
-        negative = right col moves left. Both column widths shrink by half the gap.
-        """
-        col_gap_pct = template.get("col_gap_pct", 15.0)
-
+        """Returns (ic_a_cells, ic_b_cells) — list of 6 (x,y,w,h) per IC."""
         def _cells(box: dict) -> list:
-            return _build_cells(box["x"], box["y"], box["w"], box["h"], col_gap_pct)
-
+            return _build_cells(box["x"], box["y"], box["w"], box["h"])
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
 # =========================================================
@@ -886,7 +900,6 @@ class Inspector:
         self._detector        = detector
         self._template        = template
         self._template_matcher = template_matcher
-        self._col_gap_pct     = template.get("col_gap_pct", 15.0)
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -913,8 +926,8 @@ class Inspector:
                 rt_a.x() + dx, rt_a.y() + dy,
                 self._template["ic_b"]["w"], self._template["ic_b"]["h"],
             )
-            ic_a_cells = self._rect_to_cells(rt_a, self._col_gap_pct)
-            ic_b_cells = self._rect_to_cells(rt_b, self._col_gap_pct)
+            ic_a_cells = self._rect_to_cells(rt_a)
+            ic_b_cells = self._rect_to_cells(rt_b)
             if debug:
                 print(f"[Inspector] TemplateMatcher score={score:.3f}")
                 print(f"[Inspector] IC_A matched: "
@@ -936,8 +949,8 @@ class Inspector:
                 if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
                     rt_a, rt_b = None, rt_a
 
-            ic_a_cells = self._rect_to_cells(rt_a, self._col_gap_pct) if rt_a else tmpl_a_cells
-            ic_b_cells = self._rect_to_cells(rt_b, self._col_gap_pct) if rt_b else tmpl_b_cells
+            ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
+            ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
 
             if debug:
                 if rt_a:
@@ -950,6 +963,10 @@ class Inspector:
                           f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
                 else:
                     print("[Inspector] IC_B not found → template fallback → FAIL")
+
+        # Data collection — save each cell crop to Text/R{row}C{col}/
+        _save_cell_crops(image_bgr, ic_a_cells, "A")
+        _save_cell_crops(image_bgr, ic_b_cells, "B")
 
         # Phase 2: check all Text detection boxes against each IC's cells
         all_boxes = self._detector.detect_full_image(image_bgr)  # (x,y,w,h,conf)
@@ -970,10 +987,9 @@ class Inspector:
         return True, True, [], [], annotated
 
     @staticmethod
-    def _rect_to_cells(rect: QtCore.QRect, col_gap_pct: float = 15.0) -> list:
+    def _rect_to_cells(rect: QtCore.QRect) -> list:
         """Divide a QRect into a shrunk+expanded 3-row × 2-col cell grid."""
-        return _build_cells(
-            rect.x(), rect.y(), rect.width(), rect.height(), col_gap_pct)
+        return _build_cells(rect.x(), rect.y(), rect.width(), rect.height())
 
     # Fraction of cell width/height removed from each side as a guard band.
     # Boxes that only clip the border by this margin are not credited.
@@ -1775,14 +1791,6 @@ class MainWindow(QtWidgets.QMainWindow):
             str(self._cfg.get("EXPOSURE_US", 8000)))
         setup_lay.addWidget(self._input_exposure)
 
-        lbl_col_gap = QtWidgets.QLabel("Col gap (%)")
-        lbl_col_gap.setStyleSheet("font-weight:bold")
-        setup_lay.addWidget(lbl_col_gap)
-        self._input_col_gap = QtWidgets.QLineEdit("15")
-        self._input_col_gap.setToolTip(
-            "Shift the column divider as % of IC width. Positive = right, negative = left.")
-        setup_lay.addWidget(self._input_col_gap)
-
         self._btn_detect = QtWidgets.QPushButton("Auto Detect")
         self._btn_detect.clicked.connect(self._start_auto_detect)
         setup_lay.addWidget(self._btn_detect)
@@ -2029,16 +2037,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not save template patches: {e}\n"
                     "Inspection will fall back to YOLO IC localization.")
 
-        try:
-            col_gap_pct = float(self._input_col_gap.text())
-        except ValueError:
-            col_gap_pct = 0.0
-
         TemplateManager.save(ic_a, ic_b, exposure,
                              strip_top_y_offset=top_y_off,
                              strip_bot_y_offset=bot_y_off,
-                             strip_h=strip_h_val,
-                             col_gap_pct=col_gap_pct)
+                             strip_h=strip_h_val)
 
         if self._current_detect_image is not None:
             try:

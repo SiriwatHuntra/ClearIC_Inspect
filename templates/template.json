@@ -13,7 +13,8 @@
   },
   "exposure_us": 8000,
   "match_threshold": 0.6,
-  "strip_top_y_offset": -46,
-  "strip_bot_y_offset": 230,
-  "strip_h": 92
+  "strip_top_y_offset": -56,
+  "strip_bot_y_offset": 147,
+  "strip_h": 92,
+  "col_gap_pct": 15.0
 }

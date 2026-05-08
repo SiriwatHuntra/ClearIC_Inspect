@@ -628,7 +628,7 @@ class TemplateManager:
     def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
              match_threshold: float = 0.6,
              strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
-             strip_h: int = 0):
+             strip_h: int = 0, col_gap_pct: float = 0.0):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
@@ -640,6 +640,7 @@ class TemplateManager:
             "strip_top_y_offset": strip_top_y_offset,
             "strip_bot_y_offset": strip_bot_y_offset,
             "strip_h":            strip_h,
+            "col_gap_pct":        col_gap_pct,
         }
         with open(_TEMPLATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -649,22 +650,24 @@ class TemplateManager:
         """
         Crop top and bottom strips using the defined formula and apply bilateral filter.
 
-        Given IC at (X, Y) with size (W, H):
+        Given IC at (X, Y) with size (W, H), cy = Y + H/2:
           H1 = H2 = H * 0.5
           W1 = W2 = W
-          Y1 = Y - H * 0.75   (top strip origin, above IC)
-          Y2 = Y + H * 0.75   (bottom strip origin, straddles IC bottom edge)
+          Y1 = cy - H*0.8   (top strip anchored from IC center, strip center H*0.55 above cy)
+          Y2 = Y  + H*0.8   (bottom strip anchored from IC top,  strip center H*0.55 below cy)
 
         Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
         where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        h1 = max(1, int(h * 0.5))
-        y_center = y + h // 2
+        h1       = max(1, int(h * 0.5))
+        y_center = y + h // 2       # cy
 
-        y1 = int(y_center - h * 0.75)
-        y2 = int(y_center + h * 0.75)
+        # Top strip anchored from cy (center), bottom from Y (IC top-left).
+        # Strip centers land at equal distance H*0.55 from cy on both sides.
+        y1 = int(y_center - h * 0.8)   # cy − H*0.8  → strip center H*0.55 above cy
+        y2 = int(y        + h * 0.8)   # Y  + H*0.8  → strip center H*0.55 below cy
 
         img_h, img_w = image_bgr.shape[:2]
         y1c = max(0, y1)
@@ -761,17 +764,23 @@ class TemplateManager:
         """
         Returns (ic_a_cells, ic_b_cells).
         Each is a list of 6 (x, y, w, h) tuples — 3 rows × 2 cols.
-        Left col = left half, right col = right half; rows = thirds.
+        col_gap shifts the column divider: positive = right col moves right,
+        negative = right col moves left. Both column widths shrink by half the gap.
         """
+        col_gap_pct = template.get("col_gap_pct", 15.0)   # percentage of IC width
+
         def _cells(box: dict) -> list:
             x, y = box["x"], box["y"]
             w, h = box["w"], box["h"]
-            cw   = w // 2
+            col_gap = int(w * col_gap_pct / 100.0)       # convert % → pixels
+            cw   = max(1, (w - col_gap) // 2)
             ch   = h // 3
+            divider = x + cw + col_gap                   # left col end + gap
+            col_starts = [x, divider]
             cells = []
             for row in range(3):
                 for col in range(2):
-                    cells.append((x + col * cw, y + row * ch, cw, ch))
+                    cells.append((col_starts[col], y + row * ch, cw, ch))
             return cells
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
@@ -843,6 +852,7 @@ class Inspector:
         self._detector        = detector
         self._template        = template
         self._template_matcher = template_matcher
+        self._col_gap_pct     = template.get("col_gap_pct", 15.0)
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -869,8 +879,8 @@ class Inspector:
                 rt_a.x() + dx, rt_a.y() + dy,
                 self._template["ic_b"]["w"], self._template["ic_b"]["h"],
             )
-            ic_a_cells = self._rect_to_cells(rt_a)
-            ic_b_cells = self._rect_to_cells(rt_b)
+            ic_a_cells = self._rect_to_cells(rt_a, self._col_gap_pct)
+            ic_b_cells = self._rect_to_cells(rt_b, self._col_gap_pct)
             if debug:
                 print(f"[Inspector] TemplateMatcher score={score:.3f}")
                 print(f"[Inspector] IC_A matched: "
@@ -892,8 +902,8 @@ class Inspector:
                 if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
                     rt_a, rt_b = None, rt_a
 
-            ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
-            ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
+            ic_a_cells = self._rect_to_cells(rt_a, self._col_gap_pct) if rt_a else tmpl_a_cells
+            ic_b_cells = self._rect_to_cells(rt_b, self._col_gap_pct) if rt_b else tmpl_b_cells
 
             if debug:
                 if rt_a:
@@ -926,32 +936,65 @@ class Inspector:
         return True, True, [], [], annotated
 
     @staticmethod
-    def _rect_to_cells(rect: QtCore.QRect) -> list:
-        """Divide a QRect into a 3-row × 2-col grid of (x, y, w, h) cells."""
-        x, y  = rect.x(),     rect.y()
-        w, h  = rect.width(), rect.height()
-        cw, ch = w // 2,       h // 3
-        return [(x + col * cw, y + row * ch, cw, ch)
+    def _rect_to_cells(rect: QtCore.QRect, col_gap_pct: float = 15.0) -> list:
+        """Divide a QRect into a 3-row × 2-col grid, applying col_gap_pct shift."""
+        x, y = rect.x(),     rect.y()
+        w, h = rect.width(), rect.height()
+        col_gap = int(w * col_gap_pct / 100.0)
+        cw      = max(1, (w - col_gap) // 2)
+        ch      = h // 3
+        divider = x + cw + col_gap          # left col end + gap = right col start
+        col_starts = [x, divider]
+        return [(col_starts[col], y + row * ch, cw, ch)
                 for row in range(3) for col in range(2)]
 
+    # Fraction of cell width/height removed from each side as a guard band.
+    # Boxes that only clip the border by this margin are not credited.
+    _CELL_GUARD = 0.05
+
     @staticmethod
-    def _boxes_intersect(bx1, by1, bw, bh, cx, cy, cw, ch) -> bool:
-        """True if box (bx1,by1,bw,bh) overlaps cell (cx,cy,cw,ch)."""
-        return (bx1 < cx + cw and bx1 + bw > cx and
-                by1 < cy + ch and by1 + bh > cy)
+    def _intersect_area(bx, by, bw, bh, cx, cy, cw, ch) -> int:
+        """Pixel area of intersection between a detection box and a cell."""
+        ix1 = max(bx, cx);  iy1 = max(by, cy)
+        ix2 = min(bx + bw, cx + cw);  iy2 = min(by + bh, cy + ch)
+        return max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
     def _check_ic(self, boxes: list, cells: list,
                   annotated: np.ndarray, debug: bool) -> list:
+        """
+        Dominant-overlap + guard-band cell evaluation.
+
+        Each detection box is assigned to the ONE cell it overlaps the most
+        (after each cell is inset by _CELL_GUARD on every side). A box that
+        only clips a cell border within the guard margin is not credited to
+        either cell, preventing shared false-positives at column/row boundaries.
+        """
+        g = self._CELL_GUARD
+
+        # Build guarded cell rects once
+        guarded = []
+        for cx, cy, cw, ch in cells:
+            mx = int(cw * g);  my = int(ch * g)
+            guarded.append((cx + mx, cy + my, cw - 2 * mx, ch - 2 * my))
+
+        # Assign each box to its dominant cell (largest intersection with guarded rect)
+        cell_hits = [[] for _ in cells]
+        for bx, by, bw, bh, cf in boxes:
+            best_idx  = -1
+            best_area = 0
+            for i, (gx, gy, gw, gh) in enumerate(guarded):
+                area = self._intersect_area(bx, by, bw, bh, gx, gy, gw, gh)
+                if area > best_area:
+                    best_area = area
+                    best_idx  = i
+            if best_idx >= 0 and best_area > 0:
+                cell_hits[best_idx].append((bx, by, bw, bh, cf))
+
         missing = []
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
-            # Collect every box that intersects this cell (for debug count)
-            hits = [
-                (bx, by, bw, bh, cf)
-                for bx, by, bw, bh, cf in boxes
-                if self._boxes_intersect(bx, by, bw, bh, cx, cy, cw, ch)
-            ]
+            hits    = cell_hits[idx]
             present = len(hits) > 0
             if debug:
                 hit_confs = [f"{cf:.3f}" for *_, cf in hits]
@@ -963,8 +1006,12 @@ class Inspector:
             y2 = min(annotated.shape[0], cy + ch)
             cv2.rectangle(annotated, (max(0, cx), max(0, cy)), (x2, y2), color, 2)
             if debug:
-                cv2.putText(annotated, f"R{row}C{col}",
-                            (max(0, cx) + 2, max(0, cy) + 14),
+                label = f"R{row}C{col}"
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                tx = max(0, cx) + (cw - tw) // 2
+                ty = max(0, cy) + (ch + th) // 2
+                cv2.putText(annotated, label, (tx, ty),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                             (0, 200, 0) if present else (0, 0, 220), 1)
             if not present:
@@ -1292,7 +1339,7 @@ class ImageView(QtWidgets.QLabel):
 
         painter.end()
 
-    def mouseMoveEvent(self, _e):
+    def mouseMoveEvent(self, _):
         if self._stamp_mode:
             self.update()
 
@@ -1499,7 +1546,7 @@ class RunWorker(QtCore.QThread):
 
             # ── Inspect ─────────────────────────────────────────────
             try:
-                _ia, _ib, _ma, _mb, annotated = \
+                *_, annotated = \
                     self._inspector.inspect(img_bgr, debug=debug)
 
                 cycle_ms = (time.perf_counter() - t0) * 1000
@@ -1700,6 +1747,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_exposure = QtWidgets.QLineEdit(
             str(self._cfg.get("EXPOSURE_US", 8000)))
         setup_lay.addWidget(self._input_exposure)
+
+        lbl_col_gap = QtWidgets.QLabel("Col gap (%)")
+        lbl_col_gap.setStyleSheet("font-weight:bold")
+        setup_lay.addWidget(lbl_col_gap)
+        self._input_col_gap = QtWidgets.QLineEdit("15")
+        self._input_col_gap.setToolTip(
+            "Shift the column divider as % of IC width. Positive = right, negative = left.")
+        setup_lay.addWidget(self._input_col_gap)
 
         self._btn_detect = QtWidgets.QPushButton("Auto Detect")
         self._btn_detect.clicked.connect(self._start_auto_detect)
@@ -1947,10 +2002,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not save template patches: {e}\n"
                     "Inspection will fall back to YOLO IC localization.")
 
+        try:
+            col_gap_pct = float(self._input_col_gap.text())
+        except ValueError:
+            col_gap_pct = 0.0
+
         TemplateManager.save(ic_a, ic_b, exposure,
                              strip_top_y_offset=top_y_off,
                              strip_bot_y_offset=bot_y_off,
-                             strip_h=strip_h_val)
+                             strip_h=strip_h_val,
+                             col_gap_pct=col_gap_pct)
 
         if self._current_detect_image is not None:
             try:

@@ -29,7 +29,6 @@ import os
 import json
 import glob
 import time
-import math
 from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,7 +43,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 DEBUG     = True      # verbose logs, annotated output
 IO        = False     # True = drive GPIO / False = mock (log only)
 MODE      = "DEBUG"   # "DEBUG" or "RUN"
-DIR_INPUT = "Input/train"   # input image folder for CAMERA="directory" mode
+DIR_INPUT = "Input/train/Text"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 # =========================================================
 # CONFIG LOADER

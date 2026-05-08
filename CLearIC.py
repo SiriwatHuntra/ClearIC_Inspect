@@ -601,7 +601,10 @@ class Detector:
 # =========================================================
 # TEMPLATE MANAGER
 # =========================================================
-_TEMPLATE_FILE = "templates/template.json"
+_TEMPLATE_FILE    = "templates/template.json"
+_TEMPLATE_TOP     = "templates/tmpl_top.npy"
+_TEMPLATE_BOT     = "templates/tmpl_bot.npy"
+_TEMPLATE_PREVIEW = "templates/template_preview.png"
 
 class TemplateManager:
 
@@ -622,17 +625,59 @@ class TemplateManager:
             raise TemplateError(f"Template corrupt: {e}")
 
     @staticmethod
-    def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000):
+    def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
+             strip_ratio: float = 0.25, match_threshold: float = 0.6):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
                      "w": ic_a.width(), "h": ic_a.height()},
             "ic_b": {"x": ic_b.x(), "y": ic_b.y(),
                      "w": ic_b.width(), "h": ic_b.height()},
-            "exposure_us": exposure_us,
+            "exposure_us":     exposure_us,
+            "strip_ratio":     strip_ratio,
+            "match_threshold": match_threshold,
         }
         with open(_TEMPLATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
+
+    @staticmethod
+    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect,
+                        strip_ratio: float = 0.25) -> tuple:
+        """
+        Crop top and bottom strips from ic_rect and apply bilateral filter.
+        Returns (top_filtered, bot_filtered) as BGR ndarrays.
+        """
+        x, y = ic_rect.x(), ic_rect.y()
+        w, h = ic_rect.width(), ic_rect.height()
+        strip_h = max(1, int(h * strip_ratio))
+        top_raw = image_bgr[y:y + strip_h,          x:x + w]
+        bot_raw = image_bgr[y + h - strip_h:y + h,  x:x + w]
+        top_filt = cv2.bilateralFilter(top_raw, 9, 75, 75)
+        bot_filt = cv2.bilateralFilter(bot_raw, 9, 75, 75)
+        return top_filt, bot_filt
+
+    @staticmethod
+    def save_patches(top_patch: np.ndarray, bot_patch: np.ndarray):
+        """Save bilateral-filtered strip patches as .npy files."""
+        os.makedirs("templates", exist_ok=True)
+        np.save(_TEMPLATE_TOP, top_patch)
+        np.save(_TEMPLATE_BOT, bot_patch)
+
+    @staticmethod
+    def load_patches() -> tuple:
+        """
+        Load template patches. Returns (top, bot) ndarrays, or (None, None)
+        if files are absent or corrupt (backward-compatible with old templates).
+        """
+        if not os.path.exists(_TEMPLATE_TOP) or not os.path.exists(_TEMPLATE_BOT):
+            return None, None
+        try:
+            top = np.load(_TEMPLATE_TOP)
+            bot = np.load(_TEMPLATE_BOT)
+            return top, bot
+        except Exception as e:
+            print(f"[TemplateManager] Patch load failed: {e}")
+            return None, None
 
     @staticmethod
     def compute_rois(template: dict) -> tuple:
@@ -654,6 +699,51 @@ class TemplateManager:
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
 # =========================================================
+# TEMPLATE MATCHER
+# =========================================================
+class TemplateMatcher:
+    """
+    Locates IC_A in a new image using bilateral-filtered top/bottom strip
+    template matching (cv2.TM_CCOEFF_NORMED). Replaces Detector.locate_ics()
+    for Phase 1 of inspection.
+
+    If the averaged match score falls below threshold a TemplateError is raised —
+    this acts as a rotation/misalignment rejection gate.
+    """
+
+    def __init__(self, top_patch: np.ndarray, bot_patch: np.ndarray,
+                 threshold: float = 0.6):
+        self._top       = top_patch
+        self._bot       = bot_patch
+        self._threshold = threshold
+        self._patch_w   = top_patch.shape[1]
+        self._strip_h   = top_patch.shape[0]
+
+    def locate_ic(self, image_bgr: np.ndarray) -> tuple:
+        """
+        Returns (QRect, score). Raises TemplateError when score < threshold
+        (rotation or misalignment — caller should treat the frame as FAIL).
+        """
+        filtered = cv2.bilateralFilter(image_bgr, 9, 75, 75)
+
+        res_top = cv2.matchTemplate(filtered, self._top, cv2.TM_CCOEFF_NORMED)
+        _, score_top, _, loc_top = cv2.minMaxLoc(res_top)
+
+        res_bot = cv2.matchTemplate(filtered, self._bot, cv2.TM_CCOEFF_NORMED)
+        _, score_bot, _, loc_bot = cv2.minMaxLoc(res_bot)
+
+        score = (score_top + score_bot) / 2.0
+        if score < self._threshold:
+            raise TemplateError(
+                f"Match score {score:.3f} < {self._threshold:.3f} — "
+                "IC rotation or misalignment detected")
+
+        ic_x = (loc_top[0] + loc_bot[0]) // 2
+        ic_y = loc_top[1]
+        ic_h = (loc_bot[1] + self._strip_h) - loc_top[1]
+        return QtCore.QRect(ic_x, ic_y, self._patch_w, ic_h), score
+
+# =========================================================
 # INSPECTOR
 # =========================================================
 class Inspector:
@@ -662,57 +752,74 @@ class Inspector:
     Raises MarkMissingError if either IC has any cell without an overlapping detection.
     """
 
-    def __init__(self, detector: Detector, template: dict):
-        self._detector = detector
-        self._template = template
+    def __init__(self, detector: Detector, template: dict,
+                 template_matcher: "TemplateMatcher | None" = None):
+        self._detector        = detector
+        self._template        = template
+        self._template_matcher = template_matcher
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
         """
         Returns (ic_a_pass, ic_b_pass, missing_a, missing_b, annotated_bgr).
         Raises MarkMissingError if either IC fails.
+        Raises TemplateError if template matching rejects the frame (rotation/misalignment).
 
-        Two-phase approach to prevent A/B swap:
-          Phase 1 — locate_ics() finds IC_Presence boxes in the current image
-                     and assigns A=leftmost, B=rightmost by X position.
-          Phase 2 — all detection boxes are checked against each IC's cells.
-
-        If fewer than 2 IC_Presence boxes are detected, the missing IC position
-        falls back to the saved template coordinates so its cells all return FALSE.
+        Phase 1 — locate IC_A via TemplateMatcher (preferred) or YOLO fallback.
+          TemplateMatcher: bilateral-filtered strip matching; IC_B derived from offset.
+          YOLO fallback:   Detector.locate_ics() with proximity swap logic.
+        Phase 2 — YOLO text detection checked against each IC's cell grid.
         """
         tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template)
-        annotated  = image_bgr.copy()
+        annotated = image_bgr.copy()
 
-        # Phase 1: locate ICs dynamically in the current frame
-        rt_a, rt_b = self._detector.locate_ics(image_bgr)
-
-        # Single IC found: assign to correct A/B slot using template center proximity.
-        # Prevents: IC_A absent, IC_B present → YOLO finds 1 IC → incorrectly assigned to A.
-        if rt_a is not None and rt_b is None:
-            tmpl_a_cx = (self._template["ic_a"]["x"] +
-                         self._template["ic_a"]["w"] // 2)
-            tmpl_b_cx = (self._template["ic_b"]["x"] +
-                         self._template["ic_b"]["w"] // 2)
-            found_cx  = rt_a.x() + rt_a.width() // 2
-            if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
-                # Found IC is closer to IC_B template → IC_A is missing
-                rt_a, rt_b = None, rt_a
-
-        # Build cell grids: use runtime rect when found, template fallback when missing
-        ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
-        ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
-
-        if debug:
-            if rt_a:
-                print(f"[Inspector] IC_A located: "
+        # Phase 1: locate ICs
+        if self._template_matcher is not None:
+            # Template matching path — raises TemplateError if score below threshold
+            rt_a, score = self._template_matcher.locate_ic(image_bgr)
+            dx = self._template["ic_b"]["x"] - self._template["ic_a"]["x"]
+            dy = self._template["ic_b"]["y"] - self._template["ic_a"]["y"]
+            rt_b = QtCore.QRect(
+                rt_a.x() + dx, rt_a.y() + dy,
+                self._template["ic_b"]["w"], self._template["ic_b"]["h"],
+            )
+            ic_a_cells = self._rect_to_cells(rt_a)
+            ic_b_cells = self._rect_to_cells(rt_b)
+            if debug:
+                print(f"[Inspector] TemplateMatcher score={score:.3f}")
+                print(f"[Inspector] IC_A matched: "
                       f"x={rt_a.x()} y={rt_a.y()} w={rt_a.width()} h={rt_a.height()}")
-            else:
-                print("[Inspector] IC_A not found → template fallback → FAIL")
-            if rt_b:
-                print(f"[Inspector] IC_B located: "
+                print(f"[Inspector] IC_B by offset: "
                       f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
-            else:
-                print("[Inspector] IC_B not found → template fallback → FAIL")
+        else:
+            # YOLO fallback path
+            rt_a, rt_b = self._detector.locate_ics(image_bgr)
+
+            # Single IC found: assign to correct A/B slot using template center proximity.
+            # Prevents: IC_A absent, IC_B present → YOLO finds 1 IC → incorrectly assigned to A.
+            if rt_a is not None and rt_b is None:
+                tmpl_a_cx = (self._template["ic_a"]["x"] +
+                             self._template["ic_a"]["w"] // 2)
+                tmpl_b_cx = (self._template["ic_b"]["x"] +
+                             self._template["ic_b"]["w"] // 2)
+                found_cx  = rt_a.x() + rt_a.width() // 2
+                if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
+                    rt_a, rt_b = None, rt_a
+
+            ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
+            ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
+
+            if debug:
+                if rt_a:
+                    print(f"[Inspector] IC_A located (YOLO): "
+                          f"x={rt_a.x()} y={rt_a.y()} w={rt_a.width()} h={rt_a.height()}")
+                else:
+                    print("[Inspector] IC_A not found → template fallback → FAIL")
+                if rt_b:
+                    print(f"[Inspector] IC_B located (YOLO): "
+                          f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
+                else:
+                    print("[Inspector] IC_B not found → template fallback → FAIL")
 
         # Phase 2: check all Text detection boxes against each IC's cells
         all_boxes = self._detector.detect_full_image(image_bgr)  # (x,y,w,h,conf)
@@ -1185,17 +1292,23 @@ class SetupDialog(QtWidgets.QDialog):
         self.adjustSize()
 
     def show_result(self, ic_a: QtCore.QRect | None, ic_b: QtCore.QRect | None,
-                    n_detected: int):
+                    n_detected: int, candidate_idx: int = 0):
         self._ic_a = ic_a
         self._ic_b = ic_b
         both = ic_a is not None and ic_b is not None
         if both:
             self._lbl_status.setText(
-                "IC_A and IC_B detected.\nVerify overlays on image, then Confirm.")
+                f"Candidate {candidate_idx + 1} of {n_detected} shown as IC_A.\n"
+                "Retry to cycle. Confirm when correct.")
             self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
+        elif n_detected == 1:
+            self._lbl_status.setText(
+                "Only 1 IC detected — cannot assign IC_B.\n"
+                "Adjust image or click Retry.")
+            self._lbl_status.setStyleSheet("color:#EF5350;font-size:11px")
         else:
             self._lbl_status.setText(
-                f"Only {n_detected} IC(s) detected.\nAdjust image or click Retry.")
+                "No ICs detected.\nAdjust image or click Retry.")
             self._lbl_status.setStyleSheet("color:#EF5350;font-size:11px")
         self._btn_confirm.setEnabled(both)
         self._btn_retry.setEnabled(True)
@@ -1344,6 +1457,29 @@ class RunWorker(QtCore.QThread):
                 self._gpio.set_fail_b(bool(e.missing_b))
                 self._gpio.pulse_ack()
 
+            except TemplateError as e:
+                # Rotation/misalignment rejection — signal machine FAIL for both ICs,
+                # then continue the loop (next frame may align correctly).
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                all_cells = [[r, c] for r in range(1, 4) for c in range(1, 3)]
+                err = MarkMissingError(all_cells, all_cells, img_bgr.copy())
+
+                self.sig_image.emit(img_bgr)
+                self.sig_fail.emit(err)
+                self.sig_cycle_ms.emit(cycle_ms)
+                self._logger.log_inspection(
+                    img_id, "FAIL", all_cells, "FAIL", all_cells,
+                    cycle_ms, mode, io_mock)
+                cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
+                cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   img_bgr)
+                cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   img_bgr)
+
+                self._gpio.set_fail_a(True)
+                self._gpio.set_fail_b(True)
+                self._gpio.pulse_ack()
+
+                print(f"[RunWorker] Alignment rejected: {e}")
+
             except Exception as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
@@ -1391,9 +1527,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_error = 0
 
         # setup state
-        self._setup_dlg:    SetupDialog | None = None
-        self._pending_ic_a: QtCore.QRect | None = None
-        self._pending_ic_b: QtCore.QRect | None = None
+        self._setup_dlg:           SetupDialog | None = None
+        self._pending_ic_a:        QtCore.QRect | None = None
+        self._pending_ic_b:        QtCore.QRect | None = None
+        self._detect_candidates:   list = []
+        self._detect_candidate_idx: int = 0
+        self._current_detect_image: np.ndarray | None = None
 
         screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
@@ -1663,29 +1802,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_detection(img)
 
     def _retry_detection(self):
-        """Re-run detection on the same grabbed image (called by Retry button)."""
-        if hasattr(self, "_current_detect_image") and \
-                self._current_detect_image is not None:
+        """Cycle to the next sorted YOLO candidate (no new inference needed)."""
+        if self._detect_candidates:
+            self._detect_candidate_idx += 1
+            self._show_candidate()
+        elif self._current_detect_image is not None:
             self._run_detection(self._current_detect_image)
 
     def _run_detection(self, img: np.ndarray):
         if not self._detector:
             return
         rects = self._detector.detect_all(img)
+        # Sort by (x + y) ascending → leftmost-topmost candidate first
+        self._detect_candidates    = sorted(rects, key=lambda r: r.x() + r.y())
+        self._detect_candidate_idx = 0
+        self._show_candidate()
+
+    def _show_candidate(self):
+        """Highlight the current candidate as IC_A and the next one as IC_B."""
+        cands = self._detect_candidates
+        if not cands:
+            if self._setup_dlg and self._setup_dlg.isVisible():
+                self._setup_dlg.show_result(None, None, 0, 0)
+            return
+        idx  = self._detect_candidate_idx % len(cands)
+        ic_a = cands[idx]
+        ic_b = cands[(idx + 1) % len(cands)] if len(cands) >= 2 else None
         self._view.clear_overlays()
-        ic_a = ic_b = None
-        for i, rect in enumerate(rects[:2]):
-            color = QtGui.QColor("#FFD700") if i == 0 else QtGui.QColor("#00E5FF")
-            label = "IC_A" if i == 0 else "IC_B"
-            self._view.add_overlay(rect, color, label)
-            if i == 0:
-                ic_a = rect
-            else:
-                ic_b = rect
-        if self._setup_dlg and self._setup_dlg.isVisible():
-            self._setup_dlg.show_result(ic_a, ic_b, len(rects))
+        self._view.add_overlay(ic_a, QtGui.QColor("#FFD700"), "IC_A")
+        if ic_b:
+            self._view.add_overlay(ic_b, QtGui.QColor("#00E5FF"), "IC_B")
         self._pending_ic_a = ic_a
         self._pending_ic_b = ic_b
+        if self._setup_dlg and self._setup_dlg.isVisible():
+            self._setup_dlg.show_result(ic_a, ic_b, len(cands), idx)
 
     def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         self._pending_ic_a = ic_a
@@ -1695,10 +1845,26 @@ class MainWindow(QtWidgets.QMainWindow):
             exposure = int(self._input_exposure.text())
         except ValueError:
             exposure = 8000
+
+        # Extract bilateral-filtered strip patches from the confirmed IC_A rect
+        patch_saved = False
+        if self._current_detect_image is not None:
+            try:
+                top_patch, bot_patch = TemplateManager.extract_patches(
+                    self._current_detect_image, ic_a)
+                TemplateManager.save_patches(top_patch, bot_patch)
+                patch_saved = True
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Patch Warning",
+                    f"Could not save template patches: {e}\n"
+                    "Inspection will fall back to YOLO IC localization.")
+
         TemplateManager.save(ic_a, ic_b, exposure)
-        QtWidgets.QMessageBox.information(
-            self, "Template Saved",
-            "Template saved to templates/template.json")
+        msg = "Template saved to templates/template.json"
+        if patch_saved:
+            msg += "\nPatch files saved (tmpl_top.npy / tmpl_bot.npy)"
+        QtWidgets.QMessageBox.information(self, "Template Saved", msg)
 
     def _cancel_detect(self):
         self._view.clear_overlays()
@@ -1721,7 +1887,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
-        inspector = Inspector(self._detector, tmpl)
+        top_patch, bot_patch = TemplateManager.load_patches()
+        if top_patch is not None and bot_patch is not None:
+            matcher = TemplateMatcher(
+                top_patch, bot_patch,
+                threshold=tmpl.get("match_threshold", 0.6))
+            print("[MainWindow] TemplateMatcher loaded — using template matching for IC localization.")
+        else:
+            matcher = None
+            print("[MainWindow] No patch files found — falling back to YOLO locate_ics().")
+
+        inspector = Inspector(self._detector, tmpl, template_matcher=matcher)
         gpio      = self._gpio or RaspberryIO(io_enabled=False)
 
         self._worker = RunWorker(

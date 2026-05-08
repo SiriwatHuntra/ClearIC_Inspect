@@ -16,7 +16,7 @@ System checks all 12 cells per image and signals results via GPIO.
 | Capability | Detail |
 |---|---|
 | IC Detection (setup) | YOLO auto-detects IC bounding boxes from a reference image |
-| Template Creation | One-click "Auto Detect" saves IC_A + IC_B positions + bilateral-filtered strip patches |
+| Template Creation | One-click "Auto Detect" saves IC_A + IC_B bounding box positions (used to define the 3×2 cell grids); strip patches also saved but not yet active at runtime |
 | Mark Inspection | YOLO (OpenVINO, CPU) checks all 12 ROI cells per image for laser-mark presence |
 | Real-time UI | Live annotated image, IC_A/IC_B PASS/FAIL badges, cycle time, pass/fail/error counters |
 | FAIL Popup | Modal dialog listing which IC and which cells (row/col) failed — requires acknowledgement |
@@ -40,12 +40,14 @@ System checks all 12 cells per image and signals results via GPIO.
         ▼
    Inspector.inspect()
     │
-    ├─ Phase 1 — Locate ICs
-    │     TemplateMatcher (preferred)
-    │       bilateral filter → Otsu threshold → strip template match
-    │       IC_B derived from saved dx/dy offset
-    │     OR  Detector.locate_ics() (YOLO fallback)
+    ├─ Phase 1 — Locate ICs  [current: YOLO only]
+    │     Detector.locate_ics()
     │       class 0 = IC_Presence, two largest boxes → sorted left→right
+    │     Template JSON → compute cell grids (fallback if YOLO misses one IC)
+    │     ──────────────────────────────────────────────────────────────────
+    │     [built, disabled] TemplateMatcher
+    │       bilateral filter → Otsu threshold → strip template match
+    │       IC_B derived from saved dx/dy offset — matcher=None in _start_run()
     │
     ├─ Phase 2 — Build cell grids
     │     _build_cells(): shrink IC rect (×0.95) → slice 3×2 grid

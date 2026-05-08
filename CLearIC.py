@@ -626,35 +626,59 @@ class TemplateManager:
 
     @staticmethod
     def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
-             strip_ratio: float = 0.25, match_threshold: float = 0.6):
+             match_threshold: float = 0.6,
+             strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
+             strip_h: int = 0):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
                      "w": ic_a.width(), "h": ic_a.height()},
             "ic_b": {"x": ic_b.x(), "y": ic_b.y(),
                      "w": ic_b.width(), "h": ic_b.height()},
-            "exposure_us":     exposure_us,
-            "strip_ratio":     strip_ratio,
-            "match_threshold": match_threshold,
+            "exposure_us":        exposure_us,
+            "match_threshold":    match_threshold,
+            "strip_top_y_offset": strip_top_y_offset,
+            "strip_bot_y_offset": strip_bot_y_offset,
+            "strip_h":            strip_h,
         }
         with open(_TEMPLATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
     @staticmethod
-    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect,
-                        strip_ratio: float = 0.25) -> tuple:
+    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
-        Crop top and bottom strips from ic_rect and apply bilateral filter.
-        Returns (top_filtered, bot_filtered) as BGR ndarrays.
+        Crop top and bottom strips using the defined formula and apply bilateral filter.
+
+        Given IC at (X, Y) with size (W, H):
+          H1 = H2 = H * 0.5
+          W1 = W2 = W
+          Y1 = Y - (Y*0.5 + H1*0.25)   (top strip, may be above IC)
+          Y2 = Y + (Y*0.5 + H1*0.25)   (bottom strip, below IC origin)
+
+        Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
+        where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        strip_h = max(1, int(h * strip_ratio))
-        top_raw = image_bgr[y:y + strip_h,          x:x + w]
-        bot_raw = image_bgr[y + h - strip_h:y + h,  x:x + w]
+        h1 = max(1, int(h * 0.5))
+
+        y1 = int(y - (y * 0.5 + h1 * 0.25))
+        y2 = int(y + (y * 0.5 + h1 * 0.25))
+
+        img_h, img_w = image_bgr.shape[:2]
+        y1c = max(0, y1)
+        y2c = max(0, min(y2, img_h - h1))
+        x_end = min(x + w, img_w)
+
+        top_raw = image_bgr[y1c:y1c + h1, x:x_end]
+        bot_raw = image_bgr[y2c:y2c + h1, x:x_end]
         top_filt = cv2.bilateralFilter(top_raw, 9, 75, 75)
         bot_filt = cv2.bilateralFilter(bot_raw, 9, 75, 75)
-        return top_filt, bot_filt
+
+        # Offset = strip_top_y - IC_y (negative means strip is above IC origin)
+        top_y_offset = y1c - y
+        bot_y_offset = y2c - y
+        return top_filt, bot_filt, top_y_offset, bot_y_offset, h1
 
     @staticmethod
     def save_patches(top_patch: np.ndarray, bot_patch: np.ndarray):
@@ -678,6 +702,52 @@ class TemplateManager:
         except Exception as e:
             print(f"[TemplateManager] Patch load failed: {e}")
             return None, None
+
+    @staticmethod
+    def save_preview(image_bgr: np.ndarray,
+                     ic_a: QtCore.QRect, ic_b: QtCore.QRect):
+        """
+        Save an annotated preview image showing what the program detected:
+        - IC_A box (yellow) and IC_B box (cyan) with labels
+        - 3×2 cell grid inside each IC box
+        - Top/bottom strip ROIs used for template matching (magenta), at their
+          actual computed positions per the strip formula
+        Saved to templates/template_preview.png for visual verification.
+        """
+        os.makedirs("templates", exist_ok=True)
+        img_h = image_bgr.shape[0]
+        preview = image_bgr.copy()
+
+        for rect, color, label in [
+            (ic_a, (0, 215, 255), "IC_A"),   # yellow in BGR
+            (ic_b, (255, 215, 0), "IC_B"),   # cyan in BGR
+        ]:
+            x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+            # Outer IC box
+            cv2.rectangle(preview, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(preview, label, (x + 4, y + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # 3×2 cell grid
+            cw, ch = w // 2, h // 3
+            for row in range(3):
+                for col in range(2):
+                    cx, cy = x + col * cw, y + row * ch
+                    cv2.rectangle(preview, (cx, cy), (cx + cw, cy + ch), color, 1)
+                    cv2.putText(preview, f"R{row+1}C{col+1}",
+                                (cx + 2, cy + 12),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+            # Strip ROI positions — same formula as extract_patches
+            h1 = max(1, int(h * 0.5))
+            y1 = max(0, int(y - (h * 0.75)))
+            y2 = max(0, int(y + (h * 0.75)))
+            cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
+            cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
+            cv2.putText(preview, f"TOP y={y1}", (x + 2, y1 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
+            cv2.putText(preview, f"BOT y={y2}", (x + 2, y2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
+
+        cv2.imwrite(_TEMPLATE_PREVIEW, preview)
 
     @staticmethod
     def compute_rois(template: dict) -> tuple:
@@ -712,17 +782,24 @@ class TemplateMatcher:
     """
 
     def __init__(self, top_patch: np.ndarray, bot_patch: np.ndarray,
-                 threshold: float = 0.6):
-        self._top       = top_patch
-        self._bot       = bot_patch
-        self._threshold = threshold
-        self._patch_w   = top_patch.shape[1]
-        self._strip_h   = top_patch.shape[0]
+                 threshold: float = 0.6,
+                 strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
+                 ic_h: int = 0):
+        self._top            = top_patch
+        self._bot            = bot_patch
+        self._threshold      = threshold
+        self._patch_w        = top_patch.shape[1]
+        self._top_y_offset   = strip_top_y_offset  # strip_top_y - IC_y at creation
+        self._bot_y_offset   = strip_bot_y_offset  # strip_bot_y - IC_y at creation
+        self._ic_h           = ic_h
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
         Returns (QRect, score). Raises TemplateError when score < threshold
         (rotation or misalignment — caller should treat the frame as FAIL).
+
+        IC position is reconstructed using stored strip offsets:
+          ic_y = matched_strip_y - strip_y_offset
         """
         filtered = cv2.bilateralFilter(image_bgr, 9, 75, 75)
 
@@ -738,10 +815,12 @@ class TemplateMatcher:
                 f"Match score {score:.3f} < {self._threshold:.3f} — "
                 "IC rotation or misalignment detected")
 
+        # Reconstruct IC position: ic_y = matched_strip_top_y - offset
+        ic_y_from_top = loc_top[1] - self._top_y_offset
+        ic_y_from_bot = loc_bot[1] - self._bot_y_offset
+        ic_y = (ic_y_from_top + ic_y_from_bot) // 2
         ic_x = (loc_top[0] + loc_bot[0]) // 2
-        ic_y = loc_top[1]
-        ic_h = (loc_bot[1] + self._strip_h) - loc_top[1]
-        return QtCore.QRect(ic_x, ic_y, self._patch_w, ic_h), score
+        return QtCore.QRect(ic_x, ic_y, self._patch_w, self._ic_h), score
 
 # =========================================================
 # INSPECTOR
@@ -1848,10 +1927,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Extract bilateral-filtered strip patches from the confirmed IC_A rect
         patch_saved = False
+        top_y_off = bot_y_off = strip_h_val = 0
         if self._current_detect_image is not None:
             try:
-                top_patch, bot_patch = TemplateManager.extract_patches(
-                    self._current_detect_image, ic_a)
+                top_patch, bot_patch, top_y_off, bot_y_off, strip_h_val = \
+                    TemplateManager.extract_patches(self._current_detect_image, ic_a)
                 TemplateManager.save_patches(top_patch, bot_patch)
                 patch_saved = True
             except Exception as e:
@@ -1860,10 +1940,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not save template patches: {e}\n"
                     "Inspection will fall back to YOLO IC localization.")
 
-        TemplateManager.save(ic_a, ic_b, exposure)
+        TemplateManager.save(ic_a, ic_b, exposure,
+                             strip_top_y_offset=top_y_off,
+                             strip_bot_y_offset=bot_y_off,
+                             strip_h=strip_h_val)
+
+        if self._current_detect_image is not None:
+            try:
+                TemplateManager.save_preview(self._current_detect_image, ic_a, ic_b)
+            except Exception:
+                pass  # preview is non-critical
+
         msg = "Template saved to templates/template.json"
         if patch_saved:
             msg += "\nPatch files saved (tmpl_top.npy / tmpl_bot.npy)"
+        msg += "\nPreview saved to templates/template_preview.png"
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
 
     def _cancel_detect(self):
@@ -1891,7 +1982,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if top_patch is not None and bot_patch is not None:
             matcher = TemplateMatcher(
                 top_patch, bot_patch,
-                threshold=tmpl.get("match_threshold", 0.6))
+                threshold=tmpl.get("match_threshold", 0.6),
+                strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
+                strip_bot_y_offset=tmpl.get("strip_bot_y_offset", 0),
+                ic_h=tmpl["ic_a"]["h"],
+            )
             print("[MainWindow] TemplateMatcher loaded — using template matching for IC localization.")
         else:
             matcher = None

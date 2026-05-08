@@ -12,6 +12,8 @@
     "h": 187
   },
   "exposure_us": 8000,
-  "strip_ratio": 0.25,
-  "match_threshold": 0.6
+  "match_threshold": 0.6,
+  "strip_top_y_offset": -250,
+  "strip_bot_y_offset": 250,
+  "strip_h": 92
 }

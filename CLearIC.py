@@ -41,10 +41,11 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 # =========================================================
 # HARDCODED DEV FLAGS  (edit here before running — not in Config.json)
 # =========================================================
-DEBUG  = True      # verbose logs, annotated output
-IO     = False     # True = drive GPIO / False = mock (log only)
-MODE   = "DEBUG"   # "DEBUG" or "RUN"
-
+DEBUG     = True      # verbose logs, annotated output
+IO        = False     # True = drive GPIO / False = mock (log only)
+MODE      = "DEBUG"   # "DEBUG" or "RUN"
+DIR_INPUT = "Input/test"   # input image folder for CAMERA="directory" mode
+OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 # =========================================================
 # CONFIG LOADER
 # =========================================================
@@ -1685,13 +1686,14 @@ def _output_paths(img_id: str) -> tuple:
       date/Image/img_id.jpg     — annotated image
     Creates directories on first call.
     """
+    prefix = OUT_DIR
     date     = datetime.now().strftime("%Y%m%d")
     real_dir = os.path.join(date, "RealImg")
     ann_dir  = os.path.join(date, "Image")
     os.makedirs(real_dir, exist_ok=True)
     os.makedirs(ann_dir,  exist_ok=True)
-    return (os.path.join(real_dir, f"{img_id}.jpg"),
-            os.path.join(ann_dir,  f"{img_id}.jpg"))
+    return (os.path.join(prefix, real_dir, f"{img_id}.jpg"),
+            os.path.join(prefix, ann_dir,  f"{img_id}.jpg"))
 
 class MainWindow(QtWidgets.QMainWindow):
 
@@ -1918,6 +1920,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mode=cfg.get("CAMERA", "directory"),
                 serial=cfg.get("CAMERA_SERIAL", ""),
                 exposure_us=cfg.get("EXPOSURE_US", 8000),
+                input_dir=DIR_INPUT,
             )
             self._camera.open()
         except CameraError as e:
@@ -2214,7 +2217,7 @@ def main():
 
     os.makedirs(_LOG_DIR,   exist_ok=True)
     os.makedirs("templates", exist_ok=True)
-    os.makedirs("Input",     exist_ok=True)
+    os.makedirs(DIR_INPUT,   exist_ok=True)
     os.makedirs(_DATA_DIR,   exist_ok=True)
 
     app = QtWidgets.QApplication(sys.argv)

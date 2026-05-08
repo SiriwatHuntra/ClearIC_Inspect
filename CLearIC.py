@@ -603,7 +603,7 @@ class Detector:
 # =========================================================
 _CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
 _CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
-_COL_GAP_PCT    = 15.0   # column gap as % of (shrunk) IC width
+_COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
 _DATA_DIR = "Text"       # root folder for cell crop data collection
 
@@ -1550,9 +1550,6 @@ class RunWorker(QtCore.QThread):
         mode     = MODE
         io_mock  = not IO
         debug    = DEBUG
-        os.makedirs("output", exist_ok=True)
-        os.makedirs(os.path.join("Input", "results"), exist_ok=True)
-        #input_results = os.path.join("Input", "results")
 
         self.sig_status.emit("Running…")
 
@@ -1600,9 +1597,8 @@ class RunWorker(QtCore.QThread):
                     img_id, "PASS", [], "PASS", [],
                     cycle_ms, mode, io_mock)
 
-                # Save annotated PASS image to output/ and Input/results/
-                cv2.imwrite(os.path.join("output",       f"{img_id}.png"), annotated)
-                #cv2.imwrite(os.path.join(input_results,  f"{img_id}.png"), annotated)
+                _, ann_path = _output_paths(img_id)
+                cv2.imwrite(ann_path, annotated)
 
                 # GPIO: both FAIL pins LOW → pulse ACK
                 self._gpio.set_fail_a(False)
@@ -1623,10 +1619,9 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if e.missing_b else "PASS", e.missing_b,
                     cycle_ms, mode, io_mock)
 
-                # FAIL: save raw + annotated to output/ and annotated to Input/results/
-                cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
-                cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   annotated)
-                #cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   annotated)
+                real_path, ann_path = _output_paths(img_id)
+                cv2.imwrite(real_path, img_bgr)
+                cv2.imwrite(ann_path,  annotated)
 
                 # GPIO: set FAIL pins then pulse ACK
                 self._gpio.set_fail_a(bool(e.missing_a))
@@ -1646,9 +1641,8 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_inspection(
                     img_id, "FAIL", all_cells, "FAIL", all_cells,
                     cycle_ms, mode, io_mock)
-                cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
-                cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   img_bgr)
-                # cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   img_bgr)
+                real_path, _ = _output_paths(img_id)
+                cv2.imwrite(real_path, img_bgr)
 
                 self._gpio.set_fail_a(True)
                 self._gpio.set_fail_b(True)
@@ -1684,7 +1678,20 @@ class RunWorker(QtCore.QThread):
 # =========================================================
 # MAIN WINDOW
 # =========================================================
-_OUTPUT_DIR = "output"
+def _output_paths(img_id: str) -> tuple:
+    """
+    Returns (real_path, annotated_path) for today's date-based output folders.
+      date/RealImg/img_id.jpg   — raw image
+      date/Image/img_id.jpg     — annotated image
+    Creates directories on first call.
+    """
+    date     = datetime.now().strftime("%Y%m%d")
+    real_dir = os.path.join(date, "RealImg")
+    ann_dir  = os.path.join(date, "Image")
+    os.makedirs(real_dir, exist_ok=True)
+    os.makedirs(ann_dir,  exist_ok=True)
+    return (os.path.join(real_dir, f"{img_id}.jpg"),
+            os.path.join(ann_dir,  f"{img_id}.jpg"))
 
 class MainWindow(QtWidgets.QMainWindow):
 
@@ -2205,9 +2212,10 @@ def main():
         print(f"[Config] {e}")
         sys.exit(1)
 
-    os.makedirs(_OUTPUT_DIR, exist_ok=True)
-    os.makedirs(_LOG_DIR, exist_ok=True)
+    os.makedirs(_LOG_DIR,   exist_ok=True)
     os.makedirs("templates", exist_ok=True)
+    os.makedirs("Input",     exist_ok=True)
+    os.makedirs(_DATA_DIR,   exist_ok=True)
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)

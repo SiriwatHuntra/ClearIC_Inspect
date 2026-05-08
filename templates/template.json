@@ -15,6 +15,5 @@
   "match_threshold": 0.6,
   "strip_top_y_offset": -56,
   "strip_bot_y_offset": 147,
-  "strip_h": 92,
-  "col_gap_pct": 40.0
+  "strip_h": 92
 }

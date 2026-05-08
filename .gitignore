@@ -226,7 +226,14 @@ __marimo__/
 
 # Local
 Input/
-output/
+Output/
 logs/
 Ref_sample.py
 templates/
+
+#image files
+*.jpg
+*.jpeg  
+*.png
+*.bmp
+*.tiff

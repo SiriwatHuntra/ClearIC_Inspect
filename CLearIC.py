@@ -599,6 +599,50 @@ class Detector:
         return [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
 
 # =========================================================
+# CELL GRID CONSTANTS
+# =========================================================
+_CELL_SHRINK = 0.90   # IC rect shrunk to 90% before slicing (keeps grid off raw edges)
+_CELL_EXPAND = 1.10   # each cell expanded 10% after slicing (overlapping neighbours)
+
+def _build_cells(x: int, y: int, w: int, h: int, col_gap_pct: float = 15.0) -> list:
+    """
+    Build the 3-row × 2-col cell list for one IC bounding rect.
+
+    Steps:
+      1. Shrink the IC rect to _CELL_SHRINK (centred), so the grid sits
+         slightly inside the mold boundary.
+      2. Slice the shrunk rect into a 3×2 grid with col_gap applied.
+      3. Expand every cell to _CELL_EXPAND (centred), so adjacent cells
+         overlap — text marks near a boundary are covered by both cells.
+    """
+    # Step 1 — shrink (centred)
+    sw = max(1, int(w * _CELL_SHRINK))
+    sh = max(1, int(h * _CELL_SHRINK))
+    sx = x + (w - sw) // 2
+    sy = y + (h - sh) // 2
+
+    # Step 2 — grid on shrunk rect
+    col_gap = int(sw * col_gap_pct / 100.0)
+    cw = max(1, (sw - col_gap) // 2)
+    ch = max(1, sh // 3)
+    divider = sx + cw + col_gap          # left col end + gap = right col start
+    col_starts = [sx, divider]
+
+    # Step 3 — expand each cell (centred)
+    exp_w = max(1, int(cw * _CELL_EXPAND))
+    exp_h = max(1, int(ch * _CELL_EXPAND))
+    dw    = (exp_w - cw) // 2
+    dh    = (exp_h - ch) // 2
+
+    cells = []
+    for row in range(3):
+        for col in range(2):
+            cx = col_starts[col] - dw
+            cy = sy + row * ch  - dh
+            cells.append((cx, cy, exp_w, exp_h))
+    return cells
+
+# =========================================================
 # TEMPLATE MANAGER
 # =========================================================
 _TEMPLATE_FILE    = "templates/template.json"
@@ -767,21 +811,11 @@ class TemplateManager:
         col_gap shifts the column divider: positive = right col moves right,
         negative = right col moves left. Both column widths shrink by half the gap.
         """
-        col_gap_pct = template.get("col_gap_pct", 15.0)   # percentage of IC width
+        col_gap_pct = template.get("col_gap_pct", 15.0)
 
         def _cells(box: dict) -> list:
-            x, y = box["x"], box["y"]
-            w, h = box["w"], box["h"]
-            col_gap = int(w * col_gap_pct / 100.0)       # convert % → pixels
-            cw   = max(1, (w - col_gap) // 2)
-            ch   = h // 3
-            divider = x + cw + col_gap                   # left col end + gap
-            col_starts = [x, divider]
-            cells = []
-            for row in range(3):
-                for col in range(2):
-                    cells.append((col_starts[col], y + row * ch, cw, ch))
-            return cells
+            return _build_cells(box["x"], box["y"], box["w"], box["h"], col_gap_pct)
+
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
 # =========================================================
@@ -937,16 +971,9 @@ class Inspector:
 
     @staticmethod
     def _rect_to_cells(rect: QtCore.QRect, col_gap_pct: float = 15.0) -> list:
-        """Divide a QRect into a 3-row × 2-col grid, applying col_gap_pct shift."""
-        x, y = rect.x(),     rect.y()
-        w, h = rect.width(), rect.height()
-        col_gap = int(w * col_gap_pct / 100.0)
-        cw      = max(1, (w - col_gap) // 2)
-        ch      = h // 3
-        divider = x + cw + col_gap          # left col end + gap = right col start
-        col_starts = [x, divider]
-        return [(col_starts[col], y + row * ch, cw, ch)
-                for row in range(3) for col in range(2)]
+        """Divide a QRect into a shrunk+expanded 3-row × 2-col cell grid."""
+        return _build_cells(
+            rect.x(), rect.y(), rect.width(), rect.height(), col_gap_pct)
 
     # Fraction of cell width/height removed from each side as a guard band.
     # Boxes that only clip the border by this margin are not credited.
@@ -1509,7 +1536,7 @@ class RunWorker(QtCore.QThread):
         debug    = DEBUG
         os.makedirs("output", exist_ok=True)
         os.makedirs(os.path.join("Input", "results"), exist_ok=True)
-        input_results = os.path.join("Input", "results")
+        #input_results = os.path.join("Input", "results")
 
         self.sig_status.emit("Running…")
 
@@ -1559,7 +1586,7 @@ class RunWorker(QtCore.QThread):
 
                 # Save annotated PASS image to output/ and Input/results/
                 cv2.imwrite(os.path.join("output",       f"{img_id}.png"), annotated)
-                cv2.imwrite(os.path.join(input_results,  f"{img_id}.png"), annotated)
+                #cv2.imwrite(os.path.join(input_results,  f"{img_id}.png"), annotated)
 
                 # GPIO: both FAIL pins LOW → pulse ACK
                 self._gpio.set_fail_a(False)
@@ -1583,7 +1610,7 @@ class RunWorker(QtCore.QThread):
                 # FAIL: save raw + annotated to output/ and annotated to Input/results/
                 cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
                 cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   annotated)
-                cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   annotated)
+                #cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   annotated)
 
                 # GPIO: set FAIL pins then pulse ACK
                 self._gpio.set_fail_a(bool(e.missing_a))
@@ -1605,7 +1632,7 @@ class RunWorker(QtCore.QThread):
                     cycle_ms, mode, io_mock)
                 cv2.imwrite(os.path.join("output",      f"{img_id}_R.png"), img_bgr)
                 cv2.imwrite(os.path.join("output",      f"{img_id}.png"),   img_bgr)
-                cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   img_bgr)
+                # cv2.imwrite(os.path.join(input_results, f"{img_id}.png"),   img_bgr)
 
                 self._gpio.set_fail_a(True)
                 self._gpio.set_fail_b(True)

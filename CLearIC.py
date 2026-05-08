@@ -44,7 +44,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 DEBUG     = True      # verbose logs, annotated output
 IO        = False     # True = drive GPIO / False = mock (log only)
 MODE      = "DEBUG"   # "DEBUG" or "RUN"
-DIR_INPUT = "Input/test"   # input image folder for CAMERA="directory" mode
+DIR_INPUT = "Input/train"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 # =========================================================
 # CONFIG LOADER
@@ -728,28 +728,33 @@ class TemplateManager:
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        h1       = max(1, int(h * 0.5))
-        y_center = y + h // 2       # cy
+        # Strip height ≈ lead/pin area (25% of IC height)
+        h1 = max(1, int(h * 0.25))
 
-        # Top strip anchored from cy (center), bottom from Y (IC top-left).
-        # Strip centers land at equal distance H*0.55 from cy on both sides.
-        y1 = int(y_center - h * 0.8)   # cy − H*0.8  → strip center H*0.55 above cy
-        y2 = int(y        + h * 0.8)   # Y  + H*0.8  → strip center H*0.55 below cy
+        # Top strip: pin leads directly above the IC body  [y-h1 .. y]
+        # Bot strip: pin leads directly below the IC body  [y+h  .. y+h+h1]
+        y1 = y - h1
+        y2 = y + h
 
         img_h, img_w = image_bgr.shape[:2]
-        y1c = max(0, y1)
-        y2c = max(0, min(y2, img_h - h1))
+        y1c   = max(0, y1)
+        y2c   = max(0, min(y2, img_h - h1))
         x_end = min(x + w, img_w)
 
-        top_raw = image_bgr[y1c:y1c + h1, x:x_end]
-        bot_raw = image_bgr[y2c:y2c + h1, x:x_end]
-        top_filt = cv2.bilateralFilter(top_raw, 9, 75, 75)
-        bot_filt = cv2.bilateralFilter(bot_raw, 9, 75, 75)
+        def _to_contour(crop_bgr: np.ndarray) -> np.ndarray:
+            """grayscale → bilateral smooth → Otsu threshold → binary contour."""
+            gray   = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            smooth = cv2.bilateralFilter(gray, 9, 75, 75)
+            _, binary = cv2.threshold(
+                smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return binary   # 2D uint8, values 0 or 255
 
-        # Offset = strip_top_y - IC_y (negative means strip is above IC origin)
-        top_y_offset = y1c - y
-        bot_y_offset = y2c - y
-        return top_filt, bot_filt, top_y_offset, bot_y_offset, h1
+        top_bin = _to_contour(image_bgr[y1c:y1c + h1, x:x_end])
+        bot_bin = _to_contour(image_bgr[y2c:y2c + h1, x:x_end])
+
+        top_y_offset = y1c - y   # ≈ -h1  (strip above IC top)
+        bot_y_offset = y2c - y   # ≈ +h   (strip below IC bottom)
+        return top_bin, bot_bin, top_y_offset, bot_y_offset, h1
 
     @staticmethod
     def save_patches(top_patch: np.ndarray, bot_patch: np.ndarray):
@@ -813,15 +818,16 @@ class TemplateManager:
             cv2.line(preview, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2)
             cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
             cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
-            # Strip ROI positions — same formula as extract_patches
-            h1 = max(1, int(h * 0.5))
-            y1 = int(cy - h * 0.8)
-            y2 = int(y + h * 0.8)
+            # Strip ROI — pin leads above and below IC body (same as extract_patches)
+            h1 = max(1, int(h * 0.25))
+            y1 = max(0, y - h1)    # top leads:  just above IC
+            y2 = y + h              # bottom leads: just below IC
+            y2 = max(0, min(y2, img_h - h1))
             cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
             cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
-            cv2.putText(preview, f"TOP y={y1}", (x + 2, y1 + 14),
+            cv2.putText(preview, "TOP leads", (x + 2, y1 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
-            cv2.putText(preview, f"BOT y={y2}", (x + 2, y2 + 14),
+            cv2.putText(preview, "BOT leads", (x + 2, y2 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
 
         cv2.imwrite(_TEMPLATE_PREVIEW, preview)
@@ -849,30 +855,67 @@ class TemplateMatcher:
     def __init__(self, top_patch: np.ndarray, bot_patch: np.ndarray,
                  threshold: float = 0.6,
                  strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
-                 ic_h: int = 0):
-        self._top            = top_patch
-        self._bot            = bot_patch
-        self._threshold      = threshold
-        self._patch_w        = top_patch.shape[1]
-        self._top_y_offset   = strip_top_y_offset  # strip_top_y - IC_y at creation
-        self._bot_y_offset   = strip_bot_y_offset  # strip_bot_y - IC_y at creation
-        self._ic_h           = ic_h
+                 ic_x: int = 0, ic_y: int = 0,
+                 ic_w: int = 0, ic_h: int = 0,
+                 search_margin: int = 60):
+        self._top          = top_patch
+        self._bot          = bot_patch
+        self._threshold    = threshold
+        self._patch_w      = top_patch.shape[1]
+        self._top_y_offset = strip_top_y_offset
+        self._bot_y_offset = strip_bot_y_offset
+        self._ic_x         = ic_x   # expected IC_A left edge from template
+        self._ic_y         = ic_y   # expected IC_A top from template
+        self._ic_w         = ic_w
+        self._ic_h         = ic_h
+        self._margin       = search_margin   # px around expected pos to search
+
+    def _match_in_roi(self, filtered: np.ndarray, patch: np.ndarray,
+                      exp_x: int, exp_y: int) -> tuple:
+        """
+        Search for patch within ±margin around (exp_x, exp_y).
+        Returns (abs_x, abs_y, score). Falls back to full image if ROI is too small.
+        """
+        img_h, img_w = filtered.shape[:2]
+        ph, pw = patch.shape[:2]
+        m = self._margin
+
+        rx1 = max(0, exp_x - m)
+        ry1 = max(0, exp_y - m)
+        rx2 = min(img_w, exp_x + pw + m)
+        ry2 = min(img_h, exp_y + ph + m)
+        roi  = filtered[ry1:ry2, rx1:rx2]
+
+        if roi.shape[0] < ph or roi.shape[1] < pw:
+            # ROI too small — fall back to full-image search
+            res = cv2.matchTemplate(filtered, patch, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            return loc[0], loc[1], float(score)
+
+        res = cv2.matchTemplate(roi, patch, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+        return loc[0] + rx1, loc[1] + ry1, float(score)
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
-        Returns (QRect, score). Raises TemplateError when score < threshold
-        (rotation or misalignment — caller should treat the frame as FAIL).
-
-        IC position is reconstructed using stored strip offsets:
-          ic_y = matched_strip_y - strip_y_offset
+        Returns (QRect, score). Raises TemplateError when score < threshold.
+        Searches only within ±search_margin of the expected IC_A position so
+        identical ICs elsewhere in the frame are not matched by mistake.
         """
-        filtered = cv2.bilateralFilter(image_bgr, 9, 75, 75)
+        # Apply same preprocessing as extract_patches: grayscale → bilateral → Otsu
+        gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        smooth   = cv2.bilateralFilter(gray, 9, 75, 75)
+        _, filtered = cv2.threshold(
+            smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        res_top = cv2.matchTemplate(filtered, self._top, cv2.TM_CCOEFF_NORMED)
-        _, score_top, _, loc_top = cv2.minMaxLoc(res_top)
+        # Expected absolute strip positions (from template creation)
+        exp_top_y = self._ic_y + self._top_y_offset
+        exp_bot_y = self._ic_y + self._bot_y_offset
 
-        res_bot = cv2.matchTemplate(filtered, self._bot, cv2.TM_CCOEFF_NORMED)
-        _, score_bot, _, loc_bot = cv2.minMaxLoc(res_bot)
+        tx, ty, score_top = self._match_in_roi(
+            filtered, self._top, self._ic_x, exp_top_y)
+        bx, by, score_bot = self._match_in_roi(
+            filtered, self._bot, self._ic_x, exp_bot_y)
 
         score = (score_top + score_bot) / 2.0
         if score < self._threshold:
@@ -880,11 +923,10 @@ class TemplateMatcher:
                 f"Match score {score:.3f} < {self._threshold:.3f} — "
                 "IC rotation or misalignment detected")
 
-        # Reconstruct IC position: ic_y = matched_strip_top_y - offset
-        ic_y_from_top = loc_top[1] - self._top_y_offset
-        ic_y_from_bot = loc_bot[1] - self._bot_y_offset
+        ic_y_from_top = ty - self._top_y_offset
+        ic_y_from_bot = by - self._bot_y_offset
         ic_y = (ic_y_from_top + ic_y_from_bot) // 2
-        ic_x = (loc_top[0] + loc_bot[0]) // 2
+        ic_x = (tx + bx) // 2
         return QtCore.QRect(ic_x, ic_y, self._patch_w, self._ic_h), score
 
 # =========================================================
@@ -1688,12 +1730,12 @@ def _output_paths(img_id: str) -> tuple:
     """
     prefix = OUT_DIR
     date     = datetime.now().strftime("%Y%m%d")
-    real_dir = os.path.join(date, "RealImg")
-    ann_dir  = os.path.join(date, "Image")
+    real_dir = os.path.join(prefix, date, "RealImg")
+    ann_dir  = os.path.join(prefix, date, "Image")
     os.makedirs(real_dir, exist_ok=True)
     os.makedirs(ann_dir,  exist_ok=True)
-    return (os.path.join(prefix, real_dir, f"{img_id}.jpg"),
-            os.path.join(prefix, ann_dir,  f"{img_id}.jpg"))
+    return (os.path.join(real_dir, f"{img_id}.jpg"),
+            os.path.join(ann_dir,  f"{img_id}.jpg"))
 
 class MainWindow(QtWidgets.QMainWindow):
 
@@ -2085,19 +2127,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
-        top_patch, bot_patch = TemplateManager.load_patches()
-        if top_patch is not None and bot_patch is not None:
-            matcher = TemplateMatcher(
-                top_patch, bot_patch,
-                threshold=tmpl.get("match_threshold", 0.6),
-                strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
-                strip_bot_y_offset=tmpl.get("strip_bot_y_offset", 0),
-                ic_h=tmpl["ic_a"]["h"],
-            )
-            print("[MainWindow] TemplateMatcher loaded — using template matching for IC localization.")
-        else:
-            matcher = None
-            print("[MainWindow] No patch files found — falling back to YOLO locate_ics().")
+        # IC localization uses YOLO (locate_ics, class 0) — TemplateMatcher disabled.
+        # Contour patches are still saved at setup for future use.
+        matcher = None
 
         inspector = Inspector(self._detector, tmpl, template_matcher=matcher)
         gpio      = self._gpio or RaspberryIO(io_enabled=False)

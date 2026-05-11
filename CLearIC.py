@@ -46,7 +46,8 @@ IO        = False     # True = drive GPIO / False = mock (log only)
 MODE      = "DEBUG"   # "DEBUG" or "RUN"
 DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
-MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
+MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
+TEMPLATE_MODEL_PATH = "template_auto/ClearIC_Insp.xml"               # YOLO detection model (auto template setup)
 COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
 # =========================================================
 # CONFIG LOADER
@@ -506,8 +507,178 @@ class Detector:
             return 0, 0.0
 
     def detect_all(self, _image_bgr: np.ndarray) -> list:
-        """Stub — classifier cannot detect IC positions. Returns empty list."""
+        """Stub — classifier cannot detect IC positions. Use TemplateDetector for setup."""
         return []
+
+# =========================================================
+# TEMPLATE DETECTOR  (OpenVINO YOLO detection — IC_Presence / Text)
+# =========================================================
+_DET_INPUT_SIZE = 640
+
+class TemplateDetector:
+    """
+    OpenVINO YOLO detection model for auto-template setup.
+    Finds IC_Presence bounding boxes to auto-populate the template.
+    Output: [1, 6, 8400]  (cx, cy, w, h, conf_IC_Presence, conf_Text)
+    """
+
+    def __init__(self, conf_thr: float = 0.5, nms_thr: float = 0.45):
+        self._conf_thr = conf_thr
+        self._nms_thr  = nms_thr
+        self._compiled = None
+        self._ready    = False
+        try:
+            import openvino as ov
+            if not os.path.exists(TEMPLATE_MODEL_PATH):
+                raise ModelError(f"Template model not found: {TEMPLATE_MODEL_PATH}")
+            core  = ov.Core()
+            model = core.read_model(TEMPLATE_MODEL_PATH)
+            self._compiled = core.compile_model(model, "CPU", {
+                "INFERENCE_PRECISION_HINT": "f32",
+                "PERFORMANCE_HINT":         "LATENCY",
+            })
+            self._ready = True
+            print(f"[TemplateDetector] Loaded: {TEMPLATE_MODEL_PATH}")
+        except ModelError:
+            raise
+        except Exception as e:
+            raise ModelError(f"Template model load failed: {e}")
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def _run_inference(self, image_bgr: np.ndarray) -> list:
+        """Letterbox → blob → infer → NMS. Returns (x,y,w,h,cls,conf) 6-tuples."""
+        if not self._ready or self._compiled is None:
+            return []
+        try:
+            if image_bgr.ndim == 2:
+                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+            ih, iw = image_bgr.shape[:2]
+            sz = _DET_INPUT_SIZE
+
+            scale   = min(sz / iw, sz / ih)
+            nw, nh  = int(iw * scale), int(ih * scale)
+            resized = cv2.resize(image_bgr, (nw, nh))
+            pad_buf = np.full((sz, sz, 3), 114, dtype=np.uint8)
+            pad_x   = (sz - nw) // 2
+            pad_y   = (sz - nh) // 2
+            pad_buf[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+            blob   = pad_buf[:, :, ::-1].astype(np.float32) / 255.0
+            blob   = blob.transpose(2, 0, 1)[np.newaxis]
+            result = self._compiled(blob)
+            preds  = result[0][0].T                          # [8400, 6]
+
+            conf      = preds[:, 4:6].max(axis=1)
+            class_idx = preds[:, 4:6].argmax(axis=1)
+            mask      = conf >= self._conf_thr
+            preds, conf, class_idx = preds[mask], conf[mask], class_idx[mask]
+            if len(preds) == 0:
+                return []
+
+            raw_boxes, scores, classes = [], [], []
+            for i, row in enumerate(preds):
+                cx, cy, bw, bh = row[:4]
+                x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
+                y1 = max(0,  int((cy - bh / 2 - pad_y) / scale))
+                x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
+                y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
+                if x2 > x1 and y2 > y1:
+                    raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
+                    scores.append(float(conf[i]))
+                    classes.append(int(class_idx[i]))
+
+            if not raw_boxes:
+                return []
+            indices = cv2.dnn.NMSBoxes(raw_boxes, scores, self._conf_thr, self._nms_thr)
+            if len(indices) == 0:
+                return []
+            kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
+            return [(raw_boxes[i][0], raw_boxes[i][1],
+                     raw_boxes[i][2], raw_boxes[i][3],
+                     classes[i], scores[i]) for i in kept]
+        except Exception as e:
+            print(f"[TemplateDetector] Inference error: {e}")
+            return []
+
+    def detect_all(self, image_bgr: np.ndarray) -> list:
+        """
+        Return IC_Presence QRects sorted left→right by X (for template setup).
+        Each raw YOLO rect is refined using the dark IC border edge.
+        """
+        boxes = self._run_inference(image_bgr)
+        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
+        if not presence:
+            return []
+        presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
+        top2 = presence[:2]
+        top2.sort(key=lambda b: b[0])                  # left→right by X
+        rects = [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
+        return [self._refine_ic_rect(image_bgr, r) for r in rects]
+
+    @staticmethod
+    def _refine_ic_rect(image_bgr: np.ndarray, rect: QtCore.QRect,
+                        margin: int = 40) -> QtCore.QRect:
+        """
+        Tighten a YOLO-detected IC bounding box using the dark IC border.
+
+        The IC package has a dark border (near-black) between the grey
+        background and the bright IC body. Scanning intensity profiles
+        inward from each side:
+          background  →  dark border  →  IC body
+        Returns the rect at the inner edge of the dark border.
+        """
+        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        ih, iw = image_bgr.shape[:2]
+
+        sx1 = max(0, x - margin)
+        sy1 = max(0, y - margin)
+        sx2 = min(iw, x + w + margin)
+        sy2 = min(ih, y + h + margin)
+
+        gray = cv2.cvtColor(image_bgr[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY) \
+               if image_bgr.ndim == 3 else image_bgr[sy1:sy2, sx1:sx2].copy()
+        gray = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0)
+        rh, rw = gray.shape
+        if rh < 4 or rw < 4:
+            return rect
+
+        # Background level from the outer border of the search region
+        bg = float(np.mean(np.concatenate([
+            gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])))
+        dark_thr = bg * 0.60   # 40% drop from background = dark IC border
+
+        def inner_edge(profile: np.ndarray, reverse: bool) -> int:
+            """Scan until intensity drops below dark_thr, then rises again."""
+            it = list(range(len(profile)))
+            if reverse:
+                it = it[::-1]
+            in_dark = False
+            for i in it:
+                if not in_dark and profile[i] < dark_thr:
+                    in_dark = True
+                elif in_dark and profile[i] >= dark_thr:
+                    return i
+            return it[-1]
+
+        # Use centre column/row for the scans (most representative of IC body)
+        cx, cy = rw // 2, rh // 2
+        top   = inner_edge(gray[:, cx], reverse=False)
+        bot   = inner_edge(gray[:, cx], reverse=True)
+        left  = inner_edge(gray[cy, :], reverse=False)
+        right = inner_edge(gray[cy, :], reverse=True)
+
+        nx1 = sx1 + left
+        ny1 = sy1 + top
+        nw  = max(1, right - left)
+        nh  = max(1, bot   - top)
+
+        if DEBUG:
+            print(f"[TemplateDetector] Refined: ({x},{y},{w},{h}) "
+                  f"→ ({nx1},{ny1},{nw},{nh})")
+
+        return QtCore.QRect(nx1, ny1, nw, nh)
 
 # =========================================================
 # CELL GRID CONSTANTS
@@ -1612,12 +1783,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, cfg: dict):
         super().__init__()
         self.setWindowTitle("ClearIC Inspect")
-        self._cfg      = cfg
-        self._camera:  Camera | None = None
-        self._detector: Detector | None = None
-        self._gpio     = None
-        self._logger   = Logger()
-        self._worker:  RunWorker | None = None
+        self._cfg               = cfg
+        self._camera:           Camera | None           = None
+        self._detector:         Detector | None         = None
+        self._tmpl_detector:    TemplateDetector | None = None
+        self._gpio              = None
+        self._logger            = Logger()
+        self._worker:           RunWorker | None        = None
 
         self._stats_pass  = 0
         self._stats_fail  = 0
@@ -1911,7 +2083,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 conf_thr=cfg.get("CONF_THR", 0.5),
             )
         except ModelError as e:
-            self._show_error(f"Model load failed: {e}")
+            self._show_error(f"Classifier model load failed: {e}")
+
+        try:
+            self._tmpl_detector = TemplateDetector(
+                conf_thr=cfg.get("CONF_THR", 0.5),
+            )
+        except ModelError as e:
+            self._show_error(f"Template model load failed: {e}")
 
         try:
             self._gpio = RaspberryIO(io_enabled=IO)
@@ -1950,8 +2129,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # Auto Detect flow
     # ----------------------------------------------------------
     def _start_auto_detect(self):
-        if not self._detector or not self._detector.is_ready():
-            self._show_error("Detector not ready — check model file.")
+        if not self._tmpl_detector or not self._tmpl_detector.is_ready():
+            self._show_error("Template model not ready — check TEMPLATE_MODEL_PATH.")
             return
         if self._camera is None:
             self._show_error("Camera not ready.")
@@ -1999,9 +2178,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_detection(self._current_detect_image)
 
     def _run_detection(self, img: np.ndarray):
-        if not self._detector:
+        if not self._tmpl_detector:
             return
-        rects = self._detector.detect_all(img)
+        rects = self._tmpl_detector.detect_all(img)
         # Sort by (x + y) ascending → leftmost-topmost candidate first
         self._detect_candidates    = sorted(rects, key=lambda r: r.x() + r.y())
         self._detect_candidate_idx = 0

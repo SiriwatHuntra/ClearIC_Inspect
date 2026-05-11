@@ -628,7 +628,7 @@ class TemplateDetector:
 # =========================================================
 # CELL GRID CONSTANTS
 # =========================================================
-_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
+_CELL_SHRINK    = 0.90   # IC rect shrunk before slicing (keeps grid off raw edges)
 _CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
@@ -640,7 +640,7 @@ _data_run_counter = 0
 # =========================================================
 # VISUAL SETTINGS  (live-editable from the Settings panel)
 # =========================================================
-_ann_border_px   = 2           # ROI cell border thickness (px)
+_ann_border_px   = 1           # ROI cell border thickness (px)
 _ann_show_labels = True        # draw R{row}C{col} inside each cell
 _ann_color_ok    = "#00C800"   # hex — Text  / PASS cell border
 _ann_color_ng    = "#DD0000"   # hex — NoText / FAIL cell border

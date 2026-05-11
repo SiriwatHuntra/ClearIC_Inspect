@@ -444,7 +444,7 @@ class Detector:
     Output shape: [1, 2]  — index 0 = NoText, index 1 = Text
     """
 
-    MODEL_XML = "ClearIC_Cls_openvino_model/ClearIC_Cls.xml"
+    MODEL_XML = "Text_cls-2/best_openvino_model/best.xml"
 
     def __init__(self, conf_thr: float = 0.5, **_):
         self._conf_thr = conf_thr

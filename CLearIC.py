@@ -1926,6 +1926,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_apply.clicked.connect(self._apply_settings)
         settings_lay.addWidget(btn_apply)
 
+        settings_frame.setVisible(False)
         right_lay.addWidget(settings_frame)
         right_lay.addStretch()
 

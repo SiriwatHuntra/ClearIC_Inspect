@@ -1,7 +1,8 @@
 """
 ClearIC Inspect
 ===============
-Clear-package IC laser-mark inspection via YOLO/OpenVINO ROI presence detection.
+Clear-package IC laser-mark inspection via ROI crop + OpenVINO classifier.
+Each ROI cell is cropped and classified as Text (present) or NoText (absent).
 
 Sections (in order)
 -------------------
@@ -11,9 +12,9 @@ Sections (in order)
   Image               Image dataclass + ID generator
   Camera              Basler camera or directory source
   RaspberryIO         BCM GPIO handler (mockable)
-  Detector            OpenVINO YOLO inference (2-class)
+  Detector            OpenVINO 2-class classifier (Text / NoText)
   TemplateManager     Load/save IC bounding-box template
-  Inspector           12-cell ROI inspection logic
+  Inspector           12-cell ROI crop-then-classify logic
   Logger              Daily-rotating JSON-lines log
   STYLE               Qt stylesheet
   FailDialog          Modal FAIL popup
@@ -53,7 +54,6 @@ class ConfigLoader:
     DEFAULT_CONFIG = {
         "CAMERA":        "directory",
         "CONF_THR":      0.5,
-        "NMS_IOU_THR":   0.45,
         "CAMERA_SERIAL": "",
         "EXPOSURE_US":   8000,
     }
@@ -433,24 +433,23 @@ class RaspberryIO:
                 pass
 
 # =========================================================
-# DETECTOR  (OpenVINO YOLO — 2-class)
+# DETECTOR  (OpenVINO Classifier — 2-class)
 # =========================================================
-_INPUT_SIZE = 640
+_CLS_INPUT_SIZE = 224   # YOLO-cls default input size
 
 class Detector:
     """
-    OpenVINO YOLO8 wrapper for ClearIC_Insp model.
-    Output: [1, 6, 8400]  (cx, cy, w, h, conf_IC_Presence, conf_Text)
-    No built-in NMS — applied manually.
+    OpenVINO image classifier for ClearIC mark inspection.
+    Each ROI cell crop is classified as Text (mark present) or NoText (absent).
+    Output shape: [1, 2]  — index 0 = NoText, index 1 = Text
     """
 
-    MODEL_XML = "ClearIC_Insp_openvino_model/ClearIC_Insp.xml"
+    MODEL_XML = "ClearIC_Cls_openvino_model/ClearIC_Cls.xml"
 
-    def __init__(self, conf_thr: float = 0.9, nms_thr: float = 0.45):
-        self._conf_thr  = conf_thr
-        self._nms_thr   = nms_thr
-        self._compiled  = None
-        self._ready     = False
+    def __init__(self, conf_thr: float = 0.5, **_):
+        self._conf_thr = conf_thr
+        self._compiled = None
+        self._ready    = False
         try:
             import openvino as ov
             if not os.path.exists(self.MODEL_XML):
@@ -462,7 +461,7 @@ class Detector:
                 "PERFORMANCE_HINT":         "LATENCY",
             })
             self._ready = True
-            print(f"[Detector] OpenVINO model loaded: {self.MODEL_XML}")
+            print(f"[Detector] OpenVINO classifier loaded: {self.MODEL_XML}")
         except ModelError:
             raise
         except Exception as e:
@@ -472,131 +471,41 @@ class Detector:
         return self._ready
 
     def warmup(self, frames: int = 5):
-        blank = np.zeros((_INPUT_SIZE, _INPUT_SIZE, 3), dtype=np.uint8)
+        blank = np.zeros((_CLS_INPUT_SIZE, _CLS_INPUT_SIZE, 3), dtype=np.uint8)
         for _ in range(frames):
-            self._run_inference(blank)
+            self.classify_crop(blank)
         print(f"[Detector] Warmup done ({frames} frames).")
 
-    def _run_inference(self, image_bgr: np.ndarray) -> list:
+    def classify_crop(self, crop_bgr: np.ndarray) -> tuple:
         """
-        Letterbox → blob → infer → NMS.
-        Returns list of (x1, y1, w, h, class_idx) 5-tuples.
-          class_idx 0 = IC_Presence (large mold outline)
-          class_idx 1 = Text        (individual mark/character)
+        Classify one ROI cell crop.
+        Returns (class_idx, confidence):
+          class_idx 0 = NoText  (mark absent)
+          class_idx 1 = Text    (mark present)
         """
         if not self._ready or self._compiled is None:
-            return []
+            return 0, 0.0
         try:
-            if image_bgr.ndim == 2:
-                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-            ih, iw = image_bgr.shape[:2]
-            sz = _INPUT_SIZE
-
-            scale   = min(sz / iw, sz / ih)
-            nw, nh  = int(iw * scale), int(ih * scale)
-            resized = cv2.resize(image_bgr, (nw, nh))
-            pad_buf = np.full((sz, sz, 3), 114, dtype=np.uint8)
-            pad_x   = (sz - nw) // 2
-            pad_y   = (sz - nh) // 2
-            pad_buf[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
-
-            blob   = pad_buf[:, :, ::-1].astype(np.float32) / 255.0
-            blob   = blob.transpose(2, 0, 1)[np.newaxis]
-            result = self._compiled(blob)
-            preds  = result[0][0].T                         # [8400, 6]
-
-            # confidence = max of class scores; class = argmax of scores
-            conf      = preds[:, 4:6].max(axis=1)
-            class_idx = preds[:, 4:6].argmax(axis=1)
-            mask      = conf >= self._conf_thr
-            preds     = preds[mask]
-            conf      = conf[mask]
-            class_idx = class_idx[mask]
-            if len(preds) == 0:
-                return []
-
-            raw_boxes, scores, classes = [], [], []
-            for i, row in enumerate(preds):
-                cx, cy, bw, bh = row[:4]
-                x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
-                y1 = max(0,  int((cy - bh / 2 - pad_y) / scale))
-                x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
-                y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
-                if x2 > x1 and y2 > y1:
-                    raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
-                    scores.append(float(conf[i]))
-                    classes.append(int(class_idx[i]))
-
-            if not raw_boxes:
-                return []
-
-            indices = cv2.dnn.NMSBoxes(
-                raw_boxes, scores, self._conf_thr, self._nms_thr)
-            if len(indices) == 0:
-                return []
-            kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
-            # Returns (x, y, w, h, class_idx, conf) 6-tuples
-            return [(raw_boxes[i][0], raw_boxes[i][1],
-                     raw_boxes[i][2], raw_boxes[i][3],
-                     classes[i], scores[i])
-                    for i in kept]
+            sz = _CLS_INPUT_SIZE
+            if crop_bgr.ndim == 2:
+                crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_GRAY2BGR)
+            if crop_bgr.size == 0:
+                return 0, 0.0
+            resized = cv2.resize(crop_bgr, (sz, sz))
+            blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
+            blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
+            result  = self._compiled(blob)
+            probs   = result[0][0]                           # [2] — softmax already applied by YOLO-cls
+            cls_idx = int(np.argmax(probs))
+            conf    = float(probs[cls_idx])
+            return cls_idx, conf
         except Exception as e:
-            print(f"[Detector] Inference error: {e}")
-            return []
+            print(f"[Detector] Classify error: {e}")
+            return 0, 0.0
 
-    def detect_full_image(self, image_bgr: np.ndarray) -> list:
-        """
-        Run YOLO on the full image.
-        Returns only Text class (1) boxes as (x1, y1, w, h, conf) 5-tuples.
-        IC_Presence (class 0) boxes are excluded — they cover the entire IC area
-        and would make every cell appear present even when fonts are absent.
-        Confidence is included so Inspector can annotate each detection.
-        """
-        return [(x, y, w, h, cf) for x, y, w, h, cls, cf in self._run_inference(image_bgr)
-                if cls == 1]
-
-    def locate_ics(self, image_bgr: np.ndarray) -> tuple:
-        """
-        Find the two IC_Presence bounding boxes (class 0) in the image.
-        Returns (ic_a_rect, ic_b_rect) sorted left→right by X position.
-        Either element is None if fewer than 2 IC_Presence boxes are found.
-
-        This is the key to correct A/B assignment: position in the current
-        image determines the label, not the saved template coordinates.
-        """
-        boxes = self._run_inference(image_bgr)
-        # Keep only IC_Presence class (0), sort by area descending to get full IC boxes
-        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
-        if not presence:
-            return None, None
-        # Among IC_Presence boxes, take the two largest (mold outlines)
-        presence.sort(key=lambda b: -(b[2] * b[3]))
-        top2 = presence[:2]
-        # Sort left→right by X position
-        top2.sort(key=lambda b: b[0])
-
-        if len(top2) == 2:
-            return QtCore.QRect(*top2[0]), QtCore.QRect(*top2[1])
-
-        # Only one IC found — return it in first slot; Inspector will assign correct A/B
-        return QtCore.QRect(*top2[0]), None
-
-    def detect_all(self, image_bgr: np.ndarray) -> list:
-        """
-        Return up to 2 IC_Presence QRects for template setup, sorted left→right by X.
-        Picks the two largest boxes first (to get the IC mold outlines),
-        then orders them by X so index 0 = IC_A (left), index 1 = IC_B (right).
-        """
-        boxes = self._run_inference(image_bgr)
-        if not boxes:
-            return []
-        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
-        if not presence:
-            return []
-        presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
-        top2 = presence[:2]
-        top2.sort(key=lambda b: b[0])                  # left→right by X
-        return [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
+    def detect_all(self, _image_bgr: np.ndarray) -> list:
+        """Stub — classifier cannot detect IC positions. Returns empty list."""
+        return []
 
 # =========================================================
 # CELL GRID CONSTANTS
@@ -604,28 +513,6 @@ class Detector:
 _CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
 _CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
-
-_DATA_DIR   = "Dataset"  # root dataset folder
-_DATA_SPLIT = "train"    # which split to write crops into: "train" | "val" | "test"
-_data_run_counter = 0    # incremented once per image, shared across both ICs
-
-def _save_cell_crops(image_bgr: np.ndarray, cells: list,
-                     cell_hits: list, ic_label: str, run_num: int):
-    """
-    Crop each cell ROI and save to Dataset/<split>/Text/ or .../NoText/.
-    Filename: {run_num:06d}_IC{label}_{idx:02d}.png  (flat, no ROI subfolders)
-    """
-    ih, iw = image_bgr.shape[:2]
-    for idx, (cx, cy, cw, ch) in enumerate(cells):
-        class_name = "Text" if cell_hits[idx] else "NoText"
-        folder = os.path.join(_DATA_DIR, _DATA_SPLIT, class_name)
-        os.makedirs(folder, exist_ok=True)
-        x1, y1 = max(0, cx),       max(0, cy)
-        x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
-        crop = image_bgr[y1:y2, x1:x2]
-        if crop.size > 0:
-            fname = f"{run_num:06d}_IC{ic_label}_{idx:02d}.png"
-            cv2.imwrite(os.path.join(folder, fname), crop)
 
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
@@ -933,14 +820,14 @@ class TemplateMatcher:
 # =========================================================
 class Inspector:
     """
-    Runs YOLO once on the full image then checks each ROI cell for box intersections.
-    Raises MarkMissingError if either IC has any cell without an overlapping detection.
+    Crops each ROI cell from the image and classifies it as Text / NoText.
+    Raises MarkMissingError if either IC has any cell classified as NoText.
     """
 
     def __init__(self, detector: Detector, template: dict,
                  template_matcher: "TemplateMatcher | None" = None):
-        self._detector        = detector
-        self._template        = template
+        self._detector         = detector
+        self._template         = template
         self._template_matcher = template_matcher
 
     def inspect(self, image_bgr: np.ndarray,
@@ -948,19 +835,16 @@ class Inspector:
         """
         Returns (ic_a_pass, ic_b_pass, missing_a, missing_b, annotated_bgr).
         Raises MarkMissingError if either IC fails.
-        Raises TemplateError if template matching rejects the frame (rotation/misalignment).
+        Raises TemplateError if template matching rejects the frame.
 
-        Phase 1 — locate IC_A via TemplateMatcher (preferred) or YOLO fallback.
-          TemplateMatcher: bilateral-filtered strip matching; IC_B derived from offset.
-          YOLO fallback:   Detector.locate_ics() with proximity swap logic.
-        Phase 2 — YOLO text detection checked against each IC's cell grid.
+        Phase 1 — locate IC_A via TemplateMatcher (preferred) or fixed template coords.
+        Phase 2 — crop each ROI cell and classify as Text / NoText.
         """
         tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template)
         annotated = image_bgr.copy()
 
         # Phase 1: locate ICs
         if self._template_matcher is not None:
-            # Template matching path — raises TemplateError if score below threshold
             rt_a, score = self._template_matcher.locate_ic(image_bgr)
             dx = self._template["ic_b"]["x"] - self._template["ic_a"]["x"]
             dy = self._template["ic_b"]["y"] - self._template["ic_a"]["y"]
@@ -977,53 +861,15 @@ class Inspector:
                 print(f"[Inspector] IC_B by offset: "
                       f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
         else:
-            # YOLO fallback path
-            rt_a, rt_b = self._detector.locate_ics(image_bgr)
-
-            # Single IC found: assign to correct A/B slot using template center proximity.
-            # Prevents: IC_A absent, IC_B present → YOLO finds 1 IC → incorrectly assigned to A.
-            if rt_a is not None and rt_b is None:
-                tmpl_a_cx = (self._template["ic_a"]["x"] +
-                             self._template["ic_a"]["w"] // 2)
-                tmpl_b_cx = (self._template["ic_b"]["x"] +
-                             self._template["ic_b"]["w"] // 2)
-                found_cx  = rt_a.x() + rt_a.width() // 2
-                if abs(found_cx - tmpl_b_cx) < abs(found_cx - tmpl_a_cx):
-                    rt_a, rt_b = None, rt_a
-
-            ic_a_cells = self._rect_to_cells(rt_a) if rt_a else tmpl_a_cells
-            ic_b_cells = self._rect_to_cells(rt_b) if rt_b else tmpl_b_cells
-
+            # Fixed template coordinates — no runtime IC localization
+            ic_a_cells = tmpl_a_cells
+            ic_b_cells = tmpl_b_cells
             if debug:
-                if rt_a:
-                    print(f"[Inspector] IC_A located (YOLO): "
-                          f"x={rt_a.x()} y={rt_a.y()} w={rt_a.width()} h={rt_a.height()}")
-                else:
-                    print("[Inspector] IC_A not found → template fallback → FAIL")
-                if rt_b:
-                    print(f"[Inspector] IC_B located (YOLO): "
-                          f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
-                else:
-                    print("[Inspector] IC_B not found → template fallback → FAIL")
+                print("[Inspector] No TemplateMatcher — using fixed template coordinates")
 
-        # Phase 2: check all Text detection boxes against each IC's cells
-        all_boxes = self._detector.detect_full_image(image_bgr)  # (x,y,w,h,conf)
-
-        # Draw every Text detection with cyan box + confidence label
-        for bx, by, bw, bh, bc in all_boxes:
-            cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), (255, 200, 0), 1)
-            cv2.putText(annotated, f"{bc:.2f}",
-                        (bx, by - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                        (255, 200, 0), 1)
-
-        missing_a, hits_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
-        missing_b, hits_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
-
-        # Data collection — save each cell crop to Dataset/<split>/Text or NoText/
-        global _data_run_counter
-        _data_run_counter += 1
-        _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", _data_run_counter)
-        _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", _data_run_counter)
+        # Phase 2: crop each cell and classify as Text / NoText
+        missing_a, _ = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
+        missing_b, _ = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
 
         if missing_a or missing_b:
             raise MarkMissingError(missing_a, missing_b, annotated)
@@ -1035,65 +881,33 @@ class Inspector:
         """Divide a QRect into a shrunk+expanded 3-row × 2-col cell grid."""
         return _build_cells(rect.x(), rect.y(), rect.width(), rect.height())
 
-    # Fraction of cell width/height removed from each side as a guard band.
-    # Boxes that only clip the border by this margin are not credited.
-    _CELL_GUARD = 0.05
-
-    @staticmethod
-    def _intersect_area(bx, by, bw, bh, cx, cy, cw, ch) -> int:
-        """Pixel area of intersection between a detection box and a cell."""
-        ix1 = max(bx, cx);  iy1 = max(by, cy)
-        ix2 = min(bx + bw, cx + cw);  iy2 = min(by + bh, cy + ch)
-        return max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
-    def _check_ic(self, boxes: list, cells: list,
-                  annotated: np.ndarray, debug: bool) -> list:
+    def _check_ic(self, image_bgr: np.ndarray, cells: list,
+                  annotated: np.ndarray, debug: bool) -> tuple:
         """
-        Dominant-overlap + guard-band cell evaluation.
-
-        Each detection box is assigned to the ONE cell it overlaps the most
-        (after each cell is inset by _CELL_GUARD on every side). A box that
-        only clips a cell border within the guard margin is not credited to
-        either cell, preventing shared false-positives at column/row boundaries.
+        Crop each ROI cell from image_bgr and classify as Text / NoText.
+        Returns (missing, hits_flags).
         """
-        g = self._CELL_GUARD
-
-        # Build guarded cell rects once
-        guarded = []
-        for cx, cy, cw, ch in cells:
-            mx = int(cw * g);  my = int(ch * g)
-            guarded.append((cx + mx, cy + my, cw - 2 * mx, ch - 2 * my))
-
-        # Assign each box to its dominant cell (largest intersection with guarded rect)
-        cell_hits = [[] for _ in cells]
-        for bx, by, bw, bh, cf in boxes:
-            best_idx  = -1
-            best_area = 0
-            for i, (gx, gy, gw, gh) in enumerate(guarded):
-                area = self._intersect_area(bx, by, bw, bh, gx, gy, gw, gh)
-                if area > best_area:
-                    best_area = area
-                    best_idx  = i
-            if best_idx >= 0 and best_area > 0:
-                cell_hits[best_idx].append((bx, by, bw, bh, cf))
-
+        ih, iw = image_bgr.shape[:2]
         missing    = []
-        hits_flags = []   # True/False per cell — used by data collection
+        hits_flags = []
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
-            hits    = cell_hits[idx]
-            present = len(hits) > 0
+            x1, y1 = max(0, cx),       max(0, cy)
+            x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
+            crop    = image_bgr[y1:y2, x1:x2]
+            cls_idx, conf = self._detector.classify_crop(crop)
+            present = (cls_idx == 1)   # 1 = Text (mark present)
             hits_flags.append(present)
             if debug:
-                hit_confs = [f"{cf:.3f}" for *_, cf in hits]
+                lbl = "Text" if present else "NoText"
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
-                      f"hits={len(hits)} confs=[{', '.join(hit_confs)}]")
+                      f"cls={lbl} conf={conf:.3f}")
             color = (0, 200, 0) if present else (0, 0, 220)
-            x2 = min(annotated.shape[1], cx + cw)
-            y2 = min(annotated.shape[0], cy + ch)
-            cv2.rectangle(annotated, (max(0, cx), max(0, cy)), (x2, y2), color, 2)
+            cv2.rectangle(annotated,
+                          (max(0, cx), max(0, cy)),
+                          (min(iw, cx + cw), min(ih, cy + ch)), color, 2)
             if debug:
                 label = f"R{row}C{col}"
                 (tw, th), _ = cv2.getTextSize(
@@ -1949,8 +1763,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._cfg
         try:
             self._detector = Detector(
-                conf_thr=cfg.get("CONF_THR", 0.9),
-                nms_thr=cfg.get("NMS_IOU_THR", 0.45),
+                conf_thr=cfg.get("CONF_THR", 0.5),
             )
         except ModelError as e:
             self._show_error(f"Model load failed: {e}")
@@ -2130,9 +1943,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
-        # IC localization uses YOLO (locate_ics, class 0) — TemplateMatcher disabled.
-        # Contour patches are still saved at setup for future use.
+        # IC localization via TemplateMatcher when patches exist; else fixed template coords.
         matcher = None
+        top, bot = TemplateManager.load_patches()
+        if top is not None and bot is not None:
+            ic_a = tmpl["ic_a"]
+            matcher = TemplateMatcher(
+                top, bot,
+                threshold=tmpl.get("match_threshold", 0.6),
+                strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
+                strip_bot_y_offset=tmpl.get("strip_bot_y_offset", 0),
+                ic_x=ic_a["x"], ic_y=ic_a["y"],
+                ic_w=ic_a["w"], ic_h=ic_a["h"],
+            )
 
         inspector = Inspector(self._detector, tmpl, template_matcher=matcher)
         gpio      = self._gpio or RaspberryIO(io_enabled=False)
@@ -2253,8 +2076,6 @@ def main():
     os.makedirs(_LOG_DIR,   exist_ok=True)
     os.makedirs("templates", exist_ok=True)
     os.makedirs(DIR_INPUT,   exist_ok=True)
-    os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "Text"),   exist_ok=True)
-    os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "NoText"), exist_ok=True)
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)

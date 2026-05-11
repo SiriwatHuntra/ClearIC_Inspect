@@ -47,7 +47,7 @@ MODE      = "DEBUG"   # "DEBUG" or "RUN"
 DIR_INPUT = "Input/train/Text"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
-
+COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
 # =========================================================
 # CONFIG LOADER
 # =========================================================
@@ -516,6 +516,11 @@ _CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edg
 _CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
+# Dataset collection (used only when COLLECT_DATASET = True)
+_DATA_DIR   = "Dataset"
+_DATA_SPLIT = "train"    # "train" | "val" | "test"
+_data_run_counter = 0
+
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
     Build the 3-row × 2-col cell list for one IC bounding rect.
@@ -553,6 +558,25 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
             cy = sy + row * ch  - dh
             cells.append((cx, cy, exp_w, exp_h))
     return cells
+
+def _save_cell_crops(image_bgr: np.ndarray, cells: list,
+                     cell_hits: list, ic_label: str, run_num: int):
+    """
+    Save each ROI cell crop to Dataset/<split>/Text/ or .../NoText/.
+    Called only when COLLECT_DATASET = True.
+    Filename: {run_num:06d}_IC{label}_{idx:02d}.png
+    """
+    ih, iw = image_bgr.shape[:2]
+    for idx, (cx, cy, cw, ch) in enumerate(cells):
+        class_name = "Text" if cell_hits[idx] else "NoText"
+        folder = os.path.join(_DATA_DIR, _DATA_SPLIT, class_name)
+        os.makedirs(folder, exist_ok=True)
+        x1, y1 = max(0, cx),       max(0, cy)
+        x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
+        crop = image_bgr[y1:y2, x1:x2]
+        if crop.size > 0:
+            fname = f"{run_num:06d}_IC{ic_label}_{idx:02d}.png"
+            cv2.imwrite(os.path.join(folder, fname), crop)
 
 # =========================================================
 # TEMPLATE MANAGER
@@ -870,8 +894,14 @@ class Inspector:
                 print("[Inspector] No TemplateMatcher — using fixed template coordinates")
 
         # Phase 2: crop each cell and classify as Text / NoText
-        missing_a, _ = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
-        missing_b, _ = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
+        missing_a, hits_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
+        missing_b, hits_b = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
+
+        if COLLECT_DATASET:
+            global _data_run_counter
+            _data_run_counter += 1
+            _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", _data_run_counter)
+            _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", _data_run_counter)
 
         if missing_a or missing_b:
             raise MarkMissingError(missing_a, missing_b, annotated)
@@ -2078,6 +2108,10 @@ def main():
     os.makedirs(_LOG_DIR,   exist_ok=True)
     os.makedirs("templates", exist_ok=True)
     os.makedirs(DIR_INPUT,   exist_ok=True)
+    if COLLECT_DATASET:
+        os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "Text"),   exist_ok=True)
+        os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "NoText"), exist_ok=True)
+        print(f"[Dataset] Collection ON → {_DATA_DIR}/{_DATA_SPLIT}/")
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)

@@ -21,13 +21,14 @@ ICs with a clear (transparent) mold make laser-engraved marks very difficult to 
 
 ## Runtime Flags (hardcoded in config)
 
-These are set at the top of the config file before running. Not changeable from the UI.
+These are set at the top of `CLearIC.py` before running. Not changeable from the UI.
 
 | Flag | Values | Effect |
 |---|---|---|
 | `DEBUG` | `True / False` | Enables debug mode with detailed logs |
 | `CAMERA` | `"camera" / "directory"` | Live Basler feed or load images from a folder (for dev/testing) |
 | `IO` | `True / False` | If `False`, log IO signals as messages instead of driving GPIO pins |
+| `MODEL_PATH` | path string | Path to the OpenVINO classifier `.xml` file |
 
 ## Modes (hardcoded in config)
 
@@ -73,15 +74,19 @@ Each image contains **two ICs**. IC_A is the template anchor; IC_B position is d
 
 ---
 
-## Detection Logic
+## Inspection Logic
 
-- **Model:** YOLO via OpenVINO (model ready)
-- **Post-processing:** NMS (Non-Maximum Suppression) applied after OpenVINO inference to filter overlapping bounding boxes before per-cell evaluation
-- **Classes:** `IC_Presence`, `Text`
+- **Model:** YOLO-cls via OpenVINO — 2-class image classifier
+- **Model path:** `Text_cls-2/best_openvino_model/best.xml`
+- **Input size:** 224 × 224 (YOLO-cls default)
+- **Classes:** `0 = NoText`, `1 = Text`
+- **Method:** ROI crop → classify (no bounding-box detection, no NMS)
 - **Per ROI cell result:**
-  - Any detection found (either class) → `TRUE`
-  - No detection → `FALSE`
-  - Class label is not used for pass/fail — presence only
+  1. Crop the cell region from the full image
+  2. Resize crop to 224 × 224
+  3. Run classifier → predicted class + confidence
+  - Class `Text` → cell **TRUE** (mark present)
+  - Class `NoText` → cell **FALSE** (mark absent)
 - **Per IC result:**
   - **PASS** — all 6 cells return TRUE
   - **FAIL** — any cell returns FALSE → trigger output + save images + log
@@ -167,17 +172,20 @@ Receive START_PIN (or Manual Trigger button in DEBUG)
   → If BUSY: drop signal
   → Set BUSY = True
   → Capture image  [CAMERA="directory": load next file from Input/ folder]
-  → Map 12 ROI cells using saved template
-  → Run YOLO/OpenVINO inference on all 12 cells → apply NMS
-  → Per cell: any detection present → TRUE, no detection → FALSE
-             (classes "IC_Presence" / "Text" — presence only, not type)
+  → Phase 1 — Locate ICs:
+      TemplateMatcher (bilateral strip match) → IC_A rect → IC_B by offset
+      Fallback: use fixed template coordinates if no patches saved
+  → Phase 2 — Per ROI cell (12 total):
+      Crop cell region from image
+      Classify crop via YOLO-cls (224×224 input)
+      Text → TRUE  /  NoText → FALSE
   → IC_A: PASS if all 6 TRUE, else FAIL
   → IC_B: PASS if all 6 TRUE, else FAIL
   → Set FAIL_A_PIN, FAIL_B_PIN → Pulse ACK_PIN
        [IO=False: log "[IO MOCK] FAIL_A=X FAIL_B=X ACK→HIGH"]
   → If any FAIL:
-      - Save IMAGE_ID_R.png  (original image)
-      - Save IMAGE_ID.png    (annotated: ROI boxes, failed cells in red)
+      - Save IMAGE_ID_R.jpg  (original image)
+      - Save IMAGE_ID.jpg    (annotated: ROI boxes, failed cells in red)
       - Log entry (see Logging section)
   → Update UI (badges, stats)
   → Set BUSY = False
@@ -192,8 +200,8 @@ Receive START_PIN (or Manual Trigger button in DEBUG)
 
 | File | Content |
 |---|---|
-| `IMAGE_ID_R.png` | Raw original image, no annotation |
-| `IMAGE_ID.png` | Annotated: all ROI boxes drawn, failed cells highlighted red, detected class labels shown |
+| `IMAGE_ID_R.jpg` | Raw original image, no annotation |
+| `IMAGE_ID.jpg` | Annotated: all 12 ROI cell boxes drawn (green = Text, red = NoText) |
 
 `IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN` (timestamp + sequential counter)
 
@@ -216,7 +224,7 @@ Every inspection appends one record to the log file.
 | `mode` | RUN / DEBUG |
 | `io_mock` | `True` if IO=False (signals were mocked, not sent) |
 
-In **DEBUG mode**: also log per-cell confidence scores, raw YOLO detections, and NMS input/output counts.
+In **DEBUG mode**: also log per-cell classifier result (`Text` / `NoText`) and confidence score.
 
 When `IO = False`: each signal change appended as a separate log line:
 ```
@@ -421,24 +429,34 @@ On unhandled crash (unexpected exception):
 
 ```
 ClearIC_Inspect/
-├── CLearIC.py             # ← entire program: config, IO, camera, UI, inspection
-├── output/                # Saved FAIL images (auto-created)
-├── logs/                  # Log files (auto-created)
-├── templates/             # Saved product templates
-└── models/                # OpenVINO model files
+├── CLearIC.py                          # ← entire program: config, IO, camera, UI, inspection
+├── Text_cls-2/best_openvino_model/     # OpenVINO classifier model (best.xml + best.bin)
+├── Output/                             # Saved FAIL images (auto-created, date-organised)
+├── logs/                               # Log files (auto-created)
+├── templates/                          # Saved product templates + strip patches
+└── Input/                              # Source images for CAMERA="directory" mode
 ```
 
 ### Sections inside CLearIC.py (in order)
 
 ```
-# Config Flags            DEBUG, CAMERA, IO, MODE, GPIO pin constants
+# Config Flags            DEBUG, CAMERA, IO, MODE, MODEL_PATH, GPIO pin constants
 # Stage & Error Flags     Stage enum, ErrorFlag enum
 # Exceptions              InspectionError hierarchy
 # Image                   Image dataclass + _next_image_id()
 # Camera                  Camera class (Basler / directory)
 # RaspberryIO             GPIO handler class
+# Detector                OpenVINO YOLO-cls classifier (classify_crop)
+# Cell Grid               _build_cells() — 3×2 ROI cell layout helpers
+# TemplateManager         Load/save IC bounding-box template + strip patches
+# TemplateMatcher         Bilateral-strip template matching for IC localization
+# Inspector               12-cell ROI crop-then-classify logic
+# Logger                  Daily-rotating JSON-lines log
 # Stylesheet              STYLE string
 # FailDialog              Modal FAIL popup
+# ImageView               Zoomable image widget with overlays
+# SetupDialog             Auto-detect confirm popup
+# RunWorker               QThread inspection loop
 # MainWindow              PyQt5 single-page UI
 # Entry Point             main() + __main__ guard
 ```
@@ -448,3 +466,4 @@ ClearIC_Inspect/
 ## Still Open
 
 - [ ] Startup ACK_PIN pulse — confirm machine expects this as "ready" indicator on boot
+- [ ] Auto Detect (setup) — classifier cannot detect IC positions; setup requires manual template creation via YOLO detection model or manual click-to-anchor flow

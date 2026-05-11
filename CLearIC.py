@@ -49,6 +49,7 @@ OUT_DIR   = "Output/" # Output image foler for annotated results (created on fir
 MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
 TEMPLATE_MODEL_PATH = "template_auto/ClearIC_Insp.xml"               # YOLO detection model (auto template setup)
 COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
+
 # =========================================================
 # CONFIG LOADER
 # =========================================================
@@ -439,6 +440,7 @@ class RaspberryIO:
 # DETECTOR  (OpenVINO Classifier — 2-class)
 # =========================================================
 _CLS_INPUT_SIZE = 224   # YOLO-cls default input size
+SHRINK_SCALE   = 0.9    # fraction to shrink detected IC boxes before slicing cells
 
 class Detector:
     """
@@ -602,6 +604,9 @@ class TemplateDetector:
             print(f"[TemplateDetector] Inference error: {e}")
             return []
 
+    # YOLO boxes are larger than the real IC area — shrink before use
+    _DETECT_SHRINK = SHRINK_SCALE   # fraction of width/height to keep (centred)
+
     def detect_all(self, image_bgr: np.ndarray) -> list:
         """Return IC_Presence QRects sorted left→right by X (for template setup)."""
         boxes = self._run_inference(image_bgr)
@@ -611,7 +616,14 @@ class TemplateDetector:
         presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
         top2 = presence[:2]
         top2.sort(key=lambda b: b[0])                  # left→right by X
-        return [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
+        return [self._shrink_rect(x, y, w, h) for x, y, w, h in top2]
+
+    def _shrink_rect(self, x: int, y: int, w: int, h: int) -> QtCore.QRect:
+        nw = max(1, int(w * self._DETECT_SHRINK))
+        nh = max(1, int(h * self._DETECT_SHRINK))
+        nx = x + (w - nw) // 2
+        ny = y + (h - nh) // 2
+        return QtCore.QRect(nx, ny, nw, nh)
 
 # =========================================================
 # CELL GRID CONSTANTS

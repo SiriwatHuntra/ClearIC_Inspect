@@ -521,6 +521,27 @@ _DATA_DIR   = "Dataset"
 _DATA_SPLIT = "train"    # "train" | "val" | "test"
 _data_run_counter = 0
 
+# =========================================================
+# VISUAL SETTINGS  (live-editable from the Settings panel)
+# =========================================================
+_ann_border_px   = 2           # ROI cell border thickness (px)
+_ann_show_labels = True        # draw R{row}C{col} inside each cell
+_ann_color_ok    = "#00C800"   # hex — Text  / PASS cell border
+_ann_color_ng    = "#DD0000"   # hex — NoText / FAIL cell border
+_tmpl_color_a    = "#FFD700"   # hex — IC_A overlay in setup view
+_tmpl_color_b    = "#00E5FF"   # hex — IC_B overlay in setup view
+_warmup_frames   = 5           # classifier warmup passes on startup
+
+def _hex_to_bgr(h: str) -> tuple:
+    """Convert '#RRGGBB' hex string to OpenCV BGR 3-tuple."""
+    h = h.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b, g, r)
+
+def _valid_hex(s: str) -> bool:
+    s = s.strip().lstrip("#")
+    return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
+
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
     Build the 3-row × 2-col cell list for one IC bounding rect.
@@ -936,19 +957,19 @@ class Inspector:
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
                       f"cls={lbl} conf={conf:.3f}")
-            color = (0, 200, 0) if present else (0, 0, 220)
+            color = _hex_to_bgr(_ann_color_ok) if present else _hex_to_bgr(_ann_color_ng)
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
-                          (min(iw, cx + cw), min(ih, cy + ch)), color, 2)
-            if debug:
+                          (min(iw, cx + cw), min(ih, cy + ch)),
+                          color, _ann_border_px)
+            if _ann_show_labels:
                 label = f"R{row}C{col}"
                 (tw, th), _ = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                 tx = max(0, cx) + (cw - tw) // 2
                 ty = max(0, cy) + (ch + th) // 2
                 cv2.putText(annotated, label, (tx, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                            (0, 200, 0) if present else (0, 0, 220), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             if not present:
                 missing.append([row, col])
         return missing, hits_flags
@@ -1735,6 +1756,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_cycle_ms = self._stat_row(stats_lay, "Last ms",  "—")
 
         right_lay.addWidget(stats_frame)
+
+        # Settings section
+        settings_frame = QtWidgets.QFrame()
+        settings_frame.setObjectName("setup_frame")
+        settings_lay = QtWidgets.QVBoxLayout(settings_frame)
+        settings_lay.setSpacing(4)
+
+        lbl_vis = QtWidgets.QLabel("Settings")
+        lbl_vis.setStyleSheet("font-weight:bold;font-size:13px")
+        settings_lay.addWidget(lbl_vis)
+
+        def _srow(parent, label, widget):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            lbl = QtWidgets.QLabel(label)
+            lbl.setStyleSheet("font-size:10px;color:#E2FDFF")
+            row.addWidget(lbl)
+            row.addStretch()
+            row.addWidget(widget)
+            parent.addLayout(row)
+
+        self._input_warmup = QtWidgets.QLineEdit(str(_warmup_frames))
+        self._input_warmup.setFixedWidth(52)
+        _srow(settings_lay, "Warmup frames", self._input_warmup)
+
+        self._input_border = QtWidgets.QLineEdit(str(_ann_border_px))
+        self._input_border.setFixedWidth(52)
+        _srow(settings_lay, "Border thickness (px)", self._input_border)
+
+        self._chk_labels = QtWidgets.QCheckBox("Show cell labels")
+        self._chk_labels.setChecked(_ann_show_labels)
+        settings_lay.addWidget(self._chk_labels)
+
+        self._input_color_ok = QtWidgets.QLineEdit(_ann_color_ok)
+        self._input_color_ok.setFixedWidth(80)
+        _srow(settings_lay, "PASS cell color", self._input_color_ok)
+
+        self._input_color_ng = QtWidgets.QLineEdit(_ann_color_ng)
+        self._input_color_ng.setFixedWidth(80)
+        _srow(settings_lay, "FAIL cell color", self._input_color_ng)
+
+        self._input_color_a = QtWidgets.QLineEdit(_tmpl_color_a)
+        self._input_color_a.setFixedWidth(80)
+        _srow(settings_lay, "IC_A overlay color", self._input_color_a)
+
+        self._input_color_b = QtWidgets.QLineEdit(_tmpl_color_b)
+        self._input_color_b.setFixedWidth(80)
+        _srow(settings_lay, "IC_B overlay color", self._input_color_b)
+
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_apply.clicked.connect(self._apply_settings)
+        settings_lay.addWidget(btn_apply)
+
+        right_lay.addWidget(settings_frame)
         right_lay.addStretch()
 
         root.addWidget(right_frame)
@@ -1789,6 +1864,44 @@ class MainWindow(QtWidgets.QMainWindow):
         return val
 
     # ----------------------------------------------------------
+    # Settings apply
+    # ----------------------------------------------------------
+    def _apply_settings(self):
+        global _ann_border_px, _ann_show_labels
+        global _ann_color_ok, _ann_color_ng
+        global _tmpl_color_a, _tmpl_color_b, _warmup_frames
+
+        try:
+            _warmup_frames = max(1, int(self._input_warmup.text()))
+        except ValueError:
+            self._input_warmup.setText(str(_warmup_frames))
+
+        try:
+            _ann_border_px = max(1, int(self._input_border.text()))
+        except ValueError:
+            self._input_border.setText(str(_ann_border_px))
+
+        _ann_show_labels = self._chk_labels.isChecked()
+
+        for attr, field in [
+            ("_ann_color_ok", self._input_color_ok),
+            ("_ann_color_ng", self._input_color_ng),
+            ("_tmpl_color_a", self._input_color_a),
+            ("_tmpl_color_b", self._input_color_b),
+        ]:
+            val = field.text().strip()
+            if not val.startswith("#"):
+                val = "#" + val
+            if _valid_hex(val):
+                globals()[attr] = val
+            else:
+                field.setText(globals()[attr])
+
+        print(f"[Settings] border={_ann_border_px}px  labels={_ann_show_labels}  "
+              f"ok={_ann_color_ok}  ng={_ann_color_ng}  "
+              f"ic_a={_tmpl_color_a}  ic_b={_tmpl_color_b}  warmup={_warmup_frames}")
+
+    # ----------------------------------------------------------
     # System init
     # ----------------------------------------------------------
     def _init_system(self):
@@ -1819,7 +1932,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._camera and cfg.get("CAMERA") == "camera":
             self._camera.warmup()
         if self._detector and self._detector.is_ready():
-            self._detector.warmup(frames=5)
+            self._detector.warmup(frames=_warmup_frames)
 
         # Load and display first image on startup (no overlays yet)
         if self._camera:
@@ -1905,9 +2018,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ic_a = cands[idx]
         ic_b = cands[(idx + 1) % len(cands)] if len(cands) >= 2 else None
         self._view.clear_overlays()
-        self._view.add_overlay(ic_a, QtGui.QColor("#FFD700"), "IC_A")
+        self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
         if ic_b:
-            self._view.add_overlay(ic_b, QtGui.QColor("#00E5FF"), "IC_B")
+            self._view.add_overlay(ic_b, QtGui.QColor(_tmpl_color_b), "IC_B")
         self._pending_ic_a = ic_a
         self._pending_ic_b = ic_b
         if self._setup_dlg and self._setup_dlg.isVisible():

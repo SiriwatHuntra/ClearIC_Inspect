@@ -46,6 +46,8 @@ IO        = False     # True = drive GPIO / False = mock (log only)
 MODE      = "DEBUG"   # "DEBUG" or "RUN"
 DIR_INPUT = "Input/train/Text"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
+MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
+
 # =========================================================
 # CONFIG LOADER
 # =========================================================
@@ -444,7 +446,7 @@ class Detector:
     Output shape: [1, 2]  — index 0 = NoText, index 1 = Text
     """
 
-    MODEL_XML = "Text_cls-2/best_openvino_model/best.xml"
+    MODEL_XML = MODEL_PATH
 
     def __init__(self, conf_thr: float = 0.5, **_):
         self._conf_thr = conf_thr

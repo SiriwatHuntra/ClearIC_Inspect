@@ -44,7 +44,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 DEBUG     = True      # verbose logs, annotated output
 IO        = False     # True = drive GPIO / False = mock (log only)
 MODE      = "DEBUG"   # "DEBUG" or "RUN"
-DIR_INPUT = "Input/train/Text"   # input image folder for CAMERA="directory" mode
+DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
 COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining

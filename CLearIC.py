@@ -605,27 +605,27 @@ _CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edg
 _CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
-_DATA_DIR = "Text"       # root folder for cell crop data collection
+_DATA_DIR   = "Dataset"  # root dataset folder
+_DATA_SPLIT = "train"    # which split to write crops into: "train" | "val" | "test"
+_data_run_counter = 0    # incremented once per image, shared across both ICs
 
-def _save_cell_crops(image_bgr: np.ndarray, cells: list, ic_label: str):
+def _save_cell_crops(image_bgr: np.ndarray, cells: list,
+                     cell_hits: list, ic_label: str, run_num: int):
     """
-    Crop each cell ROI from image_bgr and save to Text/R{row}C{col}/.
-    Filename: YYYYMMDD_HHMMSS_mmm_IC{label}.png
-    Creates subdirectories on first call.
+    Crop each cell ROI and save to Dataset/<split>/Text/ or .../NoText/.
+    Filename: {run_num:06d}_IC{label}_{idx:02d}.png  (flat, no ROI subfolders)
     """
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S_") + \
-           f"{datetime.now().microsecond // 1000:03d}"
     ih, iw = image_bgr.shape[:2]
     for idx, (cx, cy, cw, ch) in enumerate(cells):
-        row = idx // 2 + 1
-        col = idx %  2 + 1
-        folder = os.path.join(_DATA_DIR, f"R{row}C{col}")
+        class_name = "Text" if cell_hits[idx] else "NoText"
+        folder = os.path.join(_DATA_DIR, _DATA_SPLIT, class_name)
         os.makedirs(folder, exist_ok=True)
-        x1, y1 = max(0, cx),      max(0, cy)
+        x1, y1 = max(0, cx),       max(0, cy)
         x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
         crop = image_bgr[y1:y2, x1:x2]
         if crop.size > 0:
-            cv2.imwrite(os.path.join(folder, f"{ts}_IC{ic_label}.png"), crop)
+            fname = f"{run_num:06d}_IC{ic_label}_{idx:02d}.png"
+            cv2.imwrite(os.path.join(folder, fname), crop)
 
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
@@ -1006,10 +1006,6 @@ class Inspector:
                 else:
                     print("[Inspector] IC_B not found → template fallback → FAIL")
 
-        # Data collection — save each cell crop to Text/R{row}C{col}/
-        _save_cell_crops(image_bgr, ic_a_cells, "A")
-        _save_cell_crops(image_bgr, ic_b_cells, "B")
-
         # Phase 2: check all Text detection boxes against each IC's cells
         all_boxes = self._detector.detect_full_image(image_bgr)  # (x,y,w,h,conf)
 
@@ -1020,8 +1016,14 @@ class Inspector:
                         (bx, by - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                         (255, 200, 0), 1)
 
-        missing_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
-        missing_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
+        missing_a, hits_a = self._check_ic(all_boxes, ic_a_cells, annotated, debug)
+        missing_b, hits_b = self._check_ic(all_boxes, ic_b_cells, annotated, debug)
+
+        # Data collection — save each cell crop to Dataset/<split>/Text or NoText/
+        global _data_run_counter
+        _data_run_counter += 1
+        _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", _data_run_counter)
+        _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", _data_run_counter)
 
         if missing_a or missing_b:
             raise MarkMissingError(missing_a, missing_b, annotated)
@@ -1075,12 +1077,14 @@ class Inspector:
             if best_idx >= 0 and best_area > 0:
                 cell_hits[best_idx].append((bx, by, bw, bh, cf))
 
-        missing = []
+        missing    = []
+        hits_flags = []   # True/False per cell — used by data collection
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
             hits    = cell_hits[idx]
             present = len(hits) > 0
+            hits_flags.append(present)
             if debug:
                 hit_confs = [f"{cf:.3f}" for *_, cf in hits]
                 print(f"[Cell R{row}C{col}] "
@@ -1101,7 +1105,7 @@ class Inspector:
                             (0, 200, 0) if present else (0, 0, 220), 1)
             if not present:
                 missing.append([row, col])
-        return missing
+        return missing, hits_flags
 
 # =========================================================
 # LOGGER
@@ -2249,7 +2253,8 @@ def main():
     os.makedirs(_LOG_DIR,   exist_ok=True)
     os.makedirs("templates", exist_ok=True)
     os.makedirs(DIR_INPUT,   exist_ok=True)
-    os.makedirs(_DATA_DIR,   exist_ok=True)
+    os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "Text"),   exist_ok=True)
+    os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "NoText"), exist_ok=True)
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)

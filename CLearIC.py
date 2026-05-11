@@ -47,7 +47,7 @@ MODE      = "DEBUG"   # "DEBUG" or "RUN"
 DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
-TEMPLATE_MODEL_PATH = "template_auto/ClearIC_Insp.xml"               # YOLO detection model (auto template setup)
+TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"               # YOLO detection model (auto template setup)
 COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
 
 # =========================================================
@@ -440,7 +440,7 @@ class RaspberryIO:
 # DETECTOR  (OpenVINO Classifier — 2-class)
 # =========================================================
 _CLS_INPUT_SIZE = 224   # YOLO-cls default input size
-SHRINK_SCALE   = 0.9    # fraction to shrink detected IC boxes before slicing cells
+SHRINK_SCALE   = 1.0    # fraction to shrink detected IC boxes before slicing cells
 
 class Detector:
     """

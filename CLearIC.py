@@ -603,10 +603,7 @@ class TemplateDetector:
             return []
 
     def detect_all(self, image_bgr: np.ndarray) -> list:
-        """
-        Return IC_Presence QRects sorted left→right by X (for template setup).
-        Each raw YOLO rect is refined using the dark IC border edge.
-        """
+        """Return IC_Presence QRects sorted left→right by X (for template setup)."""
         boxes = self._run_inference(image_bgr)
         presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
         if not presence:
@@ -614,71 +611,7 @@ class TemplateDetector:
         presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
         top2 = presence[:2]
         top2.sort(key=lambda b: b[0])                  # left→right by X
-        rects = [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
-        return [self._refine_ic_rect(image_bgr, r) for r in rects]
-
-    @staticmethod
-    def _refine_ic_rect(image_bgr: np.ndarray, rect: QtCore.QRect,
-                        margin: int = 40) -> QtCore.QRect:
-        """
-        Tighten a YOLO-detected IC bounding box using the dark IC border.
-
-        The IC package has a dark border (near-black) between the grey
-        background and the bright IC body. Scanning intensity profiles
-        inward from each side:
-          background  →  dark border  →  IC body
-        Returns the rect at the inner edge of the dark border.
-        """
-        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
-        ih, iw = image_bgr.shape[:2]
-
-        sx1 = max(0, x - margin)
-        sy1 = max(0, y - margin)
-        sx2 = min(iw, x + w + margin)
-        sy2 = min(ih, y + h + margin)
-
-        gray = cv2.cvtColor(image_bgr[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY) \
-               if image_bgr.ndim == 3 else image_bgr[sy1:sy2, sx1:sx2].copy()
-        gray = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0)
-        rh, rw = gray.shape
-        if rh < 4 or rw < 4:
-            return rect
-
-        # Background level from the outer border of the search region
-        bg = float(np.mean(np.concatenate([
-            gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])))
-        dark_thr = bg * 0.60   # 40% drop from background = dark IC border
-
-        def inner_edge(profile: np.ndarray, reverse: bool) -> int:
-            """Scan until intensity drops below dark_thr, then rises again."""
-            it = list(range(len(profile)))
-            if reverse:
-                it = it[::-1]
-            in_dark = False
-            for i in it:
-                if not in_dark and profile[i] < dark_thr:
-                    in_dark = True
-                elif in_dark and profile[i] >= dark_thr:
-                    return i
-            return it[-1]
-
-        # Use centre column/row for the scans (most representative of IC body)
-        cx, cy = rw // 2, rh // 2
-        top   = inner_edge(gray[:, cx], reverse=False)
-        bot   = inner_edge(gray[:, cx], reverse=True)
-        left  = inner_edge(gray[cy, :], reverse=False)
-        right = inner_edge(gray[cy, :], reverse=True)
-
-        nx1 = sx1 + left
-        ny1 = sy1 + top
-        nw  = max(1, right - left)
-        nh  = max(1, bot   - top)
-
-        if DEBUG:
-            print(f"[TemplateDetector] Refined: ({x},{y},{w},{h}) "
-                  f"→ ({nx1},{ny1},{nw},{nh})")
-
-        return QtCore.QRect(nx1, ny1, nw, nh)
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h in top2]
 
 # =========================================================
 # CELL GRID CONSTANTS

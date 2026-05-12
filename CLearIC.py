@@ -653,24 +653,18 @@ class TemplateManager:
         """
         Crop top and bottom strips using the defined formula and apply bilateral filter.
 
-        IC(X, Y) is the center of the IC rectangle.
-          H1 = H2 = H * 0.5                      (strip height)
-          top strip at (IC_X, IC_Y - IC_H*0.75)  leads above IC body
-          bot strip at (IC_X, IC_Y + IC_H*0.75)  leads below IC body
+        Strip height = IC_H * 0.5.
+          top strip: bottom edge flush with IC top edge  → y1 = y - h1
+          bot strip: top edge flush with IC bottom edge  → y2 = y + h
 
         Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
         where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        cy = y + h // 2   # IC center Y (IC(X,Y) is the center of the rectangle)
-        # Strip height = 50% of IC height
-        h1 = max(1, int(h * 0.5))
-
-        # Top strip: top-left at (IC_X, IC_CY - IC_H*0.75) = (x, cy - h*0.75)
-        # Bot strip: top-left at (IC_X, IC_CY + IC_H*0.75) = (x, cy + h*0.75)
-        y1 = cy - int(h * 0.75)
-        y2 = cy + int(h * 0.75)
+        h1 = max(1, int(h * 0.5))  # strip height = 50% of IC height
+        y1 = y - h1   # top strip: bottom edge at IC top edge
+        y2 = y + h    # bot strip: top edge at IC bottom edge
 
         img_h, img_w = image_bgr.shape[:2]
         y1c   = max(0, y1)
@@ -754,11 +748,10 @@ class TemplateManager:
             cv2.line(preview, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2)
             cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
             cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
-            # Strip ROI — same geometry as extract_patches (IC center-based)
-            cy_ic = y + h // 2
+            # Strip ROI — same geometry as extract_patches
             h1 = max(1, int(h * 0.5))
-            y1 = max(0, cy_ic - int(h * 0.75))
-            y2 = max(0, min(cy_ic + int(h * 0.75), img_h - h1))
+            y1 = max(0, y - h1)
+            y2 = max(0, min(y + h, img_h - h1))
             cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
             cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
             cv2.putText(preview, "TOP leads", (x + 2, y1 + 14),

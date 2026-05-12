@@ -47,7 +47,7 @@ MODE      = "DEBUG"   # "DEBUG" or "RUN"
 DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
-TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"               # YOLO detection model (auto template setup)
+TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"               # (unused — kept for reference only)
 COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
 
 # =========================================================
@@ -509,121 +509,8 @@ class Detector:
             return 0, 0.0
 
     def detect_all(self, _image_bgr: np.ndarray) -> list:
-        """Stub — classifier cannot detect IC positions. Use TemplateDetector for setup."""
+        """Stub — classifier cannot detect IC positions. Draw IC areas in Setup to create template."""
         return []
-
-# =========================================================
-# TEMPLATE DETECTOR  (OpenVINO YOLO detection — IC_Presence / Text)
-# =========================================================
-_DET_INPUT_SIZE = 640
-
-class TemplateDetector:
-    """
-    OpenVINO YOLO detection model for auto-template setup.
-    Finds IC_Presence bounding boxes to auto-populate the template.
-    Output: [1, 6, 8400]  (cx, cy, w, h, conf_IC_Presence, conf_Text)
-    """
-
-    def __init__(self, conf_thr: float = 0.5, nms_thr: float = 0.45):
-        self._conf_thr = conf_thr
-        self._nms_thr  = nms_thr
-        self._compiled = None
-        self._ready    = False
-        try:
-            import openvino as ov
-            if not os.path.exists(TEMPLATE_MODEL_PATH):
-                raise ModelError(f"Template model not found: {TEMPLATE_MODEL_PATH}")
-            core  = ov.Core()
-            model = core.read_model(TEMPLATE_MODEL_PATH)
-            self._compiled = core.compile_model(model, "CPU", {
-                "INFERENCE_PRECISION_HINT": "f32",
-                "PERFORMANCE_HINT":         "LATENCY",
-            })
-            self._ready = True
-            print(f"[TemplateDetector] Loaded: {TEMPLATE_MODEL_PATH}")
-        except ModelError:
-            raise
-        except Exception as e:
-            raise ModelError(f"Template model load failed: {e}")
-
-    def is_ready(self) -> bool:
-        return self._ready
-
-    def _run_inference(self, image_bgr: np.ndarray) -> list:
-        """Letterbox → blob → infer → NMS. Returns (x,y,w,h,cls,conf) 6-tuples."""
-        if not self._ready or self._compiled is None:
-            return []
-        try:
-            if image_bgr.ndim == 2:
-                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-            ih, iw = image_bgr.shape[:2]
-            sz = _DET_INPUT_SIZE
-
-            scale   = min(sz / iw, sz / ih)
-            nw, nh  = int(iw * scale), int(ih * scale)
-            resized = cv2.resize(image_bgr, (nw, nh))
-            pad_buf = np.full((sz, sz, 3), 114, dtype=np.uint8)
-            pad_x   = (sz - nw) // 2
-            pad_y   = (sz - nh) // 2
-            pad_buf[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
-
-            blob   = pad_buf[:, :, ::-1].astype(np.float32) / 255.0
-            blob   = blob.transpose(2, 0, 1)[np.newaxis]
-            result = self._compiled(blob)
-            preds  = result[0][0].T                          # [8400, 6]
-
-            conf      = preds[:, 4:6].max(axis=1)
-            class_idx = preds[:, 4:6].argmax(axis=1)
-            mask      = conf >= self._conf_thr
-            preds, conf, class_idx = preds[mask], conf[mask], class_idx[mask]
-            if len(preds) == 0:
-                return []
-
-            raw_boxes, scores, classes = [], [], []
-            for i, row in enumerate(preds):
-                cx, cy, bw, bh = row[:4]
-                x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
-                y1 = max(0,  int((cy - bh / 2 - pad_y) / scale))
-                x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
-                y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
-                if x2 > x1 and y2 > y1:
-                    raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
-                    scores.append(float(conf[i]))
-                    classes.append(int(class_idx[i]))
-
-            if not raw_boxes:
-                return []
-            indices = cv2.dnn.NMSBoxes(raw_boxes, scores, self._conf_thr, self._nms_thr)
-            if len(indices) == 0:
-                return []
-            kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
-            return [(raw_boxes[i][0], raw_boxes[i][1],
-                     raw_boxes[i][2], raw_boxes[i][3],
-                     classes[i], scores[i]) for i in kept]
-        except Exception as e:
-            print(f"[TemplateDetector] Inference error: {e}")
-            return []
-
-    # YOLO boxes are larger than the real IC area — shrink before use
-    _DETECT_SHRINK = SHRINK_SCALE   # fraction of width/height to keep (centred)
-
-    def detect_all(self, image_bgr: np.ndarray) -> list:
-        """Return IC_Presence QRects sorted left→right by X (for template setup)."""
-        boxes = self._run_inference(image_bgr)
-        presence = [(x, y, w, h) for x, y, w, h, cls, _cf in boxes if cls == 0]
-        if not presence:
-            return []
-        presence.sort(key=lambda b: -(b[2] * b[3]))   # largest first
-        top2 = presence[:2]
-        top2.sort(key=lambda b: b[0])                  # left→right by X
-        return [self._shrink_rect(x, y, w, h) for x, y, w, h in top2]
-
-    def _shrink_rect(self, x: int, y: int, w: int, h: int) -> QtCore.QRect:
-        nw = max(1, int(w * self._DETECT_SHRINK))
-        nh = max(1, int(h * self._DETECT_SHRINK))
-        nx = x + (w - nw) // 2
-        ny = y + (h - nh) // 2
-        return QtCore.QRect(nx, ny, nw, nh)
 
 # =========================================================
 # CELL GRID CONSTANTS
@@ -766,24 +653,23 @@ class TemplateManager:
         """
         Crop top and bottom strips using the defined formula and apply bilateral filter.
 
-        Given IC at (X, Y) with size (W, H), cy = Y + H/2:
-          H1 = H2 = H * 0.5
-          W1 = W2 = W
-          Y1 = cy - H*0.8   (top strip anchored from IC center, strip center H*0.55 above cy)
-          Y2 = Y  + H*0.8   (bottom strip anchored from IC top,  strip center H*0.55 below cy)
+        Given IC at (X, Y) with size (W, H):
+          H1 = H2 = H * 0.5              (strip height)
+          top strip at (X, Y - H*0.75)   covers leads above IC body
+          bot strip at (X, Y + H*0.75)   covers leads below IC body
 
         Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
         where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        # Strip height ≈ lead/pin area (25% of IC height)
-        h1 = max(1, int(h * 0.25))
+        # Strip height = 50% of IC height
+        h1 = max(1, int(h * 0.5))
 
-        # Top strip: pin leads directly above the IC body  [y-h1 .. y]
-        # Bot strip: pin leads directly below the IC body  [y+h  .. y+h+h1]
-        y1 = y - h1
-        y2 = y + h
+        # Top strip: (IC_X, IC_Y - IC_H*0.75), size (IC_W, IC_H*0.5)
+        # Bot strip: (IC_X, IC_Y + IC_H*0.75), size (IC_W, IC_H*0.5)
+        y1 = y - int(h * 0.75)
+        y2 = y + int(h * 0.75)
 
         img_h, img_w = image_bgr.shape[:2]
         y1c   = max(0, y1)
@@ -801,8 +687,8 @@ class TemplateManager:
         top_bin = _to_contour(image_bgr[y1c:y1c + h1, x:x_end])
         bot_bin = _to_contour(image_bgr[y2c:y2c + h1, x:x_end])
 
-        top_y_offset = y1c - y   # ≈ -h1  (strip above IC top)
-        bot_y_offset = y2c - y   # ≈ +h   (strip below IC bottom)
+        top_y_offset = y1c - y   # strip_y - IC_y (used to reconstruct IC pos from match)
+        bot_y_offset = y2c - y
         return top_bin, bot_bin, top_y_offset, bot_y_offset, h1
 
     @staticmethod
@@ -867,11 +753,10 @@ class TemplateManager:
             cv2.line(preview, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2)
             cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
             cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
-            # Strip ROI — pin leads above and below IC body (same as extract_patches)
-            h1 = max(1, int(h * 0.25))
-            y1 = max(0, y - h1)    # top leads:  just above IC
-            y2 = y + h              # bottom leads: just below IC
-            y2 = max(0, min(y2, img_h - h1))
+            # Strip ROI — same geometry as extract_patches
+            h1 = max(1, int(h * 0.5))
+            y1 = max(0, y - int(h * 0.75))
+            y2 = max(0, min(y + int(h * 0.75), img_h - h1))
             cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
             cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
             cv2.putText(preview, "TOP leads", (x + 2, y1 + 14),
@@ -1299,10 +1184,10 @@ class FailDialog(QtWidgets.QDialog):
 # =========================================================
 class ImageView(QtWidgets.QLabel):
     """
-    Zoomable image display with overlay support and stamp mode.
-    Ported from Ref_sample.py ImageView (L3597–3833).
+    Zoomable image display with overlay support, stamp mode, and rubber-band drawing.
     """
     anchor_clicked = QtCore.pyqtSignal(QtCore.QPoint)   # unused but kept for future
+    rect_drawn     = QtCore.pyqtSignal(QtCore.QRect)    # emitted on rubber-band release (image coords)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1315,6 +1200,9 @@ class ImageView(QtWidgets.QLabel):
         self._stamp_mode  = False
         self._stamp_w     = 100
         self._stamp_h     = 60
+        self._rb_mode     = False
+        self._rb_start    = None  # QPoint in image coords
+        self._rb_cur      = None  # QPoint in image coords (current drag position)
         self.setMouseTracking(True)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Expanding)
@@ -1385,10 +1273,19 @@ class ImageView(QtWidgets.QLabel):
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
+    # ---- rubber-band mode ----
+    def set_rubberband_mode(self, on: bool):
+        self._rb_mode  = on
+        self._rb_start = None
+        self._rb_cur   = None
+        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+        self.update()
+
     # ---- paint ----
     def paintEvent(self, e):
         super().paintEvent(e)
-        if not self._overlays and not self._stamp_mode:
+        has_rb = self._rb_mode and self._rb_start and self._rb_cur
+        if not self._overlays and not self._stamp_mode and not has_rb:
             return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -1404,10 +1301,21 @@ class ImageView(QtWidgets.QLabel):
                 painter.setPen(color)
                 painter.drawText(wr.topLeft() + QtCore.QPoint(3, 14), label)
 
+        if has_rb:
+            rb_img    = QtCore.QRect(self._rb_start, self._rb_cur).normalized()
+            rb_widget = self._to_widget(rb_img)
+            pen = QtGui.QPen(QtGui.QColor("#FFD700"), 2, QtCore.Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRect(rb_widget)
+
         painter.end()
 
-    def mouseMoveEvent(self, _):
+    def mouseMoveEvent(self, e):
         if self._stamp_mode:
+            self.update()
+        elif self._rb_mode and self._rb_start:
+            self._rb_cur = self._to_img(e.pos())
             self.update()
 
     def mousePressEvent(self, e):
@@ -1418,123 +1326,19 @@ class ImageView(QtWidgets.QLabel):
                                   self._stamp_w, self._stamp_h)
             self.anchor_clicked.emit(img_pt)
             self.add_overlay(rect, QtGui.QColor("#FFD700"), "")
+        elif e.button() == QtCore.Qt.LeftButton and self._rb_mode:
+            self._rb_start = self._to_img(e.pos())
+            self._rb_cur   = self._rb_start
 
-# =========================================================
-# SETUP DIALOG  (Auto Detect flow: Auto-Detect → Popup → Retry / Confirm)
-# =========================================================
-class SetupDialog(QtWidgets.QDialog):
-    """
-    Non-modal popup for template creation.
-    Opens after "Auto Detect" runs; shows detection status and
-    lets the user Retry (re-runs detection) or Confirm (saves template).
-    Overlays on the main ImageView update live while the dialog is open.
-    """
-    confirmed = QtCore.pyqtSignal(QtCore.QRect, QtCore.QRect)   # ic_a, ic_b
-
-    def __init__(self, retry_fn, cancel_fn, parent=None):
-        super().__init__(parent, QtCore.Qt.WindowTitleHint |
-                         QtCore.Qt.WindowCloseButtonHint)
-        self.setWindowTitle("Auto Detect — IC Template")
-        self.setModal(False)
-        self.setMinimumWidth(340)
-        self.setStyleSheet(
-            "QDialog  { background:#5465FF; }"
-            "QLabel   { color:#FFFFFF; }"
-            "QPushButton { background:#788BFF; color:#FFFFFF; border-radius:6px;"
-            "  padding:6px 14px; font-weight:bold; border:none; }"
-            "QPushButton:disabled { background:#9BB1FF; color:#BFD7FF; }"
-        )
-
-        self._retry_fn  = retry_fn
-        self._cancel_fn = cancel_fn
-        self._ic_a: QtCore.QRect | None = None
-        self._ic_b: QtCore.QRect | None = None
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setSpacing(12)
-        lay.setContentsMargins(20, 20, 20, 20)
-
-        title = QtWidgets.QLabel("Auto Detect IC Positions")
-        title.setStyleSheet("font-size:14px;font-weight:bold;color:#E2FDFF")
-        title.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(title)
-
-        self._lbl_status = QtWidgets.QLabel("Detecting…")
-        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
-        self._lbl_status.setWordWrap(True)
-        self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
-        self._lbl_status.setMinimumHeight(36)
-        lay.addWidget(self._lbl_status)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        self._btn_retry   = QtWidgets.QPushButton("Retry")
-        self._btn_confirm = QtWidgets.QPushButton("Confirm")
-        self._btn_cancel  = QtWidgets.QPushButton("Cancel")
-
-        self._btn_confirm.setStyleSheet(
-            "background:#FFFFFF;color:#5465FF;border-radius:6px;"
-            "padding:6px 14px;font-weight:bold;")
-        self._btn_confirm.setEnabled(False)
-        self._btn_retry.setEnabled(False)
-
-        self._btn_retry.clicked.connect(self._on_retry)
-        self._btn_confirm.clicked.connect(self._on_confirm)
-        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
-
-        btn_row.addWidget(self._btn_retry)
-        btn_row.addStretch()
-        btn_row.addWidget(self._btn_confirm)
-        btn_row.addWidget(self._btn_cancel)
-        lay.addLayout(btn_row)
-
-        self.adjustSize()
-
-    def show_result(self, ic_a: QtCore.QRect | None, ic_b: QtCore.QRect | None,
-                    n_detected: int, candidate_idx: int = 0):
-        self._ic_a = ic_a
-        self._ic_b = ic_b
-        both = ic_a is not None and ic_b is not None
-        if both:
-            self._lbl_status.setText(
-                f"Candidate {candidate_idx + 1} of {n_detected} shown as IC_A.\n"
-                "Retry to cycle. Confirm when correct.")
-            self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
-        elif n_detected == 1:
-            self._lbl_status.setText(
-                "Only 1 IC detected — cannot assign IC_B.\n"
-                "Adjust image or click Retry.")
-            self._lbl_status.setStyleSheet("color:#EF5350;font-size:11px")
-        else:
-            self._lbl_status.setText(
-                "No ICs detected.\nAdjust image or click Retry.")
-            self._lbl_status.setStyleSheet("color:#EF5350;font-size:11px")
-        self._btn_confirm.setEnabled(both)
-        self._btn_retry.setEnabled(True)
-
-    def _on_retry(self):
-        self._btn_retry.setEnabled(False)
-        self._btn_confirm.setEnabled(False)
-        self._lbl_status.setText("Detecting…")
-        self._lbl_status.setStyleSheet("color:#BFD7FF;font-size:11px")
-        if self._retry_fn:
-            self._retry_fn()
-
-    def _on_confirm(self):
-        if self._ic_a and self._ic_b:
-            self.confirmed.emit(self._ic_a, self._ic_b)
-            self.accept()
-
-    def _on_cancel_clicked(self):
-        if self._cancel_fn:
-            self._cancel_fn()
-        self.reject()
-
-    def closeEvent(self, e):
-        if self._cancel_fn:
-            self._cancel_fn()
-        e.accept()
+    def mouseReleaseEvent(self, e):
+        if self._rb_mode and self._rb_start and e.button() == QtCore.Qt.LeftButton:
+            end  = self._to_img(e.pos())
+            rect = QtCore.QRect(self._rb_start, end).normalized()
+            self._rb_start = None
+            self._rb_cur   = None
+            self.update()
+            if rect.width() > 5 and rect.height() > 5:
+                self.rect_drawn.emit(rect)
 
 # =========================================================
 # RUN WORKER
@@ -1724,10 +1528,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("ClearIC Inspect")
         self._cfg               = cfg
-        self._camera:           Camera | None           = None
-        self._detector:         Detector | None         = None
-        self._tmpl_detector:    TemplateDetector | None = None
-        self._gpio              = None
+        self._camera:    Camera | None  = None
+        self._detector:  Detector | None = None
+        self._gpio       = None
         self._logger            = Logger()
         self._worker:           RunWorker | None        = None
 
@@ -1736,12 +1539,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_error = 0
 
         # setup state
-        self._setup_dlg:           SetupDialog | None = None
-        self._pending_ic_a:        QtCore.QRect | None = None
-        self._pending_ic_b:        QtCore.QRect | None = None
-        self._detect_candidates:   list = []
-        self._detect_candidate_idx: int = 0
-        self._current_detect_image: np.ndarray | None = None
+        self._pending_ic_a:  QtCore.QRect | None = None
+        self._pending_ic_b:  QtCore.QRect | None = None
+        self._setup_image:   np.ndarray | None   = None
+        self._setup_state:   str                 = 'idle'   # idle/draw_a/draw_b/ready
 
         screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
@@ -1824,9 +1625,34 @@ class MainWindow(QtWidgets.QMainWindow):
             str(self._cfg.get("EXPOSURE_US", 8000)))
         setup_lay.addWidget(self._input_exposure)
 
-        self._btn_detect = QtWidgets.QPushButton("Auto Detect")
-        self._btn_detect.clicked.connect(self._start_auto_detect)
-        setup_lay.addWidget(self._btn_detect)
+        self._lbl_setup_status = QtWidgets.QLabel("—")
+        self._lbl_setup_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._lbl_setup_status.setWordWrap(True)
+        setup_lay.addWidget(self._lbl_setup_status)
+
+        self._btn_draw_a = QtWidgets.QPushButton("Draw IC_A")
+        self._btn_draw_a.clicked.connect(self._start_draw_a)
+        setup_lay.addWidget(self._btn_draw_a)
+
+        self._btn_draw_b = QtWidgets.QPushButton("Draw IC_B")
+        self._btn_draw_b.clicked.connect(self._start_draw_b)
+        self._btn_draw_b.setEnabled(False)
+        setup_lay.addWidget(self._btn_draw_b)
+
+        btn_row_tmpl = QtWidgets.QHBoxLayout()
+        self._btn_confirm_tmpl = QtWidgets.QPushButton("Confirm")
+        self._btn_confirm_tmpl.clicked.connect(self._confirm_template)
+        self._btn_confirm_tmpl.setEnabled(False)
+        self._btn_confirm_tmpl.setStyleSheet(
+            "background:#FFFFFF;color:#5465FF;border-radius:6px;"
+            "padding:6px 14px;font-weight:bold;")
+        self._btn_reset_tmpl = QtWidgets.QPushButton("Reset")
+        self._btn_reset_tmpl.clicked.connect(self._reset_template_draw)
+        btn_row_tmpl.addWidget(self._btn_confirm_tmpl)
+        btn_row_tmpl.addWidget(self._btn_reset_tmpl)
+        setup_lay.addLayout(btn_row_tmpl)
+
+        self._view.rect_drawn.connect(self._on_rb_rect_drawn)
 
         right_lay.addWidget(setup_frame)
 
@@ -2027,13 +1853,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error(f"Classifier model load failed: {e}")
 
         try:
-            self._tmpl_detector = TemplateDetector(
-                conf_thr=cfg.get("CONF_THR", 0.5),
-            )
-        except ModelError as e:
-            self._show_error(f"Template model load failed: {e}")
-
-        try:
             self._gpio = RaspberryIO(io_enabled=IO)
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
@@ -2059,7 +1878,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 img = self._camera.grab()
                 self._view.set_image(img)
-                self._current_detect_image = img
+                self._setup_image = img
                 if cfg.get("CAMERA") == "directory":
                     self._camera.reset()   # rewind so run starts from image 1
             except CameraError:
@@ -2067,130 +1886,118 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ----------------------------------------------------------
-    # Auto Detect flow
+    # Rubber-band template setup flow
     # ----------------------------------------------------------
-    def _start_auto_detect(self):
-        if not self._tmpl_detector or not self._tmpl_detector.is_ready():
-            self._show_error("Template model not ready — check TEMPLATE_MODEL_PATH.")
-            return
+    def _grab_setup_frame(self) -> np.ndarray | None:
         if self._camera is None:
             self._show_error("Camera not ready.")
-            return
-
+            return None
         try:
+            if self._cfg.get("CAMERA") == "directory":
+                self._camera.reset()
             img = self._camera.grab()
             if self._cfg.get("CAMERA") == "directory":
                 self._camera.reset()
+            return img
         except CameraError as e:
             self._show_error(str(e))
-            return
+            return None
 
-        self._current_detect_image = img
+    def _start_draw_a(self):
+        img = self._grab_setup_frame()
+        if img is None:
+            return
+        self._setup_image  = img
+        self._pending_ic_a = None
+        self._pending_ic_b = None
         self._view.set_image(img)
         self._view.clear_overlays()
+        self._setup_state = 'draw_a'
+        self._view.set_rubberband_mode(True)
+        self._update_setup_buttons()
 
-        # Open the popup dialog before running detection so it's visible immediately
-        if self._setup_dlg is None or not self._setup_dlg.isVisible():
-            self._setup_dlg = SetupDialog(
-                retry_fn=self._retry_detection,
-                cancel_fn=self._cancel_detect,
-                parent=self,
-            )
-            self._setup_dlg.confirmed.connect(self._on_detect_confirmed)
-            # Centre popup over main window
-            self._setup_dlg.adjustSize()
-            geo   = self.geometry()
-            dlg_w = self._setup_dlg.width()
-            dlg_h = self._setup_dlg.height()
-            self._setup_dlg.move(
-                geo.x() + (geo.width()  - dlg_w) // 2,
-                geo.y() + (geo.height() - dlg_h) // 2,
-            )
-            self._setup_dlg.show()
+    def _start_draw_b(self):
+        self._setup_state = 'draw_b'
+        self._view.set_rubberband_mode(True)
+        self._update_setup_buttons()
 
-        self._run_detection(img)
+    def _on_rb_rect_drawn(self, rect: QtCore.QRect):
+        if self._setup_state == 'draw_a':
+            self._pending_ic_a = rect
+            self._view.set_rubberband_mode(False)
+            self._view.add_overlay(rect, QtGui.QColor(_tmpl_color_a), "IC_A")
+            self._setup_state = 'draw_b'
+            self._update_setup_buttons()
+        elif self._setup_state == 'draw_b':
+            self._pending_ic_b = rect
+            self._view.set_rubberband_mode(False)
+            self._view.add_overlay(rect, QtGui.QColor(_tmpl_color_b), "IC_B")
+            self._setup_state = 'ready'
+            self._update_setup_buttons()
 
-    def _retry_detection(self):
-        """Cycle to the next sorted YOLO candidate (no new inference needed)."""
-        if self._detect_candidates:
-            self._detect_candidate_idx += 1
-            self._show_candidate()
-        elif self._current_detect_image is not None:
-            self._run_detection(self._current_detect_image)
+    def _confirm_template(self):
+        if self._pending_ic_a and self._pending_ic_b:
+            self._on_detect_confirmed(self._pending_ic_a, self._pending_ic_b)
+            self._reset_template_draw()
 
-    def _run_detection(self, img: np.ndarray):
-        if not self._tmpl_detector:
-            return
-        rects = self._tmpl_detector.detect_all(img)
-        # Sort by (x + y) ascending → leftmost-topmost candidate first
-        self._detect_candidates    = sorted(rects, key=lambda r: r.x() + r.y())
-        self._detect_candidate_idx = 0
-        self._show_candidate()
-
-    def _show_candidate(self):
-        """Highlight the current candidate as IC_A and the next one as IC_B."""
-        cands = self._detect_candidates
-        if not cands:
-            if self._setup_dlg and self._setup_dlg.isVisible():
-                self._setup_dlg.show_result(None, None, 0, 0)
-            return
-        idx  = self._detect_candidate_idx % len(cands)
-        ic_a = cands[idx]
-        ic_b = cands[(idx + 1) % len(cands)] if len(cands) >= 2 else None
+    def _reset_template_draw(self):
+        self._view.set_rubberband_mode(False)
         self._view.clear_overlays()
-        self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
-        if ic_b:
-            self._view.add_overlay(ic_b, QtGui.QColor(_tmpl_color_b), "IC_B")
-        self._pending_ic_a = ic_a
-        self._pending_ic_b = ic_b
-        if self._setup_dlg and self._setup_dlg.isVisible():
-            self._setup_dlg.show_result(ic_a, ic_b, len(cands), idx)
+        self._pending_ic_a = None
+        self._pending_ic_b = None
+        self._setup_state  = 'idle'
+        self._update_setup_buttons()
+
+    def _update_setup_buttons(self):
+        s = self._setup_state
+        self._btn_draw_a.setEnabled(s in ('idle', 'ready'))
+        self._btn_draw_b.setEnabled(s in ('draw_b', 'ready'))
+        self._btn_confirm_tmpl.setEnabled(s == 'ready')
+        status = {
+            'idle':   '—',
+            'draw_a': 'Draw IC_A area on image.',
+            'draw_b': 'IC_A set. Draw IC_B area.',
+            'ready':  'Both set. Click Confirm to save.',
+        }.get(s, '—')
+        self._lbl_setup_status.setText(status)
 
     def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
-        self._pending_ic_a = ic_a
-        self._pending_ic_b = ic_b
         self._view.clear_overlays()
         try:
             exposure = int(self._input_exposure.text())
         except ValueError:
             exposure = 8000
 
-        # Extract bilateral-filtered strip patches from the confirmed IC_A rect
         patch_saved = False
         top_y_off = bot_y_off = strip_h_val = 0
-        if self._current_detect_image is not None:
+        if self._setup_image is not None:
             try:
                 top_patch, bot_patch, top_y_off, bot_y_off, strip_h_val = \
-                    TemplateManager.extract_patches(self._current_detect_image, ic_a)
+                    TemplateManager.extract_patches(self._setup_image, ic_a)
                 TemplateManager.save_patches(top_patch, bot_patch)
                 patch_saved = True
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
                     self, "Patch Warning",
                     f"Could not save template patches: {e}\n"
-                    "Inspection will fall back to YOLO IC localization.")
+                    "Inspection will use fixed template coordinates.")
 
         TemplateManager.save(ic_a, ic_b, exposure,
                              strip_top_y_offset=top_y_off,
                              strip_bot_y_offset=bot_y_off,
                              strip_h=strip_h_val)
 
-        if self._current_detect_image is not None:
+        if self._setup_image is not None:
             try:
-                TemplateManager.save_preview(self._current_detect_image, ic_a, ic_b)
+                TemplateManager.save_preview(self._setup_image, ic_a, ic_b)
             except Exception:
-                pass  # preview is non-critical
+                pass
 
         msg = "Template saved to templates/template.json"
         if patch_saved:
             msg += "\nPatch files saved (tmpl_top.npy / tmpl_bot.npy)"
         msg += "\nPreview saved to templates/template_preview.png"
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
-
-    def _cancel_detect(self):
-        self._view.clear_overlays()
-        self._pending_ic_a = None
-        self._pending_ic_b = None
 
 
     # ----------------------------------------------------------
@@ -2270,7 +2077,7 @@ class MainWindow(QtWidgets.QMainWindow):
             img = self._camera.grab()
             self._view.set_image(img)
             self._view.clear_overlays()
-            self._current_detect_image = img
+            self._setup_image = img
             if self._cfg.get("CAMERA") == "directory":
                 self._camera.reset()          # rewind again so next run starts at 0
         except CameraError:

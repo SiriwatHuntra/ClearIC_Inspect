@@ -30,6 +30,7 @@ import os
 import json
 import glob
 import time
+import threading
 from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -428,6 +429,18 @@ class RaspberryIO:
         if not self._gpio_ok:
             return False
         return self._GPIO.input(DONE_PIN) == self._GPIO.HIGH
+
+    def drain_start_pin(self, timeout_ms: int = 500):
+        """Wait until START_PIN is LOW (or timeout) to discard stale HIGH after resume."""
+        if not self._gpio_ok:
+            print("[IO MOCK] drain_start_pin")
+            return
+        GPIO = self._GPIO
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if not GPIO.input(START_PIN):
+                return
+            time.sleep(0.01)
 
     def cleanup(self):
         if self._gpio_ok:
@@ -973,7 +986,8 @@ _LOG_RETENTION = 365
 class Logger:
 
     def __init__(self, log_dir: str = _LOG_DIR):
-        self._dir = log_dir
+        self._dir         = log_dir
+        self._session_log: str | None = None
         os.makedirs(log_dir, exist_ok=True)
         self._rotate()
 
@@ -990,17 +1004,45 @@ class Logger:
                 pass
 
     def _append(self, record: dict):
+        path = self._session_log if self._session_log else self._log_path()
         try:
-            with open(self._log_path(), "a", encoding="utf-8") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as e:
             print(f"[Logger] Write failed: {e}", file=sys.stderr)
+
+    def start_session(self, mode: str):
+        self._rotate()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_log = os.path.join(self._dir, f"inspect_{ts}.log")
+        self._append({"event": "SESSION_START",
+                       "timestamp": datetime.now().isoformat(),
+                       "mode": mode})
+
+    def log_session_end(self, reason: str,
+                        pass_ct: int, fail_ct: int, err_ct: int,
+                        elapsed_s: float):
+        self._append({"event": "SESSION_END",
+                       "timestamp": datetime.now().isoformat(),
+                       "reason": reason,
+                       "total_pass": pass_ct,
+                       "total_fail": fail_ct,
+                       "total_error": err_ct,
+                       "duration_s": round(elapsed_s, 1)})
+        self._session_log = None
+
+    def log_pause(self):
+        self._append({"event": "PAUSE",
+                       "timestamp": datetime.now().isoformat()})
+
+    def log_resume(self):
+        self._append({"event": "RESUME",
+                       "timestamp": datetime.now().isoformat()})
 
     def log_inspection(self, image_id: str,
                        ic_a_result: str, ic_a_missing: list,
                        ic_b_result: str, ic_b_missing: list,
                        cycle_ms: float, mode: str, io_mock: bool):
-        self._rotate()
         self._append({
             "timestamp":   datetime.now().isoformat(),
             "image_id":    image_id,
@@ -1352,6 +1394,8 @@ class RunWorker(QtCore.QThread):
     sig_status   = QtCore.pyqtSignal(str)
     sig_cycle_ms = QtCore.pyqtSignal(float)
     sig_done     = QtCore.pyqtSignal()           # all directory images processed → standby
+    sig_paused   = QtCore.pyqtSignal()
+    sig_resumed  = QtCore.pyqtSignal()
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
@@ -1362,10 +1406,21 @@ class RunWorker(QtCore.QThread):
         self._gpio      = gpio
         self._logger    = logger
         self._cfg       = cfg
-        self._stop = False
+        self._stop    = False
+        self._running = threading.Event()
+        self._running.set()
+        self._busy    = False
 
     def stop(self):
         self._stop = True
+        self._running.set()   # unblock any paused wait
+
+    def pause(self):
+        self._running.clear()
+
+    def resume(self):
+        self._busy = True     # BUSY guard: drain stale START_PIN after resume
+        self._running.set()
 
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
@@ -1492,6 +1547,19 @@ class RunWorker(QtCore.QThread):
                 if self._gpio.is_done_signaled():
                     break                  # machine stop signal → sig_done
 
+            # ── Pause checkpoint ─────────────────────────────────────
+            # Sits after DONE handshake + clear_outputs so the machine
+            # always receives ACK before the loop suspends.
+            if not self._running.is_set():
+                self.sig_paused.emit()
+                self._running.wait()          # blocks until resume() or stop()
+                if self._stop:
+                    break
+                if self._busy:
+                    self._gpio.drain_start_pin()
+                    self._busy = False
+                self.sig_resumed.emit()
+
         self._gpio.clear_outputs()
         if not self._stop and cam_mode != "camera":
             self.sig_done.emit()
@@ -1576,6 +1644,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_pass  = 0
         self._stats_fail  = 0
         self._stats_error = 0
+
+        self._run_state          = "standby"   # "standby" | "running" | "paused"
+        self._session_start_time = 0.0
 
         # setup state
         self._pending_ic_a:  QtCore.QRect | None = None
@@ -1697,9 +1768,9 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_ctrl.setStyleSheet("font-weight:bold;font-size:13px")
         ctrl_lay.addWidget(lbl_ctrl)
 
-        self._btn_run = QtWidgets.QPushButton("Start")
-        self._btn_run.clicked.connect(self._start_run)
-        ctrl_lay.addWidget(self._btn_run)
+        self._btn_action = QtWidgets.QPushButton("Start")
+        self._btn_action.clicked.connect(self._on_action_click)
+        ctrl_lay.addWidget(self._btn_action)
 
         self._btn_stop = QtWidgets.QPushButton("Stop")
         self._btn_stop.setEnabled(False)
@@ -2051,8 +2122,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ----------------------------------------------------------
-    # Run / Stop
+    # Run / Pause / Stop
     # ----------------------------------------------------------
+    def _on_action_click(self):
+        if self._run_state == "standby":
+            self._start_run()
+        elif self._run_state == "running":
+            self._pause_run()
+        elif self._run_state == "paused":
+            self._resume_run()
+
     def _start_run(self):
         if self._worker and self._worker.isRunning():
             return
@@ -2065,13 +2144,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
+        # Reset counters for new session
+        self._stats_pass = self._stats_fail = self._stats_error = 0
+        self._lbl_pass.setText("0")
+        self._lbl_fail.setText("0")
+        self._lbl_error.setText("0")
+        self._session_start_time = time.monotonic()
+
+        mode = "DEBUG" if DEBUG else "RUN"
+        self._logger.start_session(mode)
+
         # IC localization via TemplateMatcher when patches exist; else fixed template coords.
         matcher = None
         top, bot = TemplateManager.load_patches()
         if top is not None and bot is not None:
             ic_a = tmpl["ic_a"]
             matcher = TemplateMatcher(
-                top, 
+                top,
                 bot,
                 threshold=tmpl.get("match_threshold", 0.6),
                 strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
@@ -2093,13 +2182,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_cycle_ms.connect(
             lambda ms: self._lbl_cycle_ms.setText(f"{ms:.0f}"))
         self._worker.sig_done.connect(self._on_run_done)
+        self._worker.sig_paused.connect(self._on_paused)
+        self._worker.sig_resumed.connect(self._on_resumed)
         self._worker.start()
 
-        self._btn_run.setEnabled(False)
+        self._run_state = "running"
+        self._btn_action.setText("Pause")
         self._btn_stop.setEnabled(True)
 
+    def _pause_run(self):
+        if self._worker:
+            self._worker.pause()
+        # UI updated via sig_paused → _on_paused()
+
+    def _resume_run(self):
+        if self._worker:
+            self._worker.resume()
+        # UI updated via sig_resumed → _on_resumed()
+
+    def _on_paused(self):
+        self._run_state = "paused"
+        self._btn_action.setText("Resume")
+        self._lbl_status.setText("Paused.")
+        self._logger.log_pause()
+
+    def _on_resumed(self):
+        self._run_state = "running"
+        self._btn_action.setText("Pause")
+        self._lbl_status.setText("Running…")
+        self._logger.log_resume()
+
     def _stop_run(self):
-        """Called by Stop button — early stop, no sig_done."""
+        """Called by Stop button — ends session, no sig_done."""
+        elapsed = time.monotonic() - self._session_start_time
+        self._logger.log_session_end(
+            "STOPPED", self._stats_pass, self._stats_fail,
+            self._stats_error, elapsed)
         if self._worker:
             self._worker.stop()
             self._worker.wait(3000)
@@ -2107,10 +2225,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_run_done(self):
         """Called when all images processed naturally OR DONE_PIN received."""
+        elapsed = time.monotonic() - self._session_start_time
+        self._logger.log_session_end(
+            "COMPLETE", self._stats_pass, self._stats_fail,
+            self._stats_error, elapsed)
         self._enter_standby()
 
     def _enter_standby(self):
-        self._btn_run.setEnabled(True)
+        self._run_state = "standby"
+        self._btn_action.setText("Start")
+        self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)
@@ -2160,7 +2284,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_error += 1
         self._lbl_error.setText(str(self._stats_error))
         self._show_error(msg)
-        self._btn_run.setEnabled(True)
+        elapsed = time.monotonic() - self._session_start_time
+        self._logger.log_session_end(
+            "ERROR", self._stats_pass, self._stats_fail,
+            self._stats_error, elapsed)
+        self._run_state = "standby"
+        self._btn_action.setText("Start")
+        self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
 
     # ----------------------------------------------------------

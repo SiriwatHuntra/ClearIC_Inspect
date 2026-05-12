@@ -1,19 +1,19 @@
 {
   "ic_a": {
-    "x": 181,
-    "y": 305,
-    "w": 127,
-    "h": 128
+    "x": 184,
+    "y": 309,
+    "w": 122,
+    "h": 124
   },
   "ic_b": {
-    "x": 420,
-    "y": 306,
-    "w": 126,
-    "h": 131
+    "x": 421,
+    "y": 309,
+    "w": 125,
+    "h": 126
   },
   "exposure_us": 8000,
   "match_threshold": 0.6,
-  "strip_top_y_offset": -32,
-  "strip_bot_y_offset": 128,
-  "strip_h": 32
+  "strip_top_y_offset": -31,
+  "strip_bot_y_offset": 155,
+  "strip_h": 62
 }

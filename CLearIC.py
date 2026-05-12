@@ -516,7 +516,7 @@ class Detector:
 # CELL GRID CONSTANTS
 # =========================================================
 _CELL_SHRINK    = 0.90   # IC rect shrunk before slicing (keeps grid off raw edges)
-_CELL_EXPAND    = 1.20   # each cell expanded after slicing (overlapping neighbours)
+_CELL_EXPAND    = 1.05   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
 # Dataset collection (used only when COLLECT_DATASET = True)
@@ -1498,6 +1498,51 @@ class RunWorker(QtCore.QThread):
         self.sig_status.emit("Standby.")
 
 # =========================================================
+# SETUP HELPERS
+# =========================================================
+def _find_second_ic(image_bgr: np.ndarray,
+                    ref_rect: QtCore.QRect,
+                    conf_thr: float = 0.4) -> tuple:
+    """
+    Search the opposite image half for a second IC using the ref_rect crop as a
+    template.  Preprocessing matches extract_patches (bilateral → Otsu binary).
+
+    Returns (QRect, score).  QRect is None if score < conf_thr.
+    """
+    x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
+    img_h, img_w = image_bgr.shape[:2]
+
+    gray   = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    smooth = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, binary = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Crop template from ref IC position (clamped to image bounds)
+    ty1, ty2 = max(0, y), min(img_h, y + h)
+    tx1, tx2 = max(0, x), min(img_w, x + w)
+    template = binary[ty1:ty2, tx1:tx2]
+    if template.size == 0:
+        return None, 0.0
+
+    # Search in opposite half
+    mid = img_w // 2
+    if (x + w // 2) < mid:   # ref is on left → search right half
+        search   = binary[:, mid:]
+        x_offset = mid
+    else:                     # ref is on right → search left half
+        search   = binary[:, :mid]
+        x_offset = 0
+
+    if search.shape[1] < template.shape[1] or search.shape[0] < template.shape[0]:
+        return None, 0.0
+
+    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv2.minMaxLoc(result)
+
+    if score >= conf_thr:
+        return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
+    return None, float(score)
+
+# =========================================================
 # MAIN WINDOW
 # =========================================================
 def _output_paths(img_id: str) -> tuple:
@@ -1624,11 +1669,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_setup_status.setWordWrap(True)
         setup_lay.addWidget(self._lbl_setup_status)
 
-        self._btn_draw_a = QtWidgets.QPushButton("Draw IC_A")
+        self._btn_draw_a = QtWidgets.QPushButton("Draw IC")
         self._btn_draw_a.clicked.connect(self._start_draw_a)
         setup_lay.addWidget(self._btn_draw_a)
 
-        self._btn_draw_b = QtWidgets.QPushButton("Draw IC_B")
+        self._btn_draw_b = QtWidgets.QPushButton("Draw Preview")
         self._btn_draw_b.clicked.connect(self._start_draw_b)
         self._btn_draw_b.setEnabled(False)
         setup_lay.addWidget(self._btn_draw_b)
@@ -1917,11 +1962,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_rb_rect_drawn(self, rect: QtCore.QRect):
         if self._setup_state == 'draw_a':
-            self._pending_ic_a = rect
             self._view.set_rubberband_mode(False)
-            self._view.add_overlay(rect, QtGui.QColor(_tmpl_color_a), "IC_A")
-            self._setup_state = 'draw_b'
+            self._view.clear_overlays()
+
+            img     = self._setup_image
+            img_w   = img.shape[1] if img is not None else 0
+            cx      = rect.x() + rect.width() // 2
+            on_left = (img_w == 0) or (cx < img_w // 2)
+
+            if on_left:
+                # Drawn rect is IC_A (left); search right half for IC_B
+                ic_a = rect
+                ic_b, score = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+            else:
+                # Drawn rect is on the right — railguard: find IC_A on left, drawn = IC_B
+                ic_b = rect
+                ic_a, score = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+
+            self._pending_ic_a = ic_a
+            self._pending_ic_b = ic_b
+
+            if ic_a:
+                self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
+            if ic_b:
+                self._view.add_overlay(ic_b, QtGui.QColor(_tmpl_color_b), "IC_B")
+
+            if ic_a and ic_b:
+                self._setup_state = 'ready'
+            else:
+                # Auto-search failed — fall back to manual second draw
+                self._setup_state = 'draw_b'
             self._update_setup_buttons()
+
         elif self._setup_state == 'draw_b':
             self._pending_ic_b = rect
             self._view.set_rubberband_mode(False)
@@ -1949,9 +2021,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_confirm_tmpl.setEnabled(s == 'ready')
         status = {
             'idle':   '—',
-            'draw_a': 'Draw IC_A area on image.',
-            'draw_b': 'IC_A set. Draw IC_B area.',
-            'ready':  'Both set. Click Confirm to save.',
+            'draw_a': 'Draw either IC area.',
+            'draw_b': 'Auto-search failed — draw IC_B manually.',
+            'ready':  'Both ICs set. Click Confirm to save.',
         }.get(s, '—')
         self._lbl_setup_status.setText(status)
 

@@ -440,7 +440,7 @@ class RaspberryIO:
 # DETECTOR  (OpenVINO Classifier — 2-class)
 # =========================================================
 _CLS_INPUT_SIZE = 224   # YOLO-cls default input size
-SHRINK_SCALE   = 0.90    # fraction to shrink detected IC boxes before slicing cells
+SHRINK_SCALE   = 1    # fraction to shrink detected IC boxes before slicing cells
 
 class Detector:
     """
@@ -1664,32 +1664,24 @@ class MainWindow(QtWidgets.QMainWindow):
             str(self._cfg.get("EXPOSURE_US", 8000)))
         setup_lay.addWidget(self._input_exposure)
 
-        self._lbl_setup_status = QtWidgets.QLabel("—")
-        self._lbl_setup_status.setStyleSheet("font-size:11px;color:#E2FDFF")
-        self._lbl_setup_status.setWordWrap(True)
-        setup_lay.addWidget(self._lbl_setup_status)
+        self._lbl_tmpl_status = QtWidgets.QLabel("No template saved.")
+        self._lbl_tmpl_status.setStyleSheet(
+            "font-size:11px;color:#E2FDFF;padding:4px 0px;")
+        self._lbl_tmpl_status.setWordWrap(True)
+        self._lbl_tmpl_status.setMinimumHeight(36)
+        setup_lay.addWidget(self._lbl_tmpl_status)
 
-        self._btn_draw_a = QtWidgets.QPushButton("Draw IC")
-        self._btn_draw_a.clicked.connect(self._start_draw_a)
-        setup_lay.addWidget(self._btn_draw_a)
+        self._btn_new_tmpl = QtWidgets.QPushButton("New Template")
+        self._btn_new_tmpl.clicked.connect(self._start_draw_a)
+        setup_lay.addWidget(self._btn_new_tmpl)
 
-        self._btn_draw_b = QtWidgets.QPushButton("Draw Preview")
-        self._btn_draw_b.clicked.connect(self._start_draw_b)
-        self._btn_draw_b.setEnabled(False)
-        setup_lay.addWidget(self._btn_draw_b)
-
-        btn_row_tmpl = QtWidgets.QHBoxLayout()
         self._btn_confirm_tmpl = QtWidgets.QPushButton("Confirm")
         self._btn_confirm_tmpl.clicked.connect(self._confirm_template)
         self._btn_confirm_tmpl.setEnabled(False)
         self._btn_confirm_tmpl.setStyleSheet(
             "background:#FFFFFF;color:#5465FF;border-radius:6px;"
             "padding:6px 14px;font-weight:bold;")
-        self._btn_reset_tmpl = QtWidgets.QPushButton("Reset")
-        self._btn_reset_tmpl.clicked.connect(self._reset_template_draw)
-        btn_row_tmpl.addWidget(self._btn_confirm_tmpl)
-        btn_row_tmpl.addWidget(self._btn_reset_tmpl)
-        setup_lay.addLayout(btn_row_tmpl)
+        setup_lay.addWidget(self._btn_confirm_tmpl)
 
         self._view.rect_drawn.connect(self._on_rb_rect_drawn)
 
@@ -1955,51 +1947,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view.set_rubberband_mode(True)
         self._update_setup_buttons()
 
-    def _start_draw_b(self):
-        self._setup_state = 'draw_b'
-        self._view.set_rubberband_mode(True)
-        self._update_setup_buttons()
-
     def _on_rb_rect_drawn(self, rect: QtCore.QRect):
-        if self._setup_state == 'draw_a':
-            self._view.set_rubberband_mode(False)
-            self._view.clear_overlays()
+        if self._setup_state not in ('draw_a', 'draw_a_retry'):
+            return
+        self._view.set_rubberband_mode(False)
+        self._view.clear_overlays()
 
-            img     = self._setup_image
-            img_w   = img.shape[1] if img is not None else 0
-            cx      = rect.x() + rect.width() // 2
-            on_left = (img_w == 0) or (cx < img_w // 2)
+        img     = self._setup_image
+        img_w   = img.shape[1] if img is not None else 0
+        cx      = rect.x() + rect.width() // 2
+        on_left = (img_w == 0) or (cx < img_w // 2)
 
-            if on_left:
-                # Drawn rect is IC_A (left); search right half for IC_B
-                ic_a = rect
-                ic_b, score = _find_second_ic(img, rect) if img is not None else (None, 0.0)
-            else:
-                # Drawn rect is on the right — railguard: find IC_A on left, drawn = IC_B
-                ic_b = rect
-                ic_a, score = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+        if on_left:
+            ic_a = rect
+            ic_b, _ = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+        else:
+            ic_b = rect
+            ic_a, _ = _find_second_ic(img, rect) if img is not None else (None, 0.0)
 
+        if ic_a:
+            self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
+        if ic_b:
+            self._view.add_overlay(ic_b, QtGui.QColor(_tmpl_color_b), "IC_B")
+
+        if ic_a and ic_b:
             self._pending_ic_a = ic_a
             self._pending_ic_b = ic_b
-
-            if ic_a:
-                self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
-            if ic_b:
-                self._view.add_overlay(ic_b, QtGui.QColor(_tmpl_color_b), "IC_B")
-
-            if ic_a and ic_b:
-                self._setup_state = 'ready'
-            else:
-                # Auto-search failed — fall back to manual second draw
-                self._setup_state = 'draw_b'
-            self._update_setup_buttons()
-
-        elif self._setup_state == 'draw_b':
-            self._pending_ic_b = rect
-            self._view.set_rubberband_mode(False)
-            self._view.add_overlay(rect, QtGui.QColor(_tmpl_color_b), "IC_B")
-            self._setup_state = 'ready'
-            self._update_setup_buttons()
+            self._setup_state  = 'ready'
+        else:
+            # Auto-search failed — re-enable rubber-band for immediate retry
+            self._pending_ic_a = None
+            self._pending_ic_b = None
+            self._view.set_rubberband_mode(True)
+            self._setup_state = 'draw_a_retry'
+        self._update_setup_buttons()
 
     def _confirm_template(self):
         if self._pending_ic_a and self._pending_ic_b:
@@ -2016,16 +1997,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_setup_buttons(self):
         s = self._setup_state
-        self._btn_draw_a.setEnabled(s in ('idle', 'ready'))
-        self._btn_draw_b.setEnabled(s in ('draw_b', 'ready'))
+        self._btn_new_tmpl.setEnabled(s in ('idle', 'ready'))
         self._btn_confirm_tmpl.setEnabled(s == 'ready')
-        status = {
-            'idle':   '—',
-            'draw_a': 'Draw either IC area.',
-            'draw_b': 'Auto-search failed — draw IC_B manually.',
-            'ready':  'Both ICs set. Click Confirm to save.',
-        }.get(s, '—')
-        self._lbl_setup_status.setText(status)
+        if s == 'idle':
+            text = ("Template saved."
+                    if os.path.exists(_TEMPLATE_FILE)
+                    else "No template saved.")
+        else:
+            text = {
+                'draw_a':       'Draw either IC area on image.',
+                'draw_a_retry': 'IC_B not found — draw again.',
+                'ready':        'IC_A + IC_B found. Confirm to save.',
+            }.get(s, '—')
+        self._lbl_tmpl_status.setText(text)
 
     def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         self._view.clear_overlays()

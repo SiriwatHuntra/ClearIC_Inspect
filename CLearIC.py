@@ -440,7 +440,7 @@ class RaspberryIO:
 # DETECTOR  (OpenVINO Classifier — 2-class)
 # =========================================================
 _CLS_INPUT_SIZE = 224   # YOLO-cls default input size
-SHRINK_SCALE   = 1.0    # fraction to shrink detected IC boxes before slicing cells
+SHRINK_SCALE   = 0.90    # fraction to shrink detected IC boxes before slicing cells
 
 class Detector:
     """
@@ -961,21 +961,16 @@ class TemplateMatcher:
         exp_top_y = self._ic_y + self._top_y_offset
         exp_bot_y = self._ic_y + self._bot_y_offset
 
-        tx, ty, score_top = self._match_in_roi(
-            filtered, self._top, self._ic_x, exp_top_y)
-        bx, by, score_bot = self._match_in_roi(
+        bx, by, score = self._match_in_roi(
             filtered, self._bot, self._ic_x, exp_bot_y)
 
-        score = (score_top + score_bot) / 2.0
         if score < self._threshold:
             raise TemplateError(
                 f"Match score {score:.3f} < {self._threshold:.3f} — "
                 "IC rotation or misalignment detected")
 
-        ic_y_from_top = ty - self._top_y_offset
-        ic_y_from_bot = by - self._bot_y_offset
-        ic_y = (ic_y_from_top + ic_y_from_bot) // 2
-        ic_x = (tx + bx) // 2
+        ic_y = by - self._bot_y_offset
+        ic_x = bx
         return QtCore.QRect(ic_x, ic_y, self._patch_w, self._ic_h), score
 
 # =========================================================
@@ -2219,7 +2214,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if top is not None and bot is not None:
             ic_a = tmpl["ic_a"]
             matcher = TemplateMatcher(
-                top, bot,
+                top, 
+                bot,
                 threshold=tmpl.get("match_threshold", 0.6),
                 strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
                 strip_bot_y_offset=tmpl.get("strip_bot_y_offset", 0),

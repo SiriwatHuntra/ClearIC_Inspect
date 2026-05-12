@@ -1,469 +1,133 @@
-# Clear Package IC Inspection
+# ClearIC Inspect
 
-## Problem
+**Goal:** Classify laser-engraved marks on clear-mold ICs → PASS / FAIL per IC.
 
-ICs with a clear (transparent) mold make laser-engraved marks very difficult to inspect visually.
+## Stack
+- Camera: Basler via Pylon SDK
+- Controller: Raspberry Pi 5, GPIO BCM
+- UI: PyQt5 single `QMainWindow`
+- Model: YOLO-cls via OpenVINO, 2-class (`0=NoText`, `1=Text`), 224×224 input
+- Model path: `Text_cls-2/best_openvino_model/best.xml`
 
-**Goal:** For each IC in the image — **IS THE MARK COMPLETE? (PASS / FAIL)**
-
----
-
-## Hardware
-
-| Item | Detail |
-|---|---|
-| Camera | Basler (via Pylon SDK) |
-| Lighting | Coaxial — no image pre-processing needed |
-| Controller | Raspberry Pi 5 |
-| IO | Raspberry Pi GPIO (BCM numbering) |
-
----
-
-## Runtime Flags (hardcoded in config)
-
-These are set at the top of `CLearIC.py` before running. Not changeable from the UI.
-
+## Config Flags (top of CLearIC.py, not UI-changeable)
 | Flag | Values | Effect |
 |---|---|---|
-| `DEBUG` | `True / False` | Enables debug mode with detailed logs |
-| `CAMERA` | `"camera" / "directory"` | Live Basler feed or load images from a folder (for dev/testing) |
-| `IO` | `True / False` | If `False`, log IO signals as messages instead of driving GPIO pins |
-| `MODEL_PATH` | path string | Path to the OpenVINO classifier `.xml` file |
-
-## Modes (hardcoded in config)
-
-| Mode | Description |
-|---|---|
-| `RUN` | Production mode — minimal logging, full IO, max speed |
-| `DEBUG` | Development mode — verbose logs, annotated output, IO flag respected |
-
----
-
-## Mark Specification
-
-- **Type:** Laser engraved
-- **Content:** Numbers and alphabets
-- **Layout per IC:** 3 rows × 2 columns = **6 ROI cells**
-  - Left column and right column have a horizontal offset between them
-  - Gap between columns is a configurable offset parameter
-- **ROI cell size:** Dynamic — derived from a scale/ratio parameter set in template setup
-
----
+| `DEBUG` | `True/False` | Verbose logs + annotated output |
+| `CAMERA` | `"camera"/"directory"` | Live Basler or load from `Input/` |
+| `IO` | `True/False` | Drive GPIO or mock (log `[IO MOCK] PIN→STATE`) |
+| `MODE` | `RUN/DEBUG` | Production or dev |
+| `MODEL_PATH` | path | OpenVINO `.xml` |
 
 ## Image Layout
-
-Each image contains **two ICs**. IC_A is the template anchor; IC_B position is derived from a fixed pixel offset relative to IC_A.
-
-```
-┌──────────────────────────────────────────────┐
-│   IC_A (anchor)        │   IC_B (fixed offset)│
-│                        │                      │
-│  Col_L    Col_R        │  Col_L    Col_R       │
-│  ┌───┐    ┌───┐        │  ┌───┐    ┌───┐      │
-│  │R1 │    │R1 │        │  │R1 │    │R1 │      │
-│  ├───┤    ├───┤        │  ├───┤    ├───┤      │
-│  │R2 │    │R2 │        │  │R2 │    │R2 │      │
-│  ├───┤    ├───┤        │  ├───┤    ├───┤      │
-│  │R3 │    │R3 │        │  │R3 │    │R3 │      │
-│  └───┘    └───┘        │  └───┘    └───┘      │
-└──────────────────────────────────────────────┘
-```
-
-- Total ROI cells per image: **12** (2 ICs × 2 columns × 3 rows)
-- IC_B anchor = IC_A anchor + `(offset_x, offset_y)` — set once in template
-
----
+Each image has 2 ICs. IC_A = anchor; IC_B = IC_A + `(offset_x, offset_y)`.  
+Each IC: 3 rows × 2 columns = 6 ROI cells. Total: 12 cells/image.  
+Left/right columns have a configurable horizontal offset.
 
 ## Inspection Logic
+Per ROI cell: crop → resize 224×224 → classify → `Text=TRUE` / `NoText=FALSE`.  
+Per IC: PASS if all 6 TRUE; FAIL if any FALSE → set pins + save images + log.
 
-- **Model:** YOLO-cls via OpenVINO — 2-class image classifier
-- **Model path:** `Text_cls-2/best_openvino_model/best.xml`
-- **Input size:** 224 × 224 (YOLO-cls default)
-- **Classes:** `0 = NoText`, `1 = Text`
-- **Method:** ROI crop → classify (no bounding-box detection, no NMS)
-- **Per ROI cell result:**
-  1. Crop the cell region from the full image
-  2. Resize crop to 224 × 224
-  3. Run classifier → predicted class + confidence
-  - Class `Text` → cell **TRUE** (mark present)
-  - Class `NoText` → cell **FALSE** (mark absent)
-- **Per IC result:**
-  - **PASS** — all 6 cells return TRUE
-  - **FAIL** — any cell returns FALSE → trigger output + save images + log
-
----
-
-## GPIO Pin Assignment (BCM)
-
-**Inputs — Machine → Pi**
-
-| Pin | BCM | Direction | Description |
+## GPIO (BCM)
+| Signal | Pin | Dir | Description |
 |---|---|---|---|
-| `START_PIN` | GPIO 17 | IN (pull-down) | Rising edge = Start inspection / Next image |
-| `DONE_PIN` | GPIO 27 | IN (pull-down) | Rising edge from machine = Stop gracefully, return to standby |
+| `START_PIN` | 17 | IN↓ | Rising edge → start inspection |
+| `DONE_PIN` | 27 | IN↓ | Rising edge → return to standby |
+| `ACK_PIN` | 22 | OUT | Pulse HIGH when result ready (machine reads on this edge) |
+| `FAIL_A_PIN` | 24 | OUT | HIGH = IC_A failed |
+| `FAIL_B_PIN` | 25 | OUT | HIGH = IC_B failed |
 
-**Outputs — Pi → Machine**
+IO flow: START → capture → inspect → set FAIL_A/B → pulse ACK → wait for DONE.  
+DONE clears all output pins → standby. If BUSY on START: drop signal.
 
-| Pin | BCM | Direction | Description |
-|---|---|---|---|
-| `ACK_PIN` | GPIO 22 | OUT | Pulse HIGH when result is ready — machine reads result pins on this edge |
-| `FAIL_A_PIN` | GPIO 24 | OUT | HIGH = IC_A failed (held until next ACK pulse) |
-| `FAIL_B_PIN` | GPIO 25 | OUT | HIGH = IC_B failed (held until next ACK pulse) |
+## Performance
+Full inspection (both ICs) < 1000 ms on Pi 5.
 
-> `DONE_PIN` (IN) replaces the old STOP_PIN — machine controls when the system returns to standby.
-> Old output `DONE_PIN` is now `ACK_PIN` (OUT) — the Pi's "result ready" signal to the machine.
-> When `IO = False`: all GPIO state changes are mocked — logged as `[IO MOCK] PIN → STATE` instead of driving physical pins.
+## Setup Flow (one-time per product)
+1. Capture/load reference image
+2. Click to set IC_A anchor (top-left)
+3. Set scale/ratio → auto-compute 6 ROI positions
+4. Set column offset (Col_L ↔ Col_R horizontal shift)
+5. Set IC_B offset (x, y from IC_A anchor)
+6. Preview 12 ROI boxes → adjust → save template
 
----
+## Inspection Loop
+START_PIN (or Manual Trigger) → BUSY check → capture image →  
+Phase 1: TemplateMatcher bilateral-strip → IC_A rect → IC_B by offset (fallback: fixed template coords) →  
+Phase 2: classify 12 cells → PASS/FAIL per IC →  
+set FAIL_A_PIN, FAIL_B_PIN → pulse ACK_PIN →  
+on any FAIL: save `IMAGE_ID_R.jpg` (raw) + `IMAGE_ID.jpg` (annotated, red=fail) + log →  
+update UI → DONE_PIN (DEBUG directory mode: auto-fire → next image).
 
-## IO Signal Flow
-
-```
-STANDBY STATE
-  → Waiting for START_PIN
-
-Machine sends START_PIN (rising edge)
-  → If BUSY = True: drop signal, log "[IO] START ignored — busy"
-  → Set BUSY = True
-  → Capture image
-  → Run inspection on IC_A and IC_B
-  → Set RESULT_PIN  (PASS=HIGH / FAIL=LOW)
-  → Set FAIL_A_PIN  (HIGH if IC_A failed, else LOW)
-  → Set FAIL_B_PIN  (HIGH if IC_B failed, else LOW)
-  → Pulse ACK_PIN HIGH  ← machine reads all output pins on this edge
-       [IO=False: log "[IO MOCK] RESULT=X  FAIL_A=X  FAIL_B=X  ACK→HIGH"]
-  → Hold output pins
-  → Set BUSY = False
-  → Wait for next START_PIN  ──or──  DONE_PIN
-
-Machine sends DONE_PIN (rising edge)
-  → If BUSY = True: wait for current cycle to finish first
-  → Clear RESULT_PIN, FAIL_A_PIN, FAIL_B_PIN (all LOW)
-  → Log "Returning to standby"
-  → Return to STANDBY STATE
-```
-
-> **Multi-IC simultaneous fail:** `FAIL_A_PIN` and `FAIL_B_PIN` are both set before `ACK_PIN` pulses — machine reads both on the same rising edge. `IO=False` logs both in one message.
-
----
-
-## Performance Requirement
-
-| Metric | Target |
-|---|---|
-| Full inspection per image (both ICs) | **< 1000 ms** on Raspberry Pi 5 |
-
----
-
-## Inspection Flow
-
-### Setup Mode (one-time per product type)
-1. Capture reference image (via camera or load from file)
-2. Click to set **IC_A anchor** (top-left corner of IC_A)
-3. Set **scale/ratio** → auto-compute 6 ROI cell positions for IC_A
-4. Set **column offset** (horizontal shift between Col_L and Col_R)
-5. Set **IC_B offset** (x, y pixel offset from IC_A anchor)
-6. Preview all 12 ROI boxes overlaid on image — adjust if needed
-7. Save template
-
-### RUN / DEBUG Inspection Loop
-```
-Receive START_PIN (or Manual Trigger button in DEBUG)
-  → If BUSY: drop signal
-  → Set BUSY = True
-  → Capture image  [CAMERA="directory": load next file from Input/ folder]
-  → Phase 1 — Locate ICs:
-      TemplateMatcher (bilateral strip match) → IC_A rect → IC_B by offset
-      Fallback: use fixed template coordinates if no patches saved
-  → Phase 2 — Per ROI cell (12 total):
-      Crop cell region from image
-      Classify crop via YOLO-cls (224×224 input)
-      Text → TRUE  /  NoText → FALSE
-  → IC_A: PASS if all 6 TRUE, else FAIL
-  → IC_B: PASS if all 6 TRUE, else FAIL
-  → Set FAIL_A_PIN, FAIL_B_PIN → Pulse ACK_PIN
-       [IO=False: log "[IO MOCK] FAIL_A=X FAIL_B=X ACK→HIGH"]
-  → If any FAIL:
-      - Save IMAGE_ID_R.jpg  (original image)
-      - Save IMAGE_ID.jpg    (annotated: ROI boxes, failed cells in red)
-      - Log entry (see Logging section)
-  → Update UI (badges, stats)
-  → Set BUSY = False
-  → Receive DONE_PIN (or auto-emitted in DEBUG directory mode)
-      [DEBUG + CAMERA="directory": DONE auto-fires → loads next image → loops]
-  → Else: wait for next START_PIN
-```
-
----
+`IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN`
 
 ## File Output (FAIL only)
-
-| File | Content |
-|---|---|
-| `IMAGE_ID_R.jpg` | Raw original image, no annotation |
-| `IMAGE_ID.jpg` | Annotated: all 12 ROI cell boxes drawn (green = Text, red = NoText) |
-
-`IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN` (timestamp + sequential counter)
-
----
+- `IMAGE_ID_R.jpg` — raw
+- `IMAGE_ID.jpg` — annotated (green=Text, red=NoText)
 
 ## Logging
+JSON-lines, one record/inspection. Fields: `timestamp, image_id, ic_a_result, ic_a_missing, ic_b_result, ic_b_missing, cycle_time_ms, mode, io_mock`.  
+DEBUG adds per-cell class + confidence.  
+Rotation: daily → `logs/inspect_YYYYMMDD.log`, 365-file retention.
 
-Every inspection appends one record to the log file.
-
-**Log fields:**
-| Field | Detail |
-|---|---|
-| `timestamp` | ISO 8601 |
-| `image_id` | Links to saved files |
-| `ic_a_result` | PASS / FAIL |
-| `ic_a_missing` | List of `[row, col]` cells where mark was absent (empty if PASS) |
-| `ic_b_result` | PASS / FAIL |
-| `ic_b_missing` | List of `[row, col]` cells where mark was absent |
-| `cycle_time_ms` | Full inspection duration |
-| `mode` | RUN / DEBUG |
-| `io_mock` | `True` if IO=False (signals were mocked, not sent) |
-
-In **DEBUG mode**: also log per-cell classifier result (`Text` / `NoText`) and confidence score.
-
-When `IO = False`: each signal change appended as a separate log line:
+## Exceptions
 ```
-[IO MOCK] RESULT_PIN → HIGH
-[IO MOCK] FAIL_A_PIN → LOW
-[IO MOCK] FAIL_B_PIN → HIGH
-[IO MOCK] ACK_PIN → HIGH (pulse)
+InspectionError
+├── MarkMissingError   .ic_position, .missing_cells  → FAIL path
+├── CameraError                                       → ERROR, stop loop
+├── ModelError                                        → ERROR, stop loop
+├── TemplateError                                     → block RUN, force Setup
+├── GPIOError          startup=fatal; runtime=flag unreliable, continue
+└── ConfigError                                       → abort startup
 ```
-
-### Log Rotation
-
-| Setting | Value |
-|---|---|
-| Rotation | Daily (new file each day at midnight) |
-| Retention | 1 year (365 log files max, oldest deleted automatically) |
-| Filename | `inspect_YYYYMMDD.log` |
-| Location | `logs/` |
-
----
-
-## Frontend (Single Page Application — PyQt)
-
-### Framework
-- **PyQt5** (or PyQt6)
-- Single `QMainWindow`, no navigation between pages
-- All panels in one layout — no separate windows except modal popups
-
-### Design System
-
-**Color Palette**
-| Role | Hex | Used for |
-|---|---|---|
-| Deepest | `#5465FF` | Window bg, button fill |
-| Dark | `#788BFF` | Panel / frame bg |
-| Base | `#9BB1FF` | Card surface bg (Setup, Controls, Stats, Badges) |
-| Light | `#BFD7FF` | PASS badge color, accent |
-| Lightest | `#E2FDFF` | Image display area bg |
-| White | `#FFFFFF` | Input field bg, text on dark |
-| FAIL / Error | `#EF5350` | FAIL badge, error banner |
-
-**Component Style**
-- All containers: `QFrame` with `border-radius: 8px`
-- Buttons: `#5465FF` fill, white text, rounded — **no hover effect**
-- Input fields: `QLineEdit`, white bg (`#FFFFFF`), `#5465FF` text + border, rounded
-- Label topics above inputs: bold white
-- No decorative icons, no gradients — flat and clean
-- Consistent 8px padding inside all panels
-
-### Layout
-
-```
-┌────────────────────────────────────┬─────────────────────┐
-│  MAIN VIEW  (#788BFF bg)           │  RIGHT PANEL        │
-│                                    │  (#5465FF bg)       │
-│  Live camera / last image          │                     │
-│  (#E2FDFF area)                    │  [Setup] #788BFF    │
-│                                    │  Exposure (µs)      │
-│  [ERROR BANNER — red, rounded]     │  Scale / ratio      │
-│                                    │  Column offset (px) │
-│  ┌─────────────┐  ┌─────────────┐  │  IC_B offset X (px) │
-│  │ IC_A  PASS  │  │ IC_B  FAIL  │  │  IC_B offset Y (px) │
-│  └─────────────┘  └─────────────┘  │  Set Anchor btn     │
-│  (#9BB1FF area, badge border:      │  Preview ROIs btn   │
-│   #BFD7FF=PASS / #EF5350=FAIL)     │  Save Template btn  │
-│                                    │                     │
-│  [Stats] #9BB1FF                   │  [Controls] #788BFF │
-│  Status / Pass / Fail /            │  Manual Trigger btn │
-│  Error / Last cycle (ms)           │                     │
-└────────────────────────────────────┴─────────────────────┘
-```
-
-> In **DEBUG mode** (`CAMERA="directory"`): after each inspection the DONE signal
-> automatically feeds the next image from `Input/` and re-runs the cycle.
-
-### Modal Popup on FAIL
-- Rounded `QDialog`, `#5465FF` background
-- Title: "Inspection Failed"
-- List which IC (A / B) failed
-- List missing cells as `[row, col]` per IC
-- Single "Acknowledge" button (white, rounded)
-
----
-
-## Exception Design — Throw-back on False
-
-Detection failures are raised as exceptions, not returned as values. This makes the FAIL path explicit and prevents silent misses.
-
-### Custom Exception Hierarchy
-
-```python
-InspectionError              # base for all inspection exceptions
-├── MarkMissingError         # raised when any ROI cell returns FALSE
-│     .ic_position           # "A" or "B"
-│     .missing_cells         # list of [row, col] that failed
-├── SystemError              # base for hardware/config failures
-│   ├── CameraError          # capture failed (timeout, disconnect)
-│   ├── ModelError           # OpenVINO load or inference failed
-│   ├── TemplateError        # template file missing or corrupt
-│   └── GPIOError            # pin init or write failed (IO=True only)
-└── ConfigError              # invalid flag values on startup
-```
-
-### How throw-back works
-
-```
-detector.py     →  raises MarkMissingError  if any cell is False
-roi.py          →  raises TemplateError     if template cannot be loaded
-camera.py       →  raises CameraError       after N retries
-main.py         →  catches all and routes:
-                     MarkMissingError  → FAIL path (signal + save + log)
-                     CameraError       → ERROR path (stop loop, alert UI)
-                     ModelError        → ERROR path (stop loop, alert UI)
-                     TemplateError     → ERROR path (block inspection start)
-                     GPIOError         → ERROR path (stop loop, alert UI)
-                     ConfigError       → abort startup
-```
-
----
-
-## Error Handling
-
-### Startup Errors (fatal — abort before entering loop)
-
-| Error | Cause | Action |
-|---|---|---|
-| `ConfigError` | Invalid flag value in config.py | Print error, exit |
-| `TemplateError` | No template saved for current product | Block RUN mode, force Setup first |
-| `ModelError` | OpenVINO model file missing or incompatible | Print error, exit |
-| `CameraError` | Basler not found at startup (CAMERA="camera") | Print error, exit |
-| `GPIOError` | GPIO init failed (IO=True) | Print error, exit |
-
-### Runtime Errors (per-cycle — recoverable where possible)
-
-| Error | Cause | Action |
-|---|---|---|
-| `CameraError` | Capture timeout or disconnect mid-run | Retry 2× with 200ms delay → if still fails: set RESULT_PIN LOW, pulse DONE_PIN, log `CAMERA_ERROR`, alert UI, pause loop |
-| `MarkMissingError` | Any cell returns FALSE (expected result) | FAIL path: set output pins, save images, log missing cells, update UI |
-| `ModelError` | Inference crashed mid-run | Log `MODEL_ERROR`, set RESULT_PIN LOW, pulse DONE_PIN, alert UI, stop loop |
-| `GPIOError` | Pin write failed mid-run | Log `GPIO_ERROR`, continue inspection but flag IO as unreliable |
-| Log write failure | Disk full or permission error | Print to stderr, do not crash inspection loop |
-| Cycle time > 1000ms | Inference slower than target | Log warning with actual time; do not stop — machine still gets DONE signal |
-
-### Error State in UI
-
-- Display a red **ERROR banner** with short description in the main view
-- Sidebar shows last error message + timestamp
-- Stats counter tracks error count separately from FAIL count
-
-### Error Logging Fields (appended to main log)
-
-```
-timestamp, event=ERROR, error_type, error_message, cycle_time_ms
-```
-
----
 
 ## Startup Sequence
+1. Validate config → `ConfigError`
+2. Load template → `TemplateError`
+3. Load OpenVINO model → `ModelError`
+4. Init GPIO (if IO=True) → `GPIOError`
+5. Open camera/directory → `CameraError`
+6. Warm-up inference (1 dummy pass)
+7. Log "System ready"
+8. Pulse ACK_PIN HIGH (ready signal)
+9. Enter loop
 
-```
-1. Load and validate config.py → raise ConfigError if invalid
-2. Verify template file exists  → raise TemplateError if missing
-3. Load OpenVINO model          → raise ModelError if load fails
-4. Init GPIO pins (if IO=True)  → raise GPIOError if init fails
-5. Open camera / directory      → raise CameraError if not accessible
-6. Warm up inference (1 dummy pass to load model into cache)
-7. Log "System ready" + mode + flags
-8. Pulse ACK_PIN HIGH (system ready indicator to machine)
-9. Enter inspection loop
-```
+## Shutdown
+Finish current cycle → all output pins LOW → flush log → release camera + GPIO → log counts → exit.  
+On crash: log traceback → release GPIO → exit nonzero.
 
----
+## UI
+Single `QMainWindow`, no separate windows except modal dialogs.
 
-## Graceful Shutdown
+**Colors:** window bg `#5465FF` · panel bg `#788BFF` · card bg `#9BB1FF` · PASS `#BFD7FF` · image area `#E2FDFF` · FAIL/error `#EF5350` · white `#FFFFFF`
 
-Triggered by: `DONE_PIN` rising edge (from machine), `Ctrl+C`, or UI stop button.
+**Style:** `QFrame border-radius:8px`, buttons `#5465FF` fill white text no hover, inputs `QLineEdit` white bg `#5465FF` border, 8px padding, flat/no gradients.
 
-```
-1. Finish current inspection cycle (do not abort mid-inference)
-2. Set RESULT_PIN LOW, FAIL_A_PIN LOW, FAIL_B_PIN LOW, ACK_PIN LOW
-3. Flush log buffer to disk
-4. Release camera
-5. Release GPIO
-6. Log "System stopped cleanly" + total pass/fail/error counts
-7. Return to STANDBY STATE  (or exit if Ctrl+C / crash)
-```
+**Layout:** left = image view + IC_A/IC_B PASS/FAIL badges + stats; right panel = Setup inputs (exposure, scale, col offset, IC_B offset X/Y, Set Anchor, Preview ROIs, Save Template) + Controls (Manual Trigger).
 
-On unhandled crash (unexpected exception):
-```
-1. Log full traceback
-2. Attempt GPIO release
-3. Exit with non-zero code
-```
-
----
+**FAIL popup:** `QDialog` `#5465FF` bg, lists failed IC + missing cells, single Acknowledge button.
 
 ## Single-File Rule
+All code in `CLearIC.py`. No modules.
 
-> **All code lives in `CLearIC.py`. Do not split into modules.**
-> Every class, enum, helper, and entry point belongs in this one file.
+## CLearIC.py Section Order
+```
+# Config Flags / Stage & Error Flags / Exceptions / Image / Camera
+# RaspberryIO / Detector / Cell Grid / TemplateManager / TemplateMatcher
+# Inspector / Logger / Stylesheet / FailDialog / ImageView
+# SetupDialog / RunWorker / MainWindow / Entry Point
+```
 
 ## File Structure
-
 ```
 ClearIC_Inspect/
-├── CLearIC.py                          # ← entire program: config, IO, camera, UI, inspection
-├── Text_cls-2/best_openvino_model/     # OpenVINO classifier model (best.xml + best.bin)
-├── Output/                             # Saved FAIL images (auto-created, date-organised)
-├── logs/                               # Log files (auto-created)
-├── templates/                          # Saved product templates + strip patches
-└── Input/                              # Source images for CAMERA="directory" mode
+├── CLearIC.py
+├── Text_cls-2/best_openvino_model/   # best.xml + best.bin
+├── Output/                           # FAIL images
+├── logs/
+├── templates/
+└── Input/                            # CAMERA="directory" source images
 ```
 
-### Sections inside CLearIC.py (in order)
-
-```
-# Config Flags            DEBUG, CAMERA, IO, MODE, MODEL_PATH, GPIO pin constants
-# Stage & Error Flags     Stage enum, ErrorFlag enum
-# Exceptions              InspectionError hierarchy
-# Image                   Image dataclass + _next_image_id()
-# Camera                  Camera class (Basler / directory)
-# RaspberryIO             GPIO handler class
-# Detector                OpenVINO YOLO-cls classifier (classify_crop)
-# Cell Grid               _build_cells() — 3×2 ROI cell layout helpers
-# TemplateManager         Load/save IC bounding-box template + strip patches
-# TemplateMatcher         Bilateral-strip template matching for IC localization
-# Inspector               12-cell ROI crop-then-classify logic
-# Logger                  Daily-rotating JSON-lines log
-# Stylesheet              STYLE string
-# FailDialog              Modal FAIL popup
-# ImageView               Zoomable image widget with overlays
-# SetupDialog             Auto-detect confirm popup
-# RunWorker               QThread inspection loop
-# MainWindow              PyQt5 single-page UI
-# Entry Point             main() + __main__ guard
-```
-
----
-
-## Still Open
-
-- [ ] Startup ACK_PIN pulse — confirm machine expects this as "ready" indicator on boot
-- [ ] Auto Detect (setup) — classifier cannot detect IC positions; setup requires manual template creation via YOLO detection model or manual click-to-anchor flow
+## Open Items
+- Confirm machine expects ACK_PIN pulse on boot as "ready" signal
+- Auto-detect IC position for Setup (currently manual anchor click)

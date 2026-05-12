@@ -230,6 +230,8 @@ Output/
 logs/
 Ref_sample.py
 templates/
+.agents/
+skills-lock.json
 
 #image files
 *.jpg

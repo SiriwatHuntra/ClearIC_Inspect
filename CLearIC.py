@@ -146,12 +146,14 @@ class ConfigError(InspectionError):
 # =========================================================
 # IMAGE DATACLASS + ID GENERATOR
 # =========================================================
-_img_counter = 0
+_img_counter  = 0
+_counter_lock = threading.Lock()
 
 def _next_image_id() -> str:
     global _img_counter
-    _img_counter += 1
-    return datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{_img_counter:03d}"
+    with _counter_lock:
+        _img_counter += 1
+        return datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{_img_counter:03d}"
 
 @dataclass
 class Image:
@@ -332,6 +334,15 @@ class Camera:
     def reset(self):
         """Reset directory index to beginning."""
         self._idx = 0
+
+    def grab_first(self) -> np.ndarray:
+        """Grab the first frame: rewinds directory index before and after grab."""
+        if self._mode == "directory":
+            self.reset()
+        img = self.grab()
+        if self._mode == "directory":
+            self.reset()
+        return img
 
 # =========================================================
 # RASPBERRY IO
@@ -536,6 +547,7 @@ _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 _DATA_DIR   = "Dataset"
 _DATA_SPLIT = "train"    # "train" | "val" | "test"
 _data_run_counter = 0
+_dataset_lock     = threading.Lock()
 
 # =========================================================
 # VISUAL SETTINGS  (live-editable from the Settings panel)
@@ -623,6 +635,13 @@ _TEMPLATE_TOP     = "templates/tmpl_top.npy"
 _TEMPLATE_BOT     = "templates/tmpl_bot.npy"
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
+def _bilateral_binary(image_bgr: np.ndarray) -> np.ndarray:
+    """BGR → Otsu binary via bilateral-filtered grayscale (params tuned for Basler optics)."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    smooth = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, binary = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
 class TemplateManager:
 
     @staticmethod
@@ -684,16 +703,8 @@ class TemplateManager:
         y2c   = max(0, min(y2, img_h - h1))
         x_end = min(x + w, img_w)
 
-        def _to_contour(crop_bgr: np.ndarray) -> np.ndarray:
-            """grayscale → bilateral smooth → Otsu threshold → binary contour."""
-            gray   = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            smooth = cv2.bilateralFilter(gray, 9, 75, 75)
-            _, binary = cv2.threshold(
-                smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            return binary   # 2D uint8, values 0 or 255
-
-        top_bin = _to_contour(image_bgr[y1c:y1c + h1, x:x_end])
-        bot_bin = _to_contour(image_bgr[y2c:y2c + h1, x:x_end])
+        top_bin = _bilateral_binary(image_bgr[y1c:y1c + h1, x:x_end])
+        bot_bin = _bilateral_binary(image_bgr[y2c:y2c + h1, x:x_end])
 
         top_y_offset = y1c - y   # strip_y - IC_y (used to reconstruct IC pos from match)
         bot_y_offset = y2c - y
@@ -845,10 +856,7 @@ class TemplateMatcher:
         identical ICs elsewhere in the frame are not matched by mistake.
         """
         # Apply same preprocessing as extract_patches: grayscale → bilateral → Otsu
-        gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        smooth   = cv2.bilateralFilter(gray, 9, 75, 75)
-        _, filtered = cv2.threshold(
-            smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        filtered = _bilateral_binary(image_bgr)
 
         # Expected absolute strip position for bottom strip (from template creation)
         exp_bot_y = self._ic_y + self._bot_y_offset
@@ -879,6 +887,8 @@ class Inspector:
         self._detector         = detector
         self._template         = template
         self._template_matcher = template_matcher
+        self._ic_b_dx = template["ic_b"]["x"] - template["ic_a"]["x"]
+        self._ic_b_dy = template["ic_b"]["y"] - template["ic_a"]["y"]
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -896,10 +906,8 @@ class Inspector:
         # Phase 1: locate ICs
         if self._template_matcher is not None:
             rt_a, score = self._template_matcher.locate_ic(image_bgr)
-            dx = self._template["ic_b"]["x"] - self._template["ic_a"]["x"]
-            dy = self._template["ic_b"]["y"] - self._template["ic_a"]["y"]
             rt_b = QtCore.QRect(
-                rt_a.x() + dx, rt_a.y() + dy,
+                rt_a.x() + self._ic_b_dx, rt_a.y() + self._ic_b_dy,
                 self._template["ic_b"]["w"], self._template["ic_b"]["h"],
             )
             ic_a_cells = self._rect_to_cells(rt_a)
@@ -923,9 +931,11 @@ class Inspector:
 
         if COLLECT_DATASET:
             global _data_run_counter
-            _data_run_counter += 1
-            _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", _data_run_counter)
-            _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", _data_run_counter)
+            with _dataset_lock:
+                _data_run_counter += 1
+                run_num = _data_run_counter
+            _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", run_num)
+            _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", run_num)
 
         if missing_a or missing_b:
             raise MarkMissingError(missing_a, missing_b, annotated)
@@ -944,6 +954,8 @@ class Inspector:
         Returns (missing, hits_flags).
         """
         ih, iw = image_bgr.shape[:2]
+        color_ok   = _hex_to_bgr(_ann_color_ok)
+        color_ng   = _hex_to_bgr(_ann_color_ng)
         missing    = []
         hits_flags = []
         for idx, (cx, cy, cw, ch) in enumerate(cells):
@@ -960,7 +972,7 @@ class Inspector:
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
                       f"cls={lbl} conf={conf:.3f}")
-            color = _hex_to_bgr(_ann_color_ok) if present else _hex_to_bgr(_ann_color_ng)
+            color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
                           (min(iw, cx + cw), min(ih, cy + ch)),
@@ -1174,6 +1186,9 @@ QCheckBox::indicator:disabled {
 # =========================================================
 # FAIL DIALOG
 # =========================================================
+def _fmt_missing(cells: list) -> str:
+    return ", ".join(f"[R{r}C{c}]" for r, c in cells)
+
 class FailDialog(QtWidgets.QDialog):
 
     def __init__(self, missing_a: list, missing_b: list, parent=None):
@@ -1196,15 +1211,13 @@ class FailDialog(QtWidgets.QDialog):
         lay.addWidget(title)
 
         if missing_a:
-            cells = ", ".join(f"[R{r}C{c}]" for r, c in missing_a)
-            lbl = QtWidgets.QLabel(f"IC_A — missing: {cells}")
+            lbl = QtWidgets.QLabel(f"IC_A — missing: {_fmt_missing(missing_a)}")
             lbl.setStyleSheet("color:#EF5350;font-weight:bold")
             lbl.setWordWrap(True)
             lay.addWidget(lbl)
 
         if missing_b:
-            cells = ", ".join(f"[R{r}C{c}]" for r, c in missing_b)
-            lbl = QtWidgets.QLabel(f"IC_B — missing: {cells}")
+            lbl = QtWidgets.QLabel(f"IC_B — missing: {_fmt_missing(missing_b)}")
             lbl.setStyleSheet("color:#EF5350;font-weight:bold")
             lbl.setWordWrap(True)
             lay.addWidget(lbl)
@@ -1409,7 +1422,7 @@ class RunWorker(QtCore.QThread):
         self._stop    = False
         self._running = threading.Event()
         self._running.set()
-        self._busy    = False
+        self._drain_needed = threading.Event()
 
     def stop(self):
         self._stop = True
@@ -1419,12 +1432,11 @@ class RunWorker(QtCore.QThread):
         self._running.clear()
 
     def resume(self):
-        self._busy = True     # BUSY guard: drain stale START_PIN after resume
+        self._drain_needed.set()   # BUSY guard: drain stale START_PIN after resume
         self._running.set()
 
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
-        mode     = MODE
         io_mock  = not IO
         debug    = DEBUG
 
@@ -1472,7 +1484,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
                     img_id, "PASS", [], "PASS", [],
-                    cycle_ms, mode, io_mock)
+                    cycle_ms, MODE, io_mock)
 
                 _, ann_path = _output_paths(img_id)
                 cv2.imwrite(ann_path, annotated)
@@ -1494,7 +1506,7 @@ class RunWorker(QtCore.QThread):
                     img_id,
                     "FAIL" if e.missing_a else "PASS", e.missing_a,
                     "FAIL" if e.missing_b else "PASS", e.missing_b,
-                    cycle_ms, mode, io_mock)
+                    cycle_ms, MODE, io_mock)
 
                 real_path, ann_path = _output_paths(img_id)
                 cv2.imwrite(real_path, img_bgr)
@@ -1517,7 +1529,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
                     img_id, "FAIL", all_cells, "FAIL", all_cells,
-                    cycle_ms, mode, io_mock)
+                    cycle_ms, MODE, io_mock)
                 real_path, _ = _output_paths(img_id)
                 cv2.imwrite(real_path, img_bgr)
 
@@ -1555,9 +1567,9 @@ class RunWorker(QtCore.QThread):
                 self._running.wait()          # blocks until resume() or stop()
                 if self._stop:
                     break
-                if self._busy:
+                if self._drain_needed.is_set():
                     self._gpio.drain_start_pin()
-                    self._busy = False
+                    self._drain_needed.clear()
                 self.sig_resumed.emit()
 
         self._gpio.clear_outputs()
@@ -1580,9 +1592,7 @@ def _find_second_ic(image_bgr: np.ndarray,
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
 
-    gray   = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    smooth = cv2.bilateralFilter(gray, 9, 75, 75)
-    _, binary = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary = _bilateral_binary(image_bgr)
 
     # Crop template from ref IC position (clamped to image bounds)
     ty1, ty2 = max(0, y), min(img_h, y + h)
@@ -1978,11 +1988,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Load and display first image on startup (no overlays yet)
         if self._camera:
             try:
-                img = self._camera.grab()
+                img = self._camera.grab_first()
                 self._view.set_image(img)
                 self._setup_image = img
-                if cfg.get("CAMERA") == "directory":
-                    self._camera.reset()   # rewind so run starts from image 1
             except CameraError:
                 pass
 
@@ -1995,12 +2003,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Camera not ready.")
             return None
         try:
-            if self._cfg.get("CAMERA") == "directory":
-                self._camera.reset()
-            img = self._camera.grab()
-            if self._cfg.get("CAMERA") == "directory":
-                self._camera.reset()
-            return img
+            return self._camera.grab_first()
         except CameraError as e:
             self._show_error(str(e))
             return None
@@ -2246,14 +2249,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._camera:
             return
         try:
-            if self._cfg.get("CAMERA") == "directory":
-                self._camera.reset()          # ensure index at 0
-            img = self._camera.grab()
+            img = self._camera.grab_first()
             self._view.set_image(img)
             self._view.clear_overlays()
             self._setup_image = img
-            if self._cfg.get("CAMERA") == "directory":
-                self._camera.reset()          # rewind again so next run starts at 0
         except CameraError:
             pass
 

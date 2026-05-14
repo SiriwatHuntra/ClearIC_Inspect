@@ -539,9 +539,9 @@ class Detector:
 # =========================================================
 # CELL GRID CONSTANTS
 # =========================================================
-_CELL_SHRINK    = 0.90   # IC rect shrunk before slicing (keeps grid off raw edges)
-_CELL_EXPAND    = 1.05   # each cell expanded after slicing (overlapping neighbours)
-_COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
+_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
+_CELL_EXPAND    = 1.00   # each cell expanded after slicing (overlapping neighbours)
+_COL_GAP_PCT    = 20.0   # column gap as % of (shrunk) IC width
 
 # Dataset collection (used only when COLLECT_DATASET = True)
 _DATA_DIR   = "Dataset"
@@ -979,12 +979,20 @@ class Inspector:
                           color, _ann_border_px)
             if _ann_show_labels:
                 label = f"R{row}C{col}"
-                (tw, th), _ = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                tx = max(0, cx) + (cw - tw) // 2
-                ty = max(0, cy) + (ch + th) // 2
-                cv2.putText(annotated, label, (tx, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                pad = _ann_border_px + 2
+                uw, uh = cw - 2 * pad, ch - 2 * pad
+                chosen_scale, tw, th = None, 0, 0
+                for scale in (0.35, 0.30, 0.25, 0.20, 0.15):
+                    (tw, th), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+                    if tw <= uw and th <= uh:
+                        chosen_scale = scale
+                        break
+                if chosen_scale is not None:
+                    tx = max(0, cx) + pad + (uw - tw) // 2
+                    ty = max(0, cy) + pad + (uh + th) // 2
+                    cv2.putText(annotated, label, (tx, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, chosen_scale, color, 1)
             if not present:
                 missing.append([row, col])
         return missing, hits_flags

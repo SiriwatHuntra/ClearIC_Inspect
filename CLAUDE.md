@@ -23,6 +23,15 @@ Each image has 2 ICs. IC_A = anchor; IC_B = IC_A + `(offset_x, offset_y)`.
 Each IC: 3 rows × 2 columns = 6 ROI cells. Total: 12 cells/image.  
 Left/right columns have a configurable horizontal offset.
 
+## Cell Grid Constants (top of CLearIC.py, not UI-changeable)
+| Constant | Default | Effect |
+|---|---|---|
+| `_CELL_SHRINK` | `1.00` | Horizontal L/R shrink ratio (1.0 = no shrink) |
+| `_GRID_MARGIN_TOP` | `10.0` | Top margin before row 1 starts, % of IC height |
+| `_GRID_MARGIN_BOT` | `10.0` | Bottom margin after row 3 ends, % of IC height |
+| `_COL_GAP_PCT` | `40.0` | Gap between left and right column, % of IC width |
+| `_CELL_EXPAND` | `1.00` | Per-cell expansion after slicing (1.0 = none) |
+
 ## Inspection Logic
 Per ROI cell: crop → resize 224×224 → classify → `Text=TRUE` / `NoText=FALSE`.  
 Per IC: PASS if all 6 TRUE; FAIL if any FALSE → set pins + save images + log.

@@ -575,10 +575,10 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
     Build the 3-row × 2-col cell list for one IC bounding rect.
 
     Steps:
-      1. Shrink the IC rect to _CELL_SHRINK (centred), so the grid sits
-         slightly inside the mold boundary.
-      2. Slice the shrunk rect into a 3×2 grid with _COL_GAP_PCT applied.
-      3. Expand every cell to _CELL_EXPAND (centred), so adjacent cells
+      1. Apply horizontal shrink (_CELL_SHRINK, L/R) and independent
+         vertical margins (_GRID_MARGIN_TOP / _GRID_MARGIN_BOT, top/bot).
+      2. Slice the resulting rect into a 3×2 grid with _COL_GAP_PCT applied.
+      3. Expand every cell by _CELL_EXPAND (centred), so adjacent cells
          overlap — text marks near a boundary are covered by both cells.
     """
     # Step 1 — shrink (centred)

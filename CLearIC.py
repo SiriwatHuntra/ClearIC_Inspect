@@ -539,9 +539,12 @@ class Detector:
 # =========================================================
 # CELL GRID CONSTANTS
 # =========================================================
-_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
+# Setup from drawing, static contants for slicing 3×2 cell grid inside detected IC bounding rect. 
+_CELL_SHRINK      = 1.00   # IC rect shrunk horizontally (L/R margin, 1.0 = none)
+_GRID_MARGIN_TOP  = 0.0   # top margin as % of IC height before row slice
+_GRID_MARGIN_BOT  = 7.0   # bottom margin as % of IC height before row slice
 _CELL_EXPAND    = 1.00   # each cell expanded after slicing (overlapping neighbours)
-_COL_GAP_PCT    = 20.0   # column gap as % of (shrunk) IC width
+_COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 
 # Dataset collection (used only when COLLECT_DATASET = True)
 _DATA_DIR   = "Dataset"
@@ -581,11 +584,13 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
       3. Expand every cell to _CELL_EXPAND (centred), so adjacent cells
          overlap — text marks near a boundary are covered by both cells.
     """
-    # Step 1 — shrink (centred)
+    # Step 1 — horizontal shrink (L/R) + independent vertical margin (top/bot)
     sw = max(1, int(w * _CELL_SHRINK))
-    sh = max(1, int(h * _CELL_SHRINK))
     sx = x + (w - sw) // 2
-    sy = y + (h - sh) // 2
+    mt = int(h * _GRID_MARGIN_TOP / 100.0)
+    mb = int(h * _GRID_MARGIN_BOT / 100.0)
+    sy = y + mt
+    sh = max(1, h - mt - mb)
 
     # Step 2 — grid on shrunk rect
     col_gap = int(sw * _COL_GAP_PCT / 100.0)

@@ -35,6 +35,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import gc
 import cv2
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
@@ -575,13 +576,14 @@ def _valid_hex(s: str) -> bool:
     s = s.strip().lstrip("#")
     return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
 
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
 def _preprocess_cell(crop_bgr: np.ndarray) -> np.ndarray:
     """CLAHE contrast normalisation before classification."""
     if crop_bgr.size == 0:
         return crop_bgr
-    gray  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
 
 
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
@@ -917,7 +919,7 @@ class Inspector:
         Phase 2 — crop each ROI cell and classify as Text / NoText.
         """
         tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template)
-        annotated = image_bgr.copy()
+        annotated = image_bgr  # draw in-place; caller saves raw before calling inspect()
 
         # Phase 1: locate ICs
         if self._template_matcher is not None:
@@ -1457,6 +1459,7 @@ class RunWorker(QtCore.QThread):
         debug    = DEBUG
 
         self.sig_status.emit("Running…")
+        _cycle = 0
 
         while not self._stop:
 
@@ -1487,23 +1490,27 @@ class RunWorker(QtCore.QThread):
                 break
 
             img_id = _next_image_id()
+
+            # Save raw before any processing
+            real_path, ann_path = _output_paths(img_id)
+            cv2.imwrite(real_path, img_bgr)
+
             self.sig_status.emit("Inspecting…")
 
             # ── Inspect ─────────────────────────────────────────────
             try:
-                *_, annotated = \
-                    self._inspector.inspect(img_bgr, debug=debug)
+                self._inspector.inspect(img_bgr, debug=debug)
+                # img_bgr is now annotated in-place
 
                 cycle_ms = (time.perf_counter() - t0) * 1000
-                self.sig_image.emit(annotated)
+                self.sig_image.emit(img_bgr)
                 self.sig_result.emit(True, True)
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
                     img_id, "PASS", [], "PASS", [],
                     cycle_ms, MODE, io_mock)
 
-                _, ann_path = _output_paths(img_id)
-                cv2.imwrite(ann_path, annotated)
+                cv2.imwrite(ann_path, img_bgr)
 
                 # GPIO: both FAIL pins LOW → pulse ACK
                 self._gpio.set_fail_a(False)
@@ -1512,10 +1519,9 @@ class RunWorker(QtCore.QThread):
 
             except MarkMissingError as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
-                annotated = e.annotated if e.annotated is not None \
-                            else img_bgr.copy()
+                # img_bgr IS e.annotated (drawn in-place); raw already at real_path
 
-                self.sig_image.emit(annotated)
+                self.sig_image.emit(img_bgr)
                 self.sig_fail.emit(e)
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
@@ -1524,9 +1530,7 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if e.missing_b else "PASS", e.missing_b,
                     cycle_ms, MODE, io_mock)
 
-                real_path, ann_path = _output_paths(img_id)
-                cv2.imwrite(real_path, img_bgr)
-                cv2.imwrite(ann_path,  annotated)
+                cv2.imwrite(ann_path, img_bgr)
 
                 # GPIO: set FAIL pins then pulse ACK
                 self._gpio.set_fail_a(bool(e.missing_a))
@@ -1538,7 +1542,8 @@ class RunWorker(QtCore.QThread):
                 # then continue the loop (next frame may align correctly).
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 all_cells = [[r, c] for r in range(1, 4) for c in range(1, 3)]
-                err = MarkMissingError(all_cells, all_cells, img_bgr.copy())
+                err = MarkMissingError(all_cells, all_cells, None)
+                # raw already at real_path; no annotation drawn for alignment error
 
                 self.sig_image.emit(img_bgr)
                 self.sig_fail.emit(err)
@@ -1546,8 +1551,6 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_inspection(
                     img_id, "FAIL", all_cells, "FAIL", all_cells,
                     cycle_ms, MODE, io_mock)
-                real_path, _ = _output_paths(img_id)
-                cv2.imwrite(real_path, img_bgr)
 
                 self._gpio.set_fail_a(True)
                 self._gpio.set_fail_b(True)
@@ -1560,6 +1563,13 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
                 self.sig_error.emit(f"Unexpected error: {e}")
                 break
+
+            finally:
+                del img_bgr
+
+            _cycle += 1
+            if _cycle % 100 == 0:
+                gc.collect()
 
             # ── End-of-cycle handshake ───────────────────────────────
             if cam_mode == "camera":

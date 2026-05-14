@@ -1,18 +1,46 @@
-# ClearIC Inspect — Reference
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 Single-file: `CLearIC.py`. All code lives there; no modules.
 
 ---
 
-## Config Flags *(top of file, not UI-changeable)*
+## Run
+
+```bash
+source .venv/bin/activate
+python CLearIC.py
+```
+
+Requires a display (physical screen or `DISPLAY`). PyQt5 is system-package only — do not pip-install it.
+
+**Dependencies split:**
+- `apt` only: `python3-pyqt5`, `python3-rpi.gpio`, `python3-numpy`, `python3-opencv`
+- `.venv` pip: `openvino`, `pypylon` (pypylon also needs Basler Pylon SDK at system level)
+
+---
+
+## Config: Two Separate Systems
+
+### Hardcoded dev flags *(top of `CLearIC.py`)*
 
 | Flag | Values | Effect |
 |---|---|---|
-| `DEBUG` | `True/False` | Verbose logs + annotated output saved on every cycle |
-| `CAMERA` | `"camera"/"directory"` | Live Basler or load from `Input/` |
-| `IO` | `True/False` | Drive GPIO or mock (`[IO MOCK] PIN→STATE`) |
-| `MODE` | `RUN/DEBUG` | Production or dev |
-| `MODEL_PATH` | path | OpenVINO `.xml` |
+| `DEBUG` | `True/False` | Verbose logs + save annotated every cycle |
+| `IO` | `True/False` | Drive GPIO / mock (log only) |
+| `MODE` | `"RUN"/"DEBUG"` | Written into log records |
+| `MODEL_PATH` | path | OpenVINO `.xml` for cell classifier |
+| `COLLECT_DATASET` | `True/False` | Save cell crops to `Dataset/` for retraining |
+
+### `Config.json` *(runtime, no source edit needed)*
+
+| Key | Effect |
+|---|---|
+| `CAMERA` | `"camera"` = live Basler · `"directory"` = load from `Input/` |
+| `CONF_THR` | Classifier confidence threshold |
+| `CAMERA_SERIAL` | Basler serial filter (`""` = first found) |
+| `EXPOSURE_US` | Camera exposure µs |
 
 ---
 
@@ -29,16 +57,14 @@ Single-file: `CLearIC.py`. All code lives there; no modules.
 
 ```
 START_PIN (or Manual Trigger)
-  → BUSY check (drop if BUSY)
   → Camera.grab()                          → image_bgr (ndarray)
+  → save raw to Output/.../RealImg/        (before processing)
   → TemplateMatcher.locate_ic(image_bgr)   → (QRect rt_a, score)
   → rt_b = rt_a offset by template (ic_b_offset_x/y)
   → Inspector._rect_to_cells(rt_a/b)       → cells_a / cells_b  [(cx,cy,cw,ch)×6]
-  → Inspector._check_ic(image_bgr, cells)  → (missing[], hits[])
-  → ic_pass = all(hits)
-  → set FAIL_A_PIN / FAIL_B_PIN
-  → pulse ACK_PIN
-  → on FAIL: save OUTPUT images + log
+  → Inspector._check_ic(image_bgr, cells)  → annotates in-place → (missing[], hits[])
+  → save annotated to Output/.../Image/
+  → set FAIL_A_PIN / FAIL_B_PIN  →  pulse ACK_PIN
   → wait DONE_PIN  →  clear pins  →  STANDBY
 ```
 
@@ -49,48 +75,33 @@ Template-match fallback: if score < `match_threshold`, use fixed template coords
 ## Key Functions
 
 ### `_build_cells(x, y, w, h) → list[(cx,cy,cw,ch)]`
-Converts one IC bounding rect into 6 ROI cells (3 rows × 2 cols).  
-- Applies `_CELL_SHRINK` (L/R), `_GRID_MARGIN_TOP/BOT` (top/bot), `_COL_GAP_PCT` (between cols), `_CELL_EXPAND` (per-cell).  
-- Output: list of 6 `(int, int, int, int)` tuples, row-major order R1C1→R3C2.
-
-### `Inspector._rect_to_cells(rect: QRect) → list`
-Wrapper: unpacks QRect → calls `_build_cells(rect.x, rect.y, rect.width, rect.height)`.
+Converts one IC rect into 6 ROI cells (3 rows × 2 cols). Applies `_CELL_SHRINK`, margins, `_COL_GAP_PCT`, `_CELL_EXPAND`. Row-major order R1C1→R3C2.
 
 ### `Inspector._check_ic(image_bgr, cells, annotated, debug) → (missing, hits_flags)`
-- `cells`: 6-tuple list from `_build_cells`  
-- Crops each cell → resizes 224×224 → `Detector.classify_crop()` → bool per cell  
-- `missing`: `[[row, col], …]` for NoText cells  
-- `hits_flags`: `[bool×6]`  
-- Draws colored borders + adaptive-scale labels onto `annotated` in place.
+Crop → CLAHE (`_CLAHE` module-level object) → resize 224×224 → `Detector.classify_crop()`. Draws borders + labels onto `annotated` in place. `missing`: `[[row,col],…]` for NoText cells.
 
 ### `Inspector.inspect(image_bgr, debug) → (pass_a, pass_b, missing_a, missing_b, annotated_bgr)`
-Top-level call. Runs locate → cells → `_check_ic` × 2. Raises `MarkMissingError` on any missing cell.
+Locate → cells → `_check_ic` × 2. `annotated_bgr` IS `image_bgr` (in-place, no copy).
+Raises `MarkMissingError` on missing cells, `TemplateError` on alignment rejection.
 
 ### `TemplateMatcher.locate_ic(image_bgr) → (QRect, score)`
-Bilateral-strip template match. Returns IC_A bounding rect and match score.
-
-### `TemplateManager.load() → dict`
-Keys: `ic_a {x,y,w,h}`, `ic_b {x,y,w,h}`, `exposure_us`, `match_threshold`,  
-`strip_top_y_offset`, `strip_bot_y_offset`, `strip_h`.
-
-### `TemplateManager.save(ic_a: QRect, ic_b: QRect, exposure_us, match_threshold, strip_top_y_offset, strip_bot_y_offset, strip_h)`
-Writes template JSON + bilateral patch `.npy` files.
+Bilateral-strip match on a horizontal band. Returns IC_A rect + score.
 
 ### `RunWorker.run()`
-Background thread. Loop: grab → inspect → set pins → pulse ACK → wait DONE.  
-Signals: `result_ready`, `error_occurred`, `status_changed`.
+QThread loop: grab → save raw → inspect → save annotated → GPIO → wait DONE.
+Signals: `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_status`, `sig_cycle_ms`, `sig_done`, `sig_paused`, `sig_resumed`.
 
 ---
 
-## Cell Grid Constants *(top of file, not UI-changeable)*
+## Cell Grid Constants *(top of file)*
 
 | Constant | Default | Effect |
 |---|---|---|
-| `_CELL_SHRINK` | `1.00` | Horizontal L/R shrink ratio (1.0 = none) |
-| `_GRID_MARGIN_TOP` | `10.0` | Top margin before row 1, % of IC height |
-| `_GRID_MARGIN_BOT` | `10.0` | Bottom margin after row 3, % of IC height |
+| `_CELL_SHRINK` | `0.90` | Shrink IC rect before slicing |
+| `_GRID_MARGIN_TOP` | `10.0` | Top dead-band before row 1, % of IC height |
+| `_GRID_MARGIN_BOT` | `10.0` | Bottom dead-band after row 3, % of IC height |
 | `_COL_GAP_PCT` | `40.0` | Gap between L and R column, % of IC width |
-| `_CELL_EXPAND` | `1.00` | Per-cell expansion after slicing (1.0 = none) |
+| `_CELL_EXPAND` | `1.05` | Per-cell expansion after slicing |
 
 ---
 
@@ -98,46 +109,41 @@ Signals: `result_ready`, `error_occurred`, `status_changed`.
 
 ### Setup Flow *(one-time per product)*
 1. Capture/load reference image
-2. Click → set IC_A anchor (top-left of IC body)
-3. Set scale → auto-compute 6 ROI positions
-4. Set column offset (L ↔ R horizontal shift)
-5. Set IC_B offset (x, y from IC_A anchor)
-6. Preview 12 ROI boxes → adjust → Save Template
+2. Draw IC_A rect → confirm or auto-detect
+3. Set IC_B offset (x, y from IC_A anchor)
+4. Preview 12 ROI boxes → adjust → Save Template
 
-### GPIO Pins *(BCM, IO=True only)*
+### GPIO Pins *(BCM, `IO=True` only)*
 
-| Signal | Pin | Dir | Description |
-|---|---|---|---|
-| `START_PIN` | 17 | IN↓ | Rising edge → start inspection |
-| `DONE_PIN` | 27 | IN↓ | Rising edge → return to STANDBY |
-| `ACK_PIN` | 22 | OUT | Pulse HIGH when result ready |
-| `FAIL_A_PIN` | 24 | OUT | HIGH = IC_A failed |
-| `FAIL_B_PIN` | 25 | OUT | HIGH = IC_B failed |
+| Signal | Pin | Dir |
+|---|---|---|
+| `START_PIN` | 17 | IN↓ — rising edge starts cycle |
+| `DONE_PIN` | 27 | IN↓ — rising edge returns to STANDBY |
+| `ACK_PIN` | 22 | OUT — pulse when result ready |
+| `FAIL_A_PIN` | 24 | OUT — HIGH = IC_A fail |
+| `FAIL_B_PIN` | 25 | OUT — HIGH = IC_B fail |
 
 ---
 
 ## Files & Output
 
-### Directory Structure
 ```
 ClearIC_Inspect/
 ├── CLearIC.py
-├── Text_cls-2/best_openvino_model/   # best.xml + best.bin
-├── templates/                         # template.json + top/bot .npy patches
-├── Output/                            # FAIL images only
-├── logs/                              # inspect_YYYYMMDD.log
-└── Input/                             # CAMERA="directory" source images
+├── Config.json
+├── Text_cls-2/best_openvino_model/   # ACTIVE cell classifier (best.xml + best.bin)
+├── IC_Search_openvino_model/         # unused — kept for reference
+├── templates/                        # template.json + tmpl_top.npy + tmpl_bot.npy
+├── template_auto/                    # auto-detect template output
+├── Output/YYYYMMDD/RealImg/          # raw captures (every cycle)
+├── Output/YYYYMMDD/Image/            # annotated captures (every cycle)
+├── logs/                             # inspect_YYYYMMDD.log (daily rotation, 365-day retention)
+├── Input/                            # source images for CAMERA="directory"
+├── Dataset/                          # cell crops (COLLECT_DATASET=True)
+└── Test/                             # trainModel.py, Converter.py, ImagePlayGround.py
 ```
 
-### Output Images *(FAIL only)*
-- `IMAGE_ID_R.jpg` — raw capture  
-- `IMAGE_ID.jpg` — annotated (green border = Text/PASS, red = NoText/FAIL)  
-- `IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN`
+`IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN`. Log: JSON-lines, one record per inspection.
 
-### Log Format *(JSON-lines, one record/inspection)*
-Fields: `timestamp`, `image_id`, `ic_a_result`, `ic_a_missing`, `ic_b_result`, `ic_b_missing`, `cycle_time_ms`, `mode`, `io_mock`.  
-DEBUG adds: per-cell `class` + `confidence`.  
-Rotation: daily → `logs/inspect_YYYYMMDD.log`, 365-file retention.
-
-### Template JSON Keys
-`ic_a`, `ic_b` → `{x, y, w, h}` · `exposure_us` · `match_threshold` · `strip_top_y_offset` · `strip_bot_y_offset` · `strip_h`
+### Model Retraining
+Train with `Test/trainModel.py` (Ultralytics YOLO). Export to OpenVINO with `Test/Converter.py`, then update `MODEL_PATH` in `CLearIC.py`.

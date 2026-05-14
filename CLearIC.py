@@ -520,6 +520,7 @@ class Detector:
                 crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_GRAY2BGR)
             if crop_bgr.size == 0:
                 return 0, 0.0
+            crop_bgr = _preprocess_cell(crop_bgr)
             resized = cv2.resize(crop_bgr, (sz, sz))
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
             blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
@@ -527,6 +528,8 @@ class Detector:
             probs   = result[0][0]                           # [2] — softmax already applied by YOLO-cls
             cls_idx = int(np.argmax(probs))
             conf    = float(probs[cls_idx])
+            if conf < self._conf_thr:
+                return 0, conf   # uncertain — fail-safe to NoText
             return cls_idx, conf
         except Exception as e:
             print(f"[Detector] Classify error: {e}")
@@ -542,6 +545,8 @@ class Detector:
 _CELL_SHRINK    = 0.90   # IC rect shrunk before slicing (keeps grid off raw edges)
 _CELL_EXPAND    = 1.05   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
+_GRID_MARGIN_TOP = 10.0  # % of shrunk IC height — dead band before row 1
+_GRID_MARGIN_BOT = 10.0  # % of shrunk IC height — dead band after row 3
 
 # Dataset collection (used only when COLLECT_DATASET = True)
 _DATA_DIR   = "Dataset"
@@ -570,6 +575,15 @@ def _valid_hex(s: str) -> bool:
     s = s.strip().lstrip("#")
     return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
 
+def _preprocess_cell(crop_bgr: np.ndarray) -> np.ndarray:
+    """CLAHE contrast normalisation before classification."""
+    if crop_bgr.size == 0:
+        return crop_bgr
+    gray  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
     """
     Build the 3-row × 2-col cell list for one IC bounding rect.
@@ -587,12 +601,14 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
     sx = x + (w - sw) // 2
     sy = y + (h - sh) // 2
 
-    # Step 2 — grid on shrunk rect
-    col_gap = int(sw * _COL_GAP_PCT / 100.0)
-    cw = max(1, (sw - col_gap) // 2)
-    ch = max(1, sh // 3)
-    divider = sx + cw + col_gap          # left col end + gap = right col start
-    col_starts = [sx, divider]
+    # Step 2 — vertical margins then 3×2 grid on usable area
+    usable_y0 = sy + int(sh * _GRID_MARGIN_TOP / 100.0)
+    usable_y1 = sy + sh - int(sh * _GRID_MARGIN_BOT / 100.0)
+    usable_h  = max(1, usable_y1 - usable_y0)
+    col_gap   = int(sw * _COL_GAP_PCT / 100.0)
+    cw        = max(1, (sw - col_gap) // 2)
+    ch        = max(1, usable_h // 3)
+    col_starts = [sx, sx + cw + col_gap]
 
     # Step 3 — expand each cell (centred)
     exp_w = max(1, int(cw * _CELL_EXPAND))
@@ -604,7 +620,7 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
     for row in range(3):
         for col in range(2):
             cx = col_starts[col] - dw
-            cy = sy + row * ch  - dh
+            cy = usable_y0 + row * ch - dh
             cells.append((cx, cy, exp_w, exp_h))
     return cells
 

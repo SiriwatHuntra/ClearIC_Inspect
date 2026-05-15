@@ -354,6 +354,10 @@ ACK_PIN    = 22
 FAIL_A_PIN = 24
 FAIL_B_PIN = 25
 
+# Mock-mode self-pulse delays (IO=False). Replace with real IO when hardware is ready.
+_MOCK_START_DELAY_MS = 200   # simulated delay before START_PIN fires each cycle
+_MOCK_DONE_DELAY_MS  = 100   # simulated delay after ACK before DONE_PIN fires
+
 class RaspberryIO:
     """
     BCM-mode GPIO handler.
@@ -410,10 +414,16 @@ class RaspberryIO:
     def wait_for_start(self, stop_flag_fn) -> bool:
         """Block until START_PIN rising edge or stop_flag_fn() returns True."""
         if not self._gpio_ok:
-            while not stop_flag_fn():
+            # Mock: self-pulse after _MOCK_START_DELAY_MS, honouring stop requests.
+            deadline = time.monotonic() + _MOCK_START_DELAY_MS / 1000
+            while time.monotonic() < deadline:
+                if stop_flag_fn():
+                    return False
                 time.sleep(0.02)
-                return True
-            return False
+            if stop_flag_fn():
+                return False
+            print("[IO MOCK] START_PIN pulse")
+            return True
         GPIO = self._GPIO
         while not stop_flag_fn():
             if GPIO.input(START_PIN) == GPIO.HIGH:
@@ -426,6 +436,15 @@ class RaspberryIO:
     def wait_for_done(self, stop_flag_fn) -> bool:
         """Block until DONE_PIN rising edge or stop_flag_fn() returns True."""
         if not self._gpio_ok:
+            # Mock: self-pulse after _MOCK_DONE_DELAY_MS, honouring stop requests.
+            deadline = time.monotonic() + _MOCK_DONE_DELAY_MS / 1000
+            while time.monotonic() < deadline:
+                if stop_flag_fn():
+                    return False
+                time.sleep(0.02)
+            if stop_flag_fn():
+                return False
+            print("[IO MOCK] DONE_PIN pulse")
             return True
         GPIO = self._GPIO
         while not stop_flag_fn():
@@ -649,8 +668,8 @@ def _save_cell_crops(image_bgr: np.ndarray, cells: list,
 # TEMPLATE MANAGER
 # =========================================================
 _TEMPLATE_FILE    = "templates/template.json"
-_TEMPLATE_TOP     = "templates/tmpl_top.npy"
-_TEMPLATE_BOT     = "templates/tmpl_bot.npy"
+_TEMPLATE_FULL    = "templates/tmpl_full.npy"   # combined patch (top strip + IC + bot strip)
+_TEMPLATE_BOT     = "templates/tmpl_bot.npy"    # deprecated — kept for backward-compat load
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
 def _bilateral_binary(image_bgr: np.ndarray) -> np.ndarray:
@@ -680,20 +699,16 @@ class TemplateManager:
 
     @staticmethod
     def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
-             match_threshold: float = 0.6,
-             strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
-             strip_h: int = 0):
+             match_threshold: float = 0.6, strip_h: int = 0):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
                      "w": ic_a.width(), "h": ic_a.height()},
             "ic_b": {"x": ic_b.x(), "y": ic_b.y(),
                      "w": ic_b.width(), "h": ic_b.height()},
-            "exposure_us":        exposure_us,
-            "match_threshold":    match_threshold,
-            "strip_top_y_offset": strip_top_y_offset,
-            "strip_bot_y_offset": strip_bot_y_offset,
-            "strip_h":            strip_h,
+            "exposure_us":     exposure_us,
+            "match_threshold": match_threshold,
+            "strip_h":         strip_h,
         }
         with open(_TEMPLATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -701,55 +716,56 @@ class TemplateManager:
     @staticmethod
     def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
-        Crop top and bottom strips using the defined formula and apply bilateral filter.
+        Extract a single combined patch: [top_strip | IC body | bot_strip] and apply
+        bilateral-binary preprocessing.
 
-        Strip height = IC_H * 0.5.
-          top strip: bottom edge flush with IC top edge  → y1 = y - h1
-          bot strip: top edge flush with IC bottom edge  → y2 = y + h
-
-        Returns (top_filtered, bot_filtered, top_y_offset, bot_y_offset, strip_h)
-        where *_y_offset = strip_y_clamped - IC_y  (used to reconstruct IC pos from match).
+        Strip height = IC_H * 0.5 below the IC (bot strip only; top strip disabled).
+        Returns (full_patch, strip_h) where strip_h is the pixel offset from the patch
+        top to the IC top edge (0 because patch starts at IC top).
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
         h1 = max(1, int(h * 0.5))  # strip height = 50% of IC height
-        y1 = y - h1   # top strip: bottom edge at IC top edge
-        y2 = y + h    # bot strip: top edge at IC bottom edge
 
         img_h, img_w = image_bgr.shape[:2]
-        y1c   = max(0, y1)
-        y2c   = max(0, min(y2, img_h - h1))
-        x_end = min(x + w, img_w)
+        # y_start = max(0, y - h1)  # top strip disabled
+        y_start = y
+        y_end   = min(img_h, y + h + h1)
+        x_end   = min(x + w, img_w)
 
-        top_bin = _bilateral_binary(image_bgr[y1c:y1c + h1, x:x_end])
-        bot_bin = _bilateral_binary(image_bgr[y2c:y2c + h1, x:x_end])
+        full_bin = _bilateral_binary(image_bgr[y_start:y_end, x:x_end])
+        strip_h  = 0  # y - y_start  # top strip disabled; patch starts at IC top
 
-        top_y_offset = y1c - y   # strip_y - IC_y (used to reconstruct IC pos from match)
-        bot_y_offset = y2c - y
-        return top_bin, bot_bin, top_y_offset, bot_y_offset, h1
+        return full_bin, strip_h
 
     @staticmethod
-    def save_patches(top_patch: np.ndarray, bot_patch: np.ndarray):
-        """Save bilateral-filtered strip patches as .npy files."""
+    def save_patches(full_patch: np.ndarray):
+        """Save combined (top strip + IC body + bot strip) patch as tmpl_full.npy."""
         os.makedirs("templates", exist_ok=True)
-        np.save(_TEMPLATE_TOP, top_patch)
-        np.save(_TEMPLATE_BOT, bot_patch)
+        np.save(_TEMPLATE_FULL, full_patch)
 
     @staticmethod
-    def load_patches() -> tuple:
+    def load_patches():
         """
-        Load template patches. Returns (top, bot) ndarrays, or (None, None)
-        if files are absent or corrupt (backward-compatible with old templates).
+        Load combined template patch (tmpl_full.npy).
+        Falls back to deprecated tmpl_bot.npy if full patch not found.
+        Returns ndarray or None if absent/corrupt.
         """
-        if not os.path.exists(_TEMPLATE_TOP) or not os.path.exists(_TEMPLATE_BOT):
-            return None, None
-        try:
-            top = np.load(_TEMPLATE_TOP)
-            bot = np.load(_TEMPLATE_BOT)
-            return top, bot
-        except Exception as e:
-            print(f"[TemplateManager] Patch load failed: {e}")
-            return None, None
+        if os.path.exists(_TEMPLATE_FULL):
+            try:
+                return np.load(_TEMPLATE_FULL)
+            except Exception as e:
+                print(f"[TemplateManager] Patch load failed: {e}")
+                return None
+        # Backward compat: old split files — use bot strip only for matching
+        if os.path.exists(_TEMPLATE_BOT):
+            try:
+                print("[TemplateManager] tmpl_full.npy not found, using deprecated "
+                      "tmpl_bot.npy — re-save template to upgrade.")
+                return np.load(_TEMPLATE_BOT)
+            except Exception as e:
+                print(f"[TemplateManager] Deprecated patch load failed: {e}")
+        return None
 
     @staticmethod
     def save_preview(image_bgr: np.ndarray,
@@ -815,31 +831,28 @@ class TemplateManager:
 # =========================================================
 class TemplateMatcher:
     """
-    Locates IC_A in a new image using bilateral-filtered top/bottom strip
-    template matching (cv2.TM_CCOEFF_NORMED). Replaces Detector.locate_ics()
-    for Phase 1 of inspection.
+    Locates IC_A in a new image using a single bilateral-binary combined patch
+    (top strip + IC body + bottom strip) matched with cv2.TM_CCOEFF_NORMED.
 
-    If the averaged match score falls below threshold a TemplateError is raised —
+    If the match score falls below threshold a TemplateError is raised —
     this acts as a rotation/misalignment rejection gate.
     """
 
-    def __init__(self, top_patch: np.ndarray, bot_patch: np.ndarray,
+    def __init__(self, full_patch: np.ndarray,
                  threshold: float = 0.6,
-                 strip_top_y_offset: int = 0, strip_bot_y_offset: int = 0,
+                 strip_h: int = 0,
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
                  search_margin: int = 60):
-        self._top          = top_patch
-        self._bot          = bot_patch
-        self._threshold    = threshold
-        self._patch_w      = top_patch.shape[1]
-        self._top_y_offset = strip_top_y_offset
-        self._bot_y_offset = strip_bot_y_offset
-        self._ic_x         = ic_x   # expected IC_A left edge from template
-        self._ic_y         = ic_y   # expected IC_A top from template
-        self._ic_w         = ic_w
-        self._ic_h         = ic_h
-        self._margin       = search_margin   # px around expected pos to search
+        self._patch     = full_patch
+        self._threshold = threshold
+        self._strip_h   = strip_h   # px from patch top to IC top edge
+        self._patch_w   = full_patch.shape[1]
+        self._ic_x      = ic_x   # expected IC_A left edge from template
+        self._ic_y      = ic_y   # expected IC_A top from template
+        self._ic_w      = ic_w
+        self._ic_h      = ic_h
+        self._margin    = search_margin   # px around expected pos to search
 
     def _match_in_roi(self, filtered: np.ndarray, patch: np.ndarray,
                       exp_x: int, exp_y: int) -> tuple:
@@ -870,25 +883,24 @@ class TemplateMatcher:
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
         Returns (QRect, score). Raises TemplateError when score < threshold.
-        Searches only within ±search_margin of the expected IC_A position so
-        identical ICs elsewhere in the frame are not matched by mistake.
+        Matches the combined (top strip + IC body + bot strip) patch against the frame.
+        Searches only within ±search_margin of the expected position.
         """
         # Apply same preprocessing as extract_patches: grayscale → bilateral → Otsu
         filtered = _bilateral_binary(image_bgr)
 
-        # Expected absolute strip position for bottom strip (from template creation)
-        exp_bot_y = self._ic_y + self._bot_y_offset
+        # Expected top of combined patch in image (IC_y minus the top-strip offset)
+        exp_y = self._ic_y - self._strip_h
 
-        bx, by, score = self._match_in_roi(
-            filtered, self._bot, self._ic_x, exp_bot_y)
+        mx, my, score = self._match_in_roi(filtered, self._patch, self._ic_x, exp_y)
 
         if score < self._threshold:
             raise TemplateError(
                 f"Match score {score:.3f} < {self._threshold:.3f} — "
                 "IC rotation or misalignment detected")
 
-        ic_y = by - self._bot_y_offset
-        ic_x = bx
+        ic_y = my + self._strip_h
+        ic_x = mx
         return QtCore.QRect(ic_x, ic_y, self._patch_w, self._ic_h), score
 
 # =========================================================
@@ -1458,6 +1470,15 @@ class RunWorker(QtCore.QThread):
         io_mock  = not IO
         debug    = DEBUG
 
+        # Camera preflight — verify camera is reachable before entering the loop.
+        if cam_mode == "camera":
+            try:
+                self._camera.grab_first()
+            except CameraError as e:
+                self.sig_error.emit(f"Camera not found: {e}")
+                self.sig_status.emit("ERROR — camera not found, cannot run.")
+                return
+
         self.sig_status.emit("Running…")
         _cycle = 0
 
@@ -1487,6 +1508,8 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_error("CAMERA_ERROR", str(e),
                                        (time.perf_counter() - t0) * 1000)
                 self.sig_error.emit(f"Camera error: {e}")
+                self.sig_status.emit("ERROR — machine blocked, restart required.")
+                # No ACK pulsed — machine stays blocked waiting; operator must reset.
                 break
 
             img_id = _next_image_id()
@@ -1543,7 +1566,8 @@ class RunWorker(QtCore.QThread):
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 all_cells = [[r, c] for r in range(1, 4) for c in range(1, 3)]
                 err = MarkMissingError(all_cells, all_cells, None)
-                # raw already at real_path; no annotation drawn for alignment error
+                # ann_path intentionally NOT written — no annotation drawn for alignment errors;
+                # only raw (real_path) is on disk for this cycle.
 
                 self.sig_image.emit(img_bgr)
                 self.sig_fail.emit(err)
@@ -1556,12 +1580,15 @@ class RunWorker(QtCore.QThread):
                 self._gpio.set_fail_b(True)
                 self._gpio.pulse_ack()
 
-                print(f"[RunWorker] Alignment rejected: {e}")
+                if debug:
+                    print(f"[RunWorker] Alignment rejected: {e}")
 
             except Exception as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
                 self.sig_error.emit(f"Unexpected error: {e}")
+                self.sig_status.emit("ERROR — machine blocked, restart required.")
+                # No ACK pulsed — machine stays blocked waiting; operator must reset.
                 break
 
             finally:
@@ -1599,7 +1626,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_resumed.emit()
 
         self._gpio.clear_outputs()
-        if not self._stop and cam_mode != "camera":
+        if cam_mode != "camera":
             self.sig_done.emit()
         self.sig_status.emit("Standby.")
 
@@ -2020,6 +2047,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except CameraError:
                 pass
 
+        # Apply initial button state — disables Start if no template exists yet.
+        self._update_setup_buttons()
+
 
     # ----------------------------------------------------------
     # Rubber-band template setup flow
@@ -2100,9 +2130,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_new_tmpl.setEnabled(s in ('idle', 'ready'))
         self._btn_confirm_tmpl.setEnabled(s == 'ready')
         if s == 'idle':
+            template_ok = os.path.exists(_TEMPLATE_FILE)
             text = ("Template saved."
-                    if os.path.exists(_TEMPLATE_FILE)
-                    else "No template saved.")
+                    if template_ok
+                    else "No template — create a template before running.")
+            # Gate the Start button: only allow run when a template exists.
+            if self._run_state == "standby":
+                self._btn_action.setEnabled(template_ok)
         else:
             text = {
                 'draw_a':       'Draw either IC area on image.',
@@ -2119,12 +2153,12 @@ class MainWindow(QtWidgets.QMainWindow):
             exposure = 8000
 
         patch_saved = False
-        top_y_off = bot_y_off = strip_h_val = 0
+        strip_h_val = 0
         if self._setup_image is not None:
             try:
-                top_patch, bot_patch, top_y_off, bot_y_off, strip_h_val = \
+                full_patch, strip_h_val = \
                     TemplateManager.extract_patches(self._setup_image, ic_a)
-                TemplateManager.save_patches(top_patch, bot_patch)
+                TemplateManager.save_patches(full_patch)
                 patch_saved = True
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
@@ -2132,10 +2166,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not save template patches: {e}\n"
                     "Inspection will use fixed template coordinates.")
 
-        TemplateManager.save(ic_a, ic_b, exposure,
-                             strip_top_y_offset=top_y_off,
-                             strip_bot_y_offset=bot_y_off,
-                             strip_h=strip_h_val)
+        TemplateManager.save(ic_a, ic_b, exposure, strip_h=strip_h_val)
 
         if self._setup_image is not None:
             try:
@@ -2145,9 +2176,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         msg = "Template saved to templates/template.json"
         if patch_saved:
-            msg += "\nPatch files saved (tmpl_top.npy / tmpl_bot.npy)"
+            msg += "\nPatch file saved (tmpl_full.npy)"
         msg += "\nPreview saved to templates/template_preview.png"
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
+
+        self._setup_state = 'idle'
+        self._update_setup_buttons()
 
 
     # ----------------------------------------------------------
@@ -2183,17 +2217,15 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = "DEBUG" if DEBUG else "RUN"
         self._logger.start_session(mode)
 
-        # IC localization via TemplateMatcher when patches exist; else fixed template coords.
+        # IC localization via TemplateMatcher when patch exists; else fixed template coords.
         matcher = None
-        top, bot = TemplateManager.load_patches()
-        if top is not None and bot is not None:
+        full_patch = TemplateManager.load_patches()
+        if full_patch is not None:
             ic_a = tmpl["ic_a"]
             matcher = TemplateMatcher(
-                top,
-                bot,
+                full_patch,
                 threshold=tmpl.get("match_threshold", 0.6),
-                strip_top_y_offset=tmpl.get("strip_top_y_offset", 0),
-                strip_bot_y_offset=tmpl.get("strip_bot_y_offset", 0),
+                strip_h=tmpl.get("strip_h", 0),
                 ic_x=ic_a["x"], ic_y=ic_a["y"],
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
             )

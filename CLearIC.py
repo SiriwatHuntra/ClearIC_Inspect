@@ -575,8 +575,8 @@ class Detector:
 # =========================================================
 # CELL GRID CONSTANTS
 # =========================================================
-_CELL_SHRINK    = 0.90   # IC rect shrunk before slicing (keeps grid off raw edges)
-_CELL_EXPAND    = 1.05   # each cell expanded after slicing (overlapping neighbours)
+_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
+_CELL_EXPAND    = 1.1   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 _GRID_MARGIN_TOP = 10.0  # % of shrunk IC height — dead band before row 1
 _GRID_MARGIN_BOT = 10.0  # % of shrunk IC height — dead band after row 3

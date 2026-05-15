@@ -587,6 +587,9 @@ _DATA_SPLIT = "train"    # "train" | "val" | "test"
 _data_run_counter = 0
 _dataset_lock     = threading.Lock()
 
+# CLAHE preprocessor applied to each cell crop before classification
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
 # =========================================================
 # VISUAL SETTINGS  (live-editable from the Settings panel)
 # =========================================================
@@ -998,6 +1001,9 @@ class Inspector:
             x1, y1 = max(0, cx),       max(0, cy)
             x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
             crop    = image_bgr[y1:y2, x1:x2]
+            if crop.size > 0:
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+                crop = cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
             cls_idx, conf = self._detector.classify_crop(crop)
             present = (cls_idx == 1)   # 1 = Text (mark present)
             hits_flags.append(present)
@@ -2090,17 +2096,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view.set_rubberband_mode(False)
         self._view.clear_overlays()
 
-        img     = self._setup_image
-        img_w   = img.shape[1] if img is not None else 0
-        cx      = rect.x() + rect.width() // 2
-        on_left = (img_w == 0) or (cx < img_w // 2)
+        img = self._setup_image
+        if img is None:
+            self._setup_state = 'draw_a_retry'
+            self._view.set_rubberband_mode(True)
+            self._update_setup_buttons()
+            return
 
-        if on_left:
-            ic_a = rect
-            ic_b, _ = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+        drawn_on_left = (rect.x() + rect.width() // 2) < img.shape[1] // 2
+        second, _     = _find_second_ic(img, rect)
+
+        if drawn_on_left:
+            ic_a, ic_b = rect, second
         else:
-            ic_b = rect
-            ic_a, _ = _find_second_ic(img, rect) if img is not None else (None, 0.0)
+            ic_a, ic_b = second, rect
 
         if ic_a:
             self._view.add_overlay(ic_a, QtGui.QColor(_tmpl_color_a), "IC_A")
@@ -2112,7 +2121,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_ic_b = ic_b
             self._setup_state  = 'ready'
         else:
-            # Auto-search failed — re-enable rubber-band for immediate retry
             self._pending_ic_a = None
             self._pending_ic_b = None
             self._view.set_rubberband_mode(True)

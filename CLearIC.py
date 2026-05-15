@@ -1447,9 +1447,10 @@ class RunWorker(QtCore.QThread):
     sig_error    = QtCore.pyqtSignal(str)
     sig_status   = QtCore.pyqtSignal(str)
     sig_cycle_ms = QtCore.pyqtSignal(float)
-    sig_done     = QtCore.pyqtSignal()           # all directory images processed → standby
-    sig_paused   = QtCore.pyqtSignal()
-    sig_resumed  = QtCore.pyqtSignal()
+    sig_done          = QtCore.pyqtSignal()  # worker loop exited (Stop pressed)
+    sig_session_reset = QtCore.pyqtSignal() # batch complete → clear counts, new log
+    sig_paused        = QtCore.pyqtSignal()
+    sig_resumed       = QtCore.pyqtSignal()
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
@@ -1506,8 +1507,12 @@ class RunWorker(QtCore.QThread):
             else:
                 # Auto directory: brief yield, then check DONE_PIN / Stop
                 time.sleep(0.05)
-                if self._stop or self._gpio.is_done_signaled():
+                if self._stop:
                     break
+                if self._gpio.is_done_signaled():
+                    self._camera.reset()
+                    self.sig_session_reset.emit()
+                    continue
 
             # ── Capture guard ────────────────────────────────────────
             if self._stop:
@@ -1616,12 +1621,9 @@ class RunWorker(QtCore.QThread):
                 self._gpio.wait_for_done(lambda: self._stop)
                 self._gpio.clear_outputs()
             else:
-                # Directory mode: stop on last image or DONE_PIN signal
-                if not self._camera.has_more():
-                    self._camera.reset()   # rewind for next run
-                    break                  # natural end → sig_done
-                if self._gpio.is_done_signaled():
-                    break                  # machine stop signal → sig_done
+                if not self._camera.has_more() or self._gpio.is_done_signaled():
+                    self._camera.reset()
+                    self.sig_session_reset.emit()
 
             # ── Pause checkpoint ─────────────────────────────────────
             # Sits after DONE handshake + clear_outputs so the machine
@@ -2258,6 +2260,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_cycle_ms.connect(
             lambda ms: self._lbl_cycle_ms.setText(f"{ms:.0f}"))
         self._worker.sig_done.connect(self._on_run_done)
+        self._worker.sig_session_reset.connect(self._on_session_reset)
         self._worker.sig_paused.connect(self._on_paused)
         self._worker.sig_resumed.connect(self._on_resumed)
         self._worker.start()
@@ -2299,8 +2302,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.wait(3000)
         self._enter_standby()
 
+    def _on_session_reset(self):
+        """Batch complete (all dir images done or DONE_PIN): log, clear counts, new session."""
+        elapsed = time.monotonic() - self._session_start_time
+        self._logger.log_session_end(
+            "COMPLETE", self._stats_pass, self._stats_fail,
+            self._stats_error, elapsed)
+        self._stats_pass = self._stats_fail = self._stats_error = 0
+        self._lbl_pass.setText("0")
+        self._lbl_fail.setText("0")
+        self._lbl_error.setText("0")
+        self._session_start_time = time.monotonic()
+        self._logger.start_session("DEBUG" if DEBUG else "RUN")
+
     def _on_run_done(self):
-        """Called when all images processed naturally OR DONE_PIN received."""
+        """Called when the worker loop exits (Stop pressed)."""
         elapsed = time.monotonic() - self._session_start_time
         self._logger.log_session_end(
             "COMPLETE", self._stats_pass, self._stats_fail,

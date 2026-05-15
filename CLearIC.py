@@ -679,12 +679,11 @@ _TEMPLATE_FULL    = "templates/tmpl_full.npy"   # combined patch (top strip + IC
 _TEMPLATE_BOT     = "templates/tmpl_bot.npy"    # deprecated — kept for backward-compat load
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
-def _bilateral_binary(image_bgr: np.ndarray) -> np.ndarray:
-    """BGR → Otsu binary via bilateral-filtered grayscale (params tuned for Basler optics)."""
+def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
+    """BGR → adaptive-threshold binary (Gaussian, 21px block) for template matching."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    smooth = cv2.bilateralFilter(gray, 9, 75, 75)
-    _, binary = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 21, 5)
 
 class TemplateManager:
 
@@ -723,8 +722,8 @@ class TemplateManager:
     @staticmethod
     def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
-        Extract a single combined patch: [top_strip | IC body | bot_strip] and apply
-        bilateral-binary preprocessing.
+        Extract a single combined patch: [IC body | bot_strip] and apply
+        adaptive-threshold preprocessing.
 
         Strip height = IC_H * 0.5 below the IC (bot strip only; top strip disabled).
         Returns (full_patch, strip_h) where strip_h is the pixel offset from the patch
@@ -740,7 +739,7 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)
         x_end   = min(x + w, img_w)
 
-        full_bin = _bilateral_binary(image_bgr[y_start:y_end, x:x_end])
+        full_bin = _adaptive_binary(image_bgr[y_start:y_end, x:x_end])
         strip_h  = 0  # y - y_start  # top strip disabled; patch starts at IC top
 
         return full_bin, strip_h
@@ -838,8 +837,8 @@ class TemplateManager:
 # =========================================================
 class TemplateMatcher:
     """
-    Locates IC_A in a new image using a single bilateral-binary combined patch
-    (top strip + IC body + bottom strip) matched with cv2.TM_CCOEFF_NORMED.
+    Locates IC_A in a new image using a single adaptive-binary combined patch
+    (IC body + bottom strip) matched with cv2.TM_CCOEFF_NORMED.
 
     If the match score falls below threshold a TemplateError is raised —
     this acts as a rotation/misalignment rejection gate.
@@ -893,8 +892,8 @@ class TemplateMatcher:
         Matches the combined (top strip + IC body + bot strip) patch against the frame.
         Searches only within ±search_margin of the expected position.
         """
-        # Apply same preprocessing as extract_patches: grayscale → bilateral → Otsu
-        filtered = _bilateral_binary(image_bgr)
+        # Apply same preprocessing as extract_patches: grayscale → adaptive threshold
+        filtered = _adaptive_binary(image_bgr)
 
         # Expected top of combined patch in image (IC_y minus the top-strip offset)
         exp_y = self._ic_y - self._strip_h
@@ -908,7 +907,7 @@ class TemplateMatcher:
 
         ic_y = my + self._strip_h
         ic_x = mx
-        return QtCore.QRect(ic_x, ic_y, self._patch_w, self._ic_h), score
+        return QtCore.QRect(ic_x, ic_y, self._ic_w, self._ic_h), score
 
 # =========================================================
 # INSPECTOR
@@ -1661,7 +1660,7 @@ def _find_second_ic(image_bgr: np.ndarray,
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
 
-    binary = _bilateral_binary(image_bgr)
+    binary = _adaptive_binary(image_bgr)
 
     # Crop template from ref IC position (clamped to image bounds)
     ty1, ty2 = max(0, y), min(img_h, y + h)

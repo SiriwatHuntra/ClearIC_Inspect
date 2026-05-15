@@ -1621,9 +1621,12 @@ class RunWorker(QtCore.QThread):
                 self._gpio.wait_for_done(lambda: self._stop)
                 self._gpio.clear_outputs()
             else:
-                if not self._camera.has_more() or self._gpio.is_done_signaled():
+                if not self._camera.has_more():
                     self._camera.reset()
-                    self.sig_session_reset.emit()
+                    break                           # directory done → standby
+                if self._gpio.is_done_signaled():
+                    self._camera.reset()
+                    self.sig_session_reset.emit()   # IO signal → new batch, keep running
 
             # ── Pause checkpoint ─────────────────────────────────────
             # Sits after DONE handshake + clear_outputs so the machine
@@ -2224,11 +2227,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
-        # Reset counters for new session
-        self._stats_pass = self._stats_fail = self._stats_error = 0
-        self._lbl_pass.setText("0")
-        self._lbl_fail.setText("0")
-        self._lbl_error.setText("0")
         self._session_start_time = time.monotonic()
 
         mode = "DEBUG" if DEBUG else "RUN"
@@ -2330,6 +2328,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)
+        self._stats_pass = self._stats_fail = self._stats_error = 0
+        self._lbl_pass.setText("0")
+        self._lbl_fail.setText("0")
+        self._lbl_error.setText("0")
         self._lbl_status.setText("Standby.")
         self._reload_default_image()
 

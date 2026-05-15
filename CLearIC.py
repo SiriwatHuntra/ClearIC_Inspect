@@ -58,10 +58,11 @@ COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retra
 class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
-        "CAMERA":        "directory",
-        "CONF_THR":      0.5,
-        "CAMERA_SERIAL": "",
-        "EXPOSURE_US":   8000,
+        "CAMERA":         "directory",
+        "CONF_THR":       0.5,
+        "TEXT_MIN_CONF":  0.80,
+        "CAMERA_SERIAL":  "",
+        "EXPOSURE_US":    8000,
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -84,6 +85,8 @@ class ConfigLoader:
             raise ConfigError(f"CAMERA must be one of {cls._VALID_CAMERA}")
         if not (0.0 < cfg["CONF_THR"] <= 1.0):
             raise ConfigError("CONF_THR must be in (0, 1]")
+        if not (0.0 < cfg["TEXT_MIN_CONF"] <= 1.0):
+            raise ConfigError("TEXT_MIN_CONF must be in (0, 1]")
         return cfg
 
     @classmethod
@@ -495,8 +498,9 @@ class Detector:
 
     MODEL_XML = MODEL_PATH
 
-    def __init__(self, conf_thr: float = 0.5, **_):
-        self._conf_thr = conf_thr
+    def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80, **_):
+        self._conf_thr      = conf_thr
+        self._text_min_conf = text_min_conf
         self._compiled = None
         self._ready    = False
         try:
@@ -545,12 +549,13 @@ class Detector:
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
             blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
             result  = self._compiled(blob)
-            probs   = result[0][0]                           # [2] — softmax already applied by YOLO-cls
-            cls_idx = int(np.argmax(probs))
-            conf    = float(probs[cls_idx])
-            if conf < self._conf_thr:
-                return 0, conf   # uncertain — fail-safe to NoText
-            return cls_idx, conf
+            probs     = result[0][0]                         # [2] — softmax already applied by YOLO-cls
+            text_prob = float(probs[1])                     # P(Text)
+            # Require Text probability to clear TEXT_MIN_CONF; anything below → NoText.
+            # Asymmetric on purpose: guards unmarked products without penalising NoText.
+            if text_prob >= self._text_min_conf:
+                return 1, text_prob
+            return 0, float(probs[0])
         except Exception as e:
             print(f"[Detector] Classify error: {e}")
             return 0, 0.0
@@ -2013,6 +2018,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._detector = Detector(
                 conf_thr=cfg.get("CONF_THR", 0.5),
+                text_min_conf=cfg.get("TEXT_MIN_CONF", 0.80),
             )
         except ModelError as e:
             self._show_error(f"Classifier model load failed: {e}")

@@ -58,11 +58,12 @@ COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retra
 class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
-        "CAMERA":         "directory",
-        "CONF_THR":       0.5,
-        "TEXT_MIN_CONF":  0.80,
-        "CAMERA_SERIAL":  "",
-        "EXPOSURE_US":    8000,
+        "CAMERA":              "directory",
+        "CONF_THR":            0.5,
+        "TEXT_MIN_CONF":       0.80,
+        "BLANK_CELL_STD_THR":  0.0,
+        "CAMERA_SERIAL":       "",
+        "EXPOSURE_US":         8000,
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -87,6 +88,8 @@ class ConfigLoader:
             raise ConfigError("CONF_THR must be in (0, 1]")
         if not (0.0 < cfg["TEXT_MIN_CONF"] <= 1.0):
             raise ConfigError("TEXT_MIN_CONF must be in (0, 1]")
+        if not (0.0 <= cfg["BLANK_CELL_STD_THR"] <= 255.0):
+            raise ConfigError("BLANK_CELL_STD_THR must be in [0, 255]")
         return cfg
 
     @classmethod
@@ -498,9 +501,11 @@ class Detector:
 
     MODEL_XML = MODEL_PATH
 
-    def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80, **_):
-        self._conf_thr      = conf_thr
-        self._text_min_conf = text_min_conf
+    def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80,
+                 blank_cell_std_thr: float = 0.0, **_):
+        self._conf_thr           = conf_thr
+        self._text_min_conf      = text_min_conf
+        self._blank_cell_std_thr = blank_cell_std_thr
         self._compiled = None
         self._ready    = False
         try:
@@ -544,7 +549,10 @@ class Detector:
                 crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_GRAY2BGR)
             if crop_bgr.size == 0:
                 return 0, 0.0
-            crop_bgr = _preprocess_cell(crop_bgr)
+            if self._blank_cell_std_thr > 0.0:
+                _g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.ndim == 3 else crop_bgr
+                if float(_g.std()) < self._blank_cell_std_thr:
+                    return 0, 1.0   # guard-triggered NoText; conf=1.0 marks it in logs
             resized = cv2.resize(crop_bgr, (sz, sz))
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
             blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
@@ -599,15 +607,6 @@ def _hex_to_bgr(h: str) -> tuple:
 def _valid_hex(s: str) -> bool:
     s = s.strip().lstrip("#")
     return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
-
-_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-
-def _preprocess_cell(crop_bgr: np.ndarray) -> np.ndarray:
-    """CLAHE contrast normalisation before classification."""
-    if crop_bgr.size == 0:
-        return crop_bgr
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
 
 
 def _build_cells(x: int, y: int, w: int, h: int) -> list:
@@ -1004,9 +1003,10 @@ class Inspector:
             hits_flags.append(present)
             if debug:
                 lbl = "Text" if present else "NoText"
+                _dbg_g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
-                      f"cls={lbl} conf={conf:.3f}")
+                      f"cls={lbl} conf={conf:.3f}  raw_std={_dbg_g.std():.1f}")
             color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
@@ -2019,6 +2019,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._detector = Detector(
                 conf_thr=cfg.get("CONF_THR", 0.5),
                 text_min_conf=cfg.get("TEXT_MIN_CONF", 0.80),
+                blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
             )
         except ModelError as e:
             self._show_error(f"Classifier model load failed: {e}")

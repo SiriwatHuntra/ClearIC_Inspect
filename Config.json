@@ -2,6 +2,7 @@
   "CAMERA": "directory",
   "CONF_THR": 0.85,
   "TEXT_MIN_CONF": 0.80,
+  "BLANK_CELL_STD_THR": 0.0,
   "NMS_IOU_THR": 0.45,
   "CAMERA_SERIAL": "",
   "EXPOSURE_US": 8000

@@ -43,9 +43,10 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 # =========================================================
 # HARDCODED DEV FLAGS  (edit here before running — not in Config.json)
 # =========================================================
-DEBUG     = True      # verbose logs, annotated output
-IO        = False     # True = drive GPIO / False = mock (log only)
-MODE      = "DEBUG"   # "DEBUG" or "RUN"
+DEBUG           = True      # verbose logs, annotated output
+IO              = False     # True = drive GPIO / False = mock (log only)
+MODE            = "DEBUG"   # "DEBUG" or "RUN"
+CLASSIFIER_MODE = "cls"     # "cls" = pre-filter + model  |  "cv_only" = CV features only
 DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
 OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
 MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
@@ -58,12 +59,12 @@ COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retra
 class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
-        "CAMERA":              "directory",
-        "CONF_THR":            0.5,
-        "TEXT_MIN_CONF":       0.80,
-        "BLANK_CELL_STD_THR":  0.0,
-        "CAMERA_SERIAL":       "",
-        "EXPOSURE_US":         8000,
+        "CAMERA":            "directory",
+        "CONF_THR":          0.5,
+        "TEXT_MIN_CONF":     0.80,
+        "PREFILTER_ENABLED": True,
+        "CAMERA_SERIAL":     "",
+        "EXPOSURE_US":       8000,
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -88,8 +89,8 @@ class ConfigLoader:
             raise ConfigError("CONF_THR must be in (0, 1]")
         if not (0.0 < cfg["TEXT_MIN_CONF"] <= 1.0):
             raise ConfigError("TEXT_MIN_CONF must be in (0, 1]")
-        if not (0.0 <= cfg["BLANK_CELL_STD_THR"] <= 255.0):
-            raise ConfigError("BLANK_CELL_STD_THR must be in [0, 255]")
+        if not isinstance(cfg["PREFILTER_ENABLED"], bool):
+            raise ConfigError("PREFILTER_ENABLED must be true or false")
         return cfg
 
     @classmethod
@@ -502,10 +503,10 @@ class Detector:
     MODEL_XML = MODEL_PATH
 
     def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80,
-                 blank_cell_std_thr: float = 0.0, **_):
-        self._conf_thr           = conf_thr
-        self._text_min_conf      = text_min_conf
-        self._blank_cell_std_thr = blank_cell_std_thr
+                 prefilter_enabled: bool = True, **_):
+        self._conf_thr          = conf_thr
+        self._text_min_conf     = text_min_conf
+        self._prefilter_enabled = prefilter_enabled
         self._compiled = None
         self._ready    = False
         try:
@@ -549,18 +550,17 @@ class Detector:
                 crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_GRAY2BGR)
             if crop_bgr.size == 0:
                 return 0, 0.0
-            if self._blank_cell_std_thr > 0.0:
-                _g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.ndim == 3 else crop_bgr
-                if float(_g.std()) < self._blank_cell_std_thr:
-                    return 0, 1.0   # guard-triggered NoText; conf=1.0 marks it in logs
+            _gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.ndim == 3 else crop_bgr
+            if CLASSIFIER_MODE == "cv_only":
+                return (0, 1.0) if _notext_prefilter(_gray) else (1, 1.0)
+            if self._prefilter_enabled and _notext_prefilter(_gray):
+                return 0, 1.0   # pre-filter: clearly NoText (conf=1.0 marks it in logs)
             resized = cv2.resize(crop_bgr, (sz, sz))
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
             blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
             result  = self._compiled(blob)
             probs     = result[0][0]                         # [2] — softmax already applied by YOLO-cls
-            text_prob = float(probs[1])                     # P(Text)
-            # Require Text probability to clear TEXT_MIN_CONF; anything below → NoText.
-            # Asymmetric on purpose: guards unmarked products without penalising NoText.
+            text_prob = float(probs[1])
             if text_prob >= self._text_min_conf:
                 return 1, text_prob
             return 0, float(probs[0])
@@ -580,6 +580,30 @@ _CELL_EXPAND    = 1.1   # each cell expanded after slicing (overlapping neighbou
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
 _GRID_MARGIN_TOP = 10.0  # % of shrunk IC height — dead band before row 1
 _GRID_MARGIN_BOT = 10.0  # % of shrunk IC height — dead band after row 3
+
+# Classical CV pre-filter thresholds
+_PREFILTER_GRAD_THR     = 150.0   # mean(Sobel_x² + Sobel_y²); text >>200, blank <150
+_PREFILTER_CONTRAST_THR =  35.0   # p95 − p5 pixel spread; text >50, blank <35
+_PREFILTER_BLOB_FRAC    =   0.05  # max CC area / crop area after Otsu; text >0.05
+
+def _prefilter_features(gray: np.ndarray) -> tuple:
+    """Return (grad_energy, contrast, blob_frac) for a grayscale cell crop."""
+    sx   = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+    sy   = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    grad = float(np.mean(sx ** 2 + sy ** 2))
+    p5, p95    = np.percentile(gray, [5, 95])
+    contrast   = float(p95 - p5)
+    _, binary  = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    blob_frac  = float(stats[1:, cv2.CC_STAT_AREA].max()) / gray.size if n > 1 else 0.0
+    return grad, contrast, blob_frac
+
+def _notext_prefilter(gray: np.ndarray) -> bool:
+    """Return True if the cell is clearly NoText (all 3 CV features below threshold)."""
+    grad, contrast, blob_frac = _prefilter_features(gray)
+    return (grad      < _PREFILTER_GRAD_THR and
+            contrast  < _PREFILTER_CONTRAST_THR and
+            blob_frac < _PREFILTER_BLOB_FRAC)
 
 # Dataset collection (used only when COLLECT_DATASET = True)
 _DATA_DIR   = "Dataset"
@@ -1002,11 +1026,13 @@ class Inspector:
             present = (cls_idx == 1)   # 1 = Text (mark present)
             hits_flags.append(present)
             if debug:
-                lbl = "Text" if present else "NoText"
-                _dbg_g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-                print(f"[Cell R{row}C{col}] "
-                      f"{'PRESENT' if present else 'ABSENT '} "
-                      f"cls={lbl} conf={conf:.3f}  raw_std={_dbg_g.std():.1f}")
+                lbl   = "Text" if present else "NoText"
+                src   = "CV   " if conf == 1.0 else "Model"
+                _dg   = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+                _grad, _ctr, _blob = _prefilter_features(_dg)
+                print(f"[Cell R{row}C{col}] {'PRESENT' if present else 'ABSENT '} "
+                      f"cls={lbl} src={src} conf={conf:.3f}  "
+                      f"grad={_grad:.0f} ctr={_ctr:.0f} blob={_blob:.2f}")
             color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
@@ -2019,7 +2045,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._detector = Detector(
                 conf_thr=cfg.get("CONF_THR", 0.5),
                 text_min_conf=cfg.get("TEXT_MIN_CONF", 0.80),
-                blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
+                prefilter_enabled=cfg.get("PREFILTER_ENABLED", True),
             )
         except ModelError as e:
             self._show_error(f"Classifier model load failed: {e}")

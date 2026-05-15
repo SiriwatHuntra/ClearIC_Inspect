@@ -1,25 +1,35 @@
+import shutil
+import sys
 import cv2
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 from imblearn.over_sampling import SMOTE
 import albumentations as A
 from ultralytics import YOLO
 
-# Kaggle paths
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# /kaggle/input is read-only — copy dataset to writable /kaggle/working first.
 PROJECT_DIR = Path("/kaggle/input/datasets/siriwat121")
-DATASET_DIR = PROJECT_DIR / "ic-font/Dataset"
+DATASET_DIR = PROJECT_DIR / "ic-font/Dataset"   # read-only source
+WORK_DIR    = Path("/kaggle/working/Dataset")    # writable working copy
 
-MODEL = str(PROJECT_DIR / "model-yolo/yolo26n-cls.pt")
+MODEL    = str(PROJECT_DIR / "model-yolo/yolo26n-cls.pt")
+IMG_SIZE = 224
+EPOCHS   = 100
+BATCH    = 64
+PROJECT  = "/kaggle/working/Model_IC"
+NAME     = "Text_cls"
 
-IMG_SIZE   = 224
-EPOCHS     = 100
-BATCH_SIZE = 64
-PROJECT    = "/kaggle/working/Model_IC"
-NAME       = "Text_cls"
+# ── Step 0: copy to writable workspace ───────────────────────────────────────
+if WORK_DIR.exists():
+    print(f"[Setup] {WORK_DIR} already exists, skipping copy.", flush=True)
+else:
+    print(f"[Setup] Copying dataset → {WORK_DIR} ...", flush=True)
+    shutil.copytree(DATASET_DIR, WORK_DIR)
+    print(f"[Setup] Done — {sum(1 for _ in WORK_DIR.rglob('*.*'))} files.", flush=True)
 
 # ── SMOTE balancing ───────────────────────────────────────────────────────────
-# Images are downsampled to SMOTE_SIZE for k-NN interpolation (memory efficient),
-# then synthetic crops are saved back at IMG_SIZE so YOLO trains at full resolution.
 SMOTE_SIZE = 64
 
 def _load_flat(folder: Path, sz: int) -> tuple:
@@ -35,8 +45,10 @@ def apply_smote(dataset_dir: Path, minority: str, majority: str):
     maj_dir = dataset_dir / "train" / majority
     min_dir = dataset_dir / "train" / minority
 
+    print(f"[SMOTE] Loading images ...", flush=True)
     X_maj, _ = _load_flat(maj_dir, SMOTE_SIZE)
     X_min, _ = _load_flat(min_dir, SMOTE_SIZE)
+    print(f"[SMOTE] {majority}={len(X_maj)}  {minority}={len(X_min)} — fitting ...", flush=True)
 
     X = np.vstack([X_maj, X_min])
     y = np.array([1] * len(X_maj) + [0] * len(X_min))
@@ -53,26 +65,12 @@ def apply_smote(dataset_dir: Path, minority: str, majority: str):
             img_224 = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
             cv2.imwrite(str(min_dir / f"_smote_{i:05d}.png"), img_224)
             count += 1
-    print(f"[SMOTE] +{count} synthetic {minority} → total {len(X_min) + count} "
-          f"(was {len(X_min)}, majority {len(X_maj)})")
+    print(f"[SMOTE] +{count} synthetic {minority} → total {len(X_min)+count} "
+          f"(was {len(X_min)}, majority {len(X_maj)})", flush=True)
 
 # ── Geometric augmentation ────────────────────────────────────────────────────
-# Targets: stretch (aspect ratio), scale change, padding, shift offset.
-#
-# Pipeline:
-#   1. PadIfNeeded  — adds ~40% replicated border so the crop can "see" IC
-#                     background at cell edges (padding simulation)
-#   2. RandomResizedCrop — combines stretch (ratio) + scale in one op:
-#        ratio=(0.55, 1.82): portrait→landscape stretch of the crop window
-#        scale=(0.50, 0.90): crop covers 50-90% of the padded area
-#   3. ShiftScaleRotate   — translates content within the frame (shift offset),
-#        border filled with BORDER_REPLICATE (realistic IC surface)
-#
-# Only original images are augmented (files not starting with '_'), so
-# re-running is safe and doesn't compound generated copies.
-AUG_COPIES = 2   # augmented variants per original image
-
-_PAD_TO = int(IMG_SIZE * 1.4)   # 224 × 1.4 ≈ 313 px padded canvas
+AUG_COPIES = 2
+_PAD_TO    = int(IMG_SIZE * 1.4)
 
 _TRANSFORM = A.Compose([
     A.PadIfNeeded(
@@ -82,28 +80,27 @@ _TRANSFORM = A.Compose([
     ),
     A.RandomResizedCrop(
         size=(IMG_SIZE, IMG_SIZE),
-        scale=(0.50, 0.90),   # zoom: content fills 50-90% of output frame
-        ratio=(0.55, 1.82),   # stretch: 0.55:1 (tall) → 1.82:1 (wide)
+        scale=(0.50, 0.90),
+        ratio=(0.55, 1.82),
         interpolation=cv2.INTER_LINEAR,
         p=1.0,
     ),
     A.ShiftScaleRotate(
-        shift_limit=0.10,     # ±10% translation offset
-        scale_limit=0.0,      # no additional scale (handled above)
-        rotate_limit=0,       # no rotation
+        shift_limit=0.10,
+        scale_limit=0.0,
+        rotate_limit=0,
         border_mode=cv2.BORDER_REPLICATE,
         p=0.6,
     ),
 ])
 
 def augment_dataset(dataset_dir: Path, classes: list, n_copies: int = AUG_COPIES):
-    """Generate n_copies augmented images per original training image for each class."""
     for cls in classes:
-        folder = dataset_dir / "train" / cls
+        folder    = dataset_dir / "train" / cls
         originals = [p for p in sorted(folder.glob("*.*"))
                      if not p.stem.startswith("_")]
         count = 0
-        for p in originals:
+        for p in tqdm(originals, desc=f"[Augment] {cls}", unit="img"):
             img = cv2.imread(str(p))
             if img is None:
                 continue
@@ -112,42 +109,45 @@ def augment_dataset(dataset_dir: Path, classes: list, n_copies: int = AUG_COPIES
                 aug = _TRANSFORM(image=img)["image"]
                 cv2.imwrite(str(folder / f"_aug_{p.stem}_{k:02d}.png"), aug)
                 count += 1
-        print(f"[Augment] {cls}: +{count} images → total {len(originals) + count}")
+        print(f"[Augment] {cls}: +{count} → total {len(originals)+count}", flush=True)
 
-# ── Run preprocessing pipeline ────────────────────────────────────────────────
-# Order: SMOTE first (balances NoText), then augment both classes so synthetic
-# samples also receive geometric variation.
-apply_smote(DATASET_DIR, minority="NoText", majority="Text")
-augment_dataset(DATASET_DIR, classes=["Text", "NoText"])
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Run preprocessing ─────────────────────────────────────────────────────────
+apply_smote(WORK_DIR, minority="NoText", majority="Text")
+augment_dataset(WORK_DIR, classes=["Text", "NoText"])
 
+# ── Train ─────────────────────────────────────────────────────────────────────
 model = YOLO(MODEL)
 
 model.train(
-    data=str(DATASET_DIR),
+    data=str(WORK_DIR),
     imgsz=IMG_SIZE,
     epochs=EPOCHS,
-    batch=BATCH_SIZE,
+    batch=BATCH,
     project=PROJECT,
     name=NAME,
 
-    # Colour jitter — unchanged
+    # Colour jitter
     hsv_h=0.015,
     hsv_s=0.1,
     hsv_v=0.1,
 
-    # Geometric — YOLO's built-in kept minimal; heavy geometric variation is
-    # handled by the pre-generated augmented images above.
+    # Geometric (light — heavy variation handled by pre-augmented images)
     degrees=0.0,
     translate=0.05,
     scale=0.05,
     fliplr=0.0,
     flipud=0.0,
 
-    lr0=0.01,
-    optimizer="AdamW",
+    # Regularisation — anti-overfit
+    freeze=10,             # freeze backbone, train head only
+    erasing=0.4,           # random erase patches — forces partial-mark robustness
+    mixup=0.15,            # blend two images — prevents texture memorisation
+    weight_decay=0.001,    # L2 regularisation (up from default 0.0005)
     dropout=0.2,
     label_smoothing=0.1,
+
+    lr0=0.001,             # lower LR for fine-tuning pretrained backbone
+    optimizer="AdamW",
 
     save=True,
     pretrained=True,

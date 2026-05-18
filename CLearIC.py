@@ -576,10 +576,10 @@ class Detector:
 # CELL GRID CONSTANTS
 # =========================================================
 _CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
-_CELL_EXPAND    = 1.1   # each cell expanded after slicing (overlapping neighbours)
+_CELL_EXPAND    = 1.2   # each cell expanded after slicing (overlapping neighbours)
 _COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
-_GRID_MARGIN_TOP = 10.0  # % of shrunk IC height — dead band before row 1
-_GRID_MARGIN_BOT = 10.0  # % of shrunk IC height — dead band after row 3
+_GRID_MARGIN_TOP = 0.0  # % of shrunk IC height — dead band before row 1
+_GRID_MARGIN_BOT = 15.0  # % of shrunk IC height — dead band after row 3
 
 # Dataset collection (used only when COLLECT_DATASET = True)
 _DATA_DIR   = "Dataset"
@@ -739,7 +739,7 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)
         x_end   = min(x + w, img_w)
 
-        full_bin = _adaptive_binary(image_bgr[y_start:y_end, x:x_end])
+        full_bin = _adaptive_binary(image_bgr)[y_start:y_end, x:x_end]
         strip_h  = 0  # y - y_start  # top strip disabled; patch starts at IC top
 
         return full_bin, strip_h
@@ -901,9 +901,8 @@ class TemplateMatcher:
         mx, my, score = self._match_in_roi(filtered, self._patch, self._ic_x, exp_y)
 
         if score < self._threshold:
-            raise TemplateError(
-                f"Match score {score:.3f} < {self._threshold:.3f} — "
-                "IC rotation or misalignment detected")
+            print(f"[TemplateMatcher] Low match score {score:.3f} < {self._threshold:.3f} — "
+                  "using best-match position anyway")
 
         ic_y = my + self._strip_h
         ic_x = mx

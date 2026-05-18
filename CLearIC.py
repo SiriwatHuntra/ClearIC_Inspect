@@ -40,26 +40,6 @@ import cv2
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-try:
-    import serial as _serial
-    _ser = _serial.Serial(port='/dev/ttyUSB0', baudrate=38400,
-                          parity=_serial.PARITY_NONE,
-                          stopbits=_serial.STOPBITS_ONE,
-                          bytesize=_serial.EIGHTBITS, timeout=1)
-    print('[IO] Serial port OK')
-except Exception:
-    _ser = None
-    print('[IO] Serial device not found')
-
-# =========================================================
-# MODULE-LEVEL CONFIG ALIASES  (populated from Config.json via main())
-# =========================================================
-DEBUG           = True
-IO              = False
-MODE            = "DEBUG"
-DIR_INPUT       = "Input/"
-OUT_DIR         = "Output/"
-COLLECT_DATASET = False
 
 # =========================================================
 # CONFIG LOADER
@@ -146,6 +126,12 @@ class ConfigLoader:
             raise ConfigError("COLLECT_DATASET must be a boolean")
         if not isinstance(cfg["LOG_RETENTION"], int) or cfg["LOG_RETENTION"] < 1:
             raise ConfigError("LOG_RETENTION must be a positive integer")
+        if not isinstance(cfg["TRIGGER_SETTLE_MS"], (int, float)) or cfg["TRIGGER_SETTLE_MS"] < 0:
+            raise ConfigError("TRIGGER_SETTLE_MS must be a non-negative number")
+        for pin_key in ("GPIO_START_PIN", "GPIO_DONE_PIN", "GPIO_BUSY_PIN",
+                        "GPIO_LOT_END_PIN", "GPIO_FAIL_A_PIN", "GPIO_FAIL_B_PIN"):
+            if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
+                raise ConfigError(f"{pin_key} must be a BCM pin number (1–27)")
         return cfg
 
     @classmethod
@@ -423,8 +409,9 @@ class Camera:
 # =========================================================
 class RaspberryIO:
     """
-    BCM-mode GPIO handler.
+    BCM-mode GPIO handler with serial lighting controller.
     Falls back to mock logging when IO=False or RPi.GPIO unavailable.
+    Serial port (/dev/ttyUSB0) is opened only when io_enabled=True.
     """
 
     def __init__(self, io_enabled: bool = True,
@@ -435,6 +422,7 @@ class RaspberryIO:
         self._enabled             = io_enabled
         self._gpio_ok             = False
         self._GPIO                = None
+        self._ser                 = None
         self._start_pin           = start_pin
         self._done_pin            = done_pin
         self._busy_pin            = busy_pin
@@ -463,6 +451,18 @@ class RaspberryIO:
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
             raise GPIOError(f"GPIO init failed: {e}")
+
+        try:
+            import serial as _serial
+            self._ser = _serial.Serial(
+                port='/dev/ttyUSB0', baudrate=38400,
+                parity=_serial.PARITY_NONE,
+                stopbits=_serial.STOPBITS_ONE,
+                bytesize=_serial.EIGHTBITS, timeout=1)
+            print("[IO] Serial port OK")
+        except Exception:
+            self._ser = None
+            print("[IO] Serial device not found")
 
     def _out(self, pin: int, high: bool, pin_name: str = ""):
         if self._gpio_ok:
@@ -979,6 +979,44 @@ class TemplateMatcher:
         ic_y = my + self._strip_h
         ic_x = mx
         return QtCore.QRect(ic_x, ic_y, self._ic_w, self._ic_h), score
+
+def _find_second_ic(image_bgr: np.ndarray,
+                    ref_rect: QtCore.QRect,
+                    conf_thr: float = 0.4) -> tuple:
+    """
+    Search the opposite image half for a second IC using the ref_rect crop as a
+    template.  Preprocessing matches extract_patches (bilateral → Otsu binary).
+
+    Returns (QRect, score).  QRect is None if score < conf_thr.
+    """
+    x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
+    img_h, img_w = image_bgr.shape[:2]
+
+    binary = _adaptive_binary(image_bgr)
+
+    ty1, ty2 = max(0, y), min(img_h, y + h)
+    tx1, tx2 = max(0, x), min(img_w, x + w)
+    template = binary[ty1:ty2, tx1:tx2]
+    if template.size == 0:
+        return None, 0.0
+
+    mid = img_w // 2
+    if (x + w // 2) < mid:   # ref is on left → search right half
+        search   = binary[:, mid:]
+        x_offset = mid
+    else:                     # ref is on right → search left half
+        search   = binary[:, :mid]
+        x_offset = 0
+
+    if search.shape[1] < template.shape[1] or search.shape[0] < template.shape[0]:
+        return None, 0.0
+
+    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv2.minMaxLoc(result)
+
+    if score >= conf_thr:
+        return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
+    return None, float(score)
 
 # =========================================================
 # INSPECTOR
@@ -1527,6 +1565,21 @@ class ImageView(QtWidgets.QLabel):
 # =========================================================
 # RUN WORKER
 # =========================================================
+def _output_paths(img_id: str, out_dir: str = "Output/") -> tuple:
+    """
+    Returns (real_path, annotated_path) for today's date-based output folders.
+      date/RealImg/img_id.jpg   — raw image
+      date/Image/img_id.jpg     — annotated image
+    Creates directories on first call.
+    """
+    date     = datetime.now().strftime("%Y%m%d")
+    real_dir = os.path.join(out_dir, date, "RealImg")
+    ann_dir  = os.path.join(out_dir, date, "Image")
+    os.makedirs(real_dir, exist_ok=True)
+    os.makedirs(ann_dir,  exist_ok=True)
+    return (os.path.join(real_dir, f"{img_id}.jpg"),
+            os.path.join(ann_dir,  f"{img_id}.jpg"))
+
 class RunWorker(QtCore.QThread):
     """
     Background inspection loop.
@@ -1652,7 +1705,7 @@ class RunWorker(QtCore.QThread):
             img_id = _next_image_id()
 
             # Save raw before any processing
-            real_path, ann_path = _output_paths(img_id)
+            real_path, ann_path = _output_paths(img_id, self._cfg.get("OUT_DIR", "Output/"))
             cv2.imwrite(real_path, img_bgr)
 
             self.sig_status.emit("Inspecting…")
@@ -1768,67 +1821,8 @@ class RunWorker(QtCore.QThread):
         self.sig_status.emit("Standby.")
 
 # =========================================================
-# SETUP HELPERS
-# =========================================================
-def _find_second_ic(image_bgr: np.ndarray,
-                    ref_rect: QtCore.QRect,
-                    conf_thr: float = 0.4) -> tuple:
-    """
-    Search the opposite image half for a second IC using the ref_rect crop as a
-    template.  Preprocessing matches extract_patches (bilateral → Otsu binary).
-
-    Returns (QRect, score).  QRect is None if score < conf_thr.
-    """
-    x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
-    img_h, img_w = image_bgr.shape[:2]
-
-    binary = _adaptive_binary(image_bgr)
-
-    # Crop template from ref IC position (clamped to image bounds)
-    ty1, ty2 = max(0, y), min(img_h, y + h)
-    tx1, tx2 = max(0, x), min(img_w, x + w)
-    template = binary[ty1:ty2, tx1:tx2]
-    if template.size == 0:
-        return None, 0.0
-
-    # Search in opposite half
-    mid = img_w // 2
-    if (x + w // 2) < mid:   # ref is on left → search right half
-        search   = binary[:, mid:]
-        x_offset = mid
-    else:                     # ref is on right → search left half
-        search   = binary[:, :mid]
-        x_offset = 0
-
-    if search.shape[1] < template.shape[1] or search.shape[0] < template.shape[0]:
-        return None, 0.0
-
-    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-    _, score, _, loc = cv2.minMaxLoc(result)
-
-    if score >= conf_thr:
-        return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
-    return None, float(score)
-
-# =========================================================
 # MAIN WINDOW
 # =========================================================
-def _output_paths(img_id: str) -> tuple:
-    """
-    Returns (real_path, annotated_path) for today's date-based output folders.
-      date/RealImg/img_id.jpg   — raw image
-      date/Image/img_id.jpg     — annotated image
-    Creates directories on first call.
-    """
-    prefix = OUT_DIR
-    date     = datetime.now().strftime("%Y%m%d")
-    real_dir = os.path.join(prefix, date, "RealImg")
-    ann_dir  = os.path.join(prefix, date, "Image")
-    os.makedirs(real_dir, exist_ok=True)
-    os.makedirs(ann_dir,  exist_ok=True)
-    return (os.path.join(real_dir, f"{img_id}.jpg"),
-            os.path.join(ann_dir,  f"{img_id}.jpg"))
-
 class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, cfg: dict):
@@ -2525,14 +2519,6 @@ def main():
     except ConfigError as e:
         print(f"[Config] {e}")
         sys.exit(1)
-
-    global DEBUG, IO, MODE, DIR_INPUT, OUT_DIR, COLLECT_DATASET
-    DEBUG           = bool(cfg.get("DEBUG", True))
-    IO              = bool(cfg.get("IO", False))
-    MODE            = str(cfg.get("MODE", "DEBUG"))
-    DIR_INPUT       = str(cfg.get("DIR_INPUT", "Input/"))
-    OUT_DIR         = str(cfg.get("OUT_DIR", "Output/"))
-    COLLECT_DATASET = bool(cfg.get("COLLECT_DATASET", False))
 
     os.makedirs(cfg.get("LOG_DIR", "logs"), exist_ok=True)
     os.makedirs("templates", exist_ok=True)

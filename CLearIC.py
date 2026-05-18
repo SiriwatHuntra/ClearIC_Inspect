@@ -40,6 +40,17 @@ import cv2
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
+try:
+    import serial as _serial
+    _ser = _serial.Serial(port='/dev/ttyUSB0', baudrate=38400,
+                          parity=_serial.PARITY_NONE,
+                          stopbits=_serial.STOPBITS_ONE,
+                          bytesize=_serial.EIGHTBITS, timeout=1)
+    print('[IO] Serial port OK')
+except Exception:
+    _ser = None
+    print('[IO] Serial device not found')
+
 # =========================================================
 # MODULE-LEVEL CONFIG ALIASES  (populated from Config.json via main())
 # =========================================================
@@ -80,11 +91,13 @@ class ConfigLoader:
         # GPIO pins
         "GPIO_START_PIN":       17,
         "GPIO_DONE_PIN":        27,
-        "GPIO_ACK_PIN":         22,
+        "GPIO_BUSY_PIN":        23,
+        "GPIO_LOT_END_PIN":     18,
         "GPIO_FAIL_A_PIN":      24,
         "GPIO_FAIL_B_PIN":      25,
         "MOCK_START_DELAY_MS":  200,
         "MOCK_DONE_DELAY_MS":   100,
+        "TRIGGER_SETTLE_MS":    50,
         # Cell grid geometry
         "CELL_SHRINK":          0.95,
         "CELL_EXPAND":          1.2,
@@ -415,7 +428,8 @@ class RaspberryIO:
     """
 
     def __init__(self, io_enabled: bool = True,
-                 start_pin: int = 17, done_pin: int = 27, ack_pin: int = 22,
+                 start_pin: int = 17, done_pin: int = 27,
+                 busy_pin: int = 23, lot_end_pin: int = 18,
                  fail_a_pin: int = 24, fail_b_pin: int = 25,
                  mock_start_delay_ms: int = 200, mock_done_delay_ms: int = 100):
         self._enabled             = io_enabled
@@ -423,7 +437,8 @@ class RaspberryIO:
         self._GPIO                = None
         self._start_pin           = start_pin
         self._done_pin            = done_pin
-        self._ack_pin             = ack_pin
+        self._busy_pin            = busy_pin
+        self._lot_end_pin         = lot_end_pin
         self._fail_a_pin          = fail_a_pin
         self._fail_b_pin          = fail_b_pin
         self._mock_start_delay_ms = mock_start_delay_ms
@@ -438,11 +453,12 @@ class RaspberryIO:
             self._GPIO = GPIO
             GPIO.setwarnings(False)
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self._start_pin,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            GPIO.setup(self._done_pin,   GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            GPIO.setup(self._ack_pin,    GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(self._fail_a_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(self._fail_b_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._start_pin,   GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
+            GPIO.setup(self._done_pin,    GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
+            GPIO.setup(self._lot_end_pin, GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
+            GPIO.setup(self._busy_pin,    GPIO.OUT, initial=GPIO.LOW)           # idle = LOW
+            GPIO.setup(self._fail_a_pin,  GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._fail_b_pin,  GPIO.OUT, initial=GPIO.LOW)
             self._gpio_ok = True
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
@@ -461,18 +477,22 @@ class RaspberryIO:
     def set_fail_b(self, v: bool):
         self._out(self._fail_b_pin, v, "FAIL_B_PIN")
 
-    def pulse_ack(self, ms: int = 50):
-        self._out(self._ack_pin, True,  "ACK_PIN")
-        time.sleep(ms / 1000.0)
-        self._out(self._ack_pin, False, "ACK_PIN")
+    def set_busy(self, v: bool):
+        self._out(self._busy_pin, v, "BUSY_PIN")
+
+    def is_lot_end_signaled(self) -> bool:
+        """Non-blocking: True if LOT_END_PIN is currently LOW. Always False in mock mode."""
+        if not self._gpio_ok:
+            return False
+        return self._GPIO.input(self._lot_end_pin) == self._GPIO.LOW
 
     def clear_outputs(self):
-        self._out(self._ack_pin,    False, "ACK_PIN")
+        self._out(self._busy_pin,   False, "BUSY_PIN")
         self._out(self._fail_a_pin, False, "FAIL_A_PIN")
         self._out(self._fail_b_pin, False, "FAIL_B_PIN")
 
     def wait_for_start(self, stop_flag_fn) -> bool:
-        """Block until START_PIN rising edge or stop_flag_fn() returns True."""
+        """Block until START_PIN goes LOW (active LOW) or stop_flag_fn() returns True."""
         if not self._gpio_ok:
             deadline = time.monotonic() + self._mock_start_delay_ms / 1000
             while time.monotonic() < deadline:
@@ -485,15 +505,15 @@ class RaspberryIO:
             return True
         GPIO = self._GPIO
         while not stop_flag_fn():
-            if GPIO.input(self._start_pin) == GPIO.HIGH:
-                time.sleep(0.005)
-                if GPIO.input(self._start_pin) == GPIO.HIGH:
+            if GPIO.input(self._start_pin) == GPIO.LOW:
+                time.sleep(0.05)                        # 50ms debounce
+                if GPIO.input(self._start_pin) == GPIO.LOW:
                     return True
             time.sleep(0.005)
         return False
 
     def wait_for_done(self, stop_flag_fn) -> bool:
-        """Block until DONE_PIN rising edge or stop_flag_fn() returns True."""
+        """Block until DONE_PIN goes LOW (active LOW) or stop_flag_fn() returns True."""
         if not self._gpio_ok:
             deadline = time.monotonic() + self._mock_done_delay_ms / 1000
             while time.monotonic() < deadline:
@@ -506,28 +526,28 @@ class RaspberryIO:
             return True
         GPIO = self._GPIO
         while not stop_flag_fn():
-            if GPIO.input(self._done_pin) == GPIO.HIGH:
-                time.sleep(0.005)
-                if GPIO.input(self._done_pin) == GPIO.HIGH:
+            if GPIO.input(self._done_pin) == GPIO.LOW:
+                time.sleep(0.05)                        # 50ms debounce
+                if GPIO.input(self._done_pin) == GPIO.LOW:
                     return True
             time.sleep(0.005)
         return False
 
     def is_done_signaled(self) -> bool:
-        """Non-blocking: True if DONE_PIN is currently HIGH. Always False in mock mode."""
+        """Non-blocking: True if DONE_PIN is currently LOW (active LOW). Always False in mock mode."""
         if not self._gpio_ok:
             return False
-        return self._GPIO.input(self._done_pin) == self._GPIO.HIGH
+        return self._GPIO.input(self._done_pin) == self._GPIO.LOW
 
     def drain_start_pin(self, timeout_ms: int = 500):
-        """Wait until START_PIN is LOW (or timeout) to discard stale HIGH after resume."""
+        """Wait until START_PIN returns HIGH (idle) to discard stale LOW after resume."""
         if not self._gpio_ok:
             print("[IO MOCK] drain_start_pin")
             return
         GPIO = self._GPIO
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
-            if not GPIO.input(self._start_pin):
+            if GPIO.input(self._start_pin) == GPIO.HIGH:
                 return
             time.sleep(0.01)
 
@@ -1551,6 +1571,19 @@ class RunWorker(QtCore.QThread):
         self._drain_needed.set()   # BUSY guard: drain stale START_PIN after resume
         self._running.set()
 
+    def _handle_lot_end(self):
+        """Move NG images to a timestamped archive folder and emit session reset."""
+        import shutil
+        out_dir = self._cfg.get("OUT_DIR", "Output/")
+        ng_src  = os.path.join(out_dir, "NGPIC")
+        if os.path.isdir(ng_src) and os.listdir(ng_src):
+            stamp   = datetime.now().strftime("%Y%m%d%H%M%S")
+            ng_dest = os.path.join(out_dir, "ImageNG", stamp)
+            os.makedirs(ng_dest, exist_ok=True)
+            for f in os.listdir(ng_src):
+                shutil.move(os.path.join(ng_src, f), os.path.join(ng_dest, f))
+        self.sig_session_reset.emit()
+
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
         io_mock  = not self._cfg.get("IO", False)
@@ -1572,12 +1605,26 @@ class RunWorker(QtCore.QThread):
 
             # ── Wait for next cycle trigger ──────────────────────────
             if cam_mode == "camera":
-                # Production: wait for GPIO START_PIN rising edge
+                # Check lot-end pin before waiting for start
+                if self._gpio.is_lot_end_signaled():
+                    time.sleep(0.05)
+                    if self._gpio.is_lot_end_signaled():
+                        self.sig_status.emit("Lot end — saving NG images…")
+                        self._handle_lot_end()
+
+                # Production: wait for GPIO START_PIN active LOW
                 self.sig_status.emit("Waiting for START signal…")
                 if not self._gpio.wait_for_start(lambda: self._stop):
                     break
                 if self._stop:
                     break
+
+                # Tray settled — assert BUSY before grab
+                self._gpio.set_busy(True)
+
+                settle_ms = self._cfg.get("TRIGGER_SETTLE_MS", 0)
+                if settle_ms > 0:
+                    time.sleep(settle_ms / 1000.0)
             else:
                 # Auto directory: brief yield, then check DONE_PIN / Stop
                 time.sleep(0.05)
@@ -1625,10 +1672,10 @@ class RunWorker(QtCore.QThread):
 
                 cv2.imwrite(ann_path, img_bgr)
 
-                # GPIO: both FAIL pins LOW → pulse ACK
+                # GPIO: both FAIL pins LOW → BUSY LOW (result ready)
                 self._gpio.set_fail_a(False)
                 self._gpio.set_fail_b(False)
-                self._gpio.pulse_ack()
+                self._gpio.set_busy(False)
 
             except MarkMissingError as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
@@ -1645,10 +1692,10 @@ class RunWorker(QtCore.QThread):
 
                 cv2.imwrite(ann_path, img_bgr)
 
-                # GPIO: set FAIL pins then pulse ACK
+                # GPIO: set FAIL pins → BUSY LOW (result ready)
                 self._gpio.set_fail_a(bool(e.missing_a))
                 self._gpio.set_fail_b(bool(e.missing_b))
-                self._gpio.pulse_ack()
+                self._gpio.set_busy(False)
 
             except TemplateError as e:
                 # Rotation/misalignment rejection — signal machine FAIL for both ICs,
@@ -1668,7 +1715,7 @@ class RunWorker(QtCore.QThread):
 
                 self._gpio.set_fail_a(True)
                 self._gpio.set_fail_b(True)
-                self._gpio.pulse_ack()
+                self._gpio.set_busy(False)
 
                 if debug:
                     print(f"[RunWorker] Alignment rejected: {e}")
@@ -2081,7 +2128,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 io_enabled=cfg.get("IO", False),
                 start_pin=cfg.get("GPIO_START_PIN", 17),
                 done_pin=cfg.get("GPIO_DONE_PIN", 27),
-                ack_pin=cfg.get("GPIO_ACK_PIN", 22),
+                busy_pin=cfg.get("GPIO_BUSY_PIN", 23),
+                lot_end_pin=cfg.get("GPIO_LOT_END_PIN", 18),
                 fail_a_pin=cfg.get("GPIO_FAIL_A_PIN", 24),
                 fail_b_pin=cfg.get("GPIO_FAIL_B_PIN", 25),
                 mock_start_delay_ms=cfg.get("MOCK_START_DELAY_MS", 200),

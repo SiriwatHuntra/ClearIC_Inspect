@@ -41,16 +41,14 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 # =========================================================
-# HARDCODED DEV FLAGS  (edit here before running — not in Config.json)
+# MODULE-LEVEL CONFIG ALIASES  (populated from Config.json via main())
 # =========================================================
-DEBUG     = True      # verbose logs, annotated output
-IO        = False     # True = drive GPIO / False = mock (log only)
-MODE      = "DEBUG"   # "DEBUG" or "RUN"
-DIR_INPUT = "Input/"   # input image folder for CAMERA="directory" mode
-OUT_DIR   = "Output/" # Output image foler for annotated results (created on first run)
-MODEL_PATH          = "Text_cls-2/best_openvino_model/best.xml"       # YOLO-cls classifier (cell inspection)
-TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"               # (unused — kept for reference only)
-COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retraining
+DEBUG           = True
+IO              = False
+MODE            = "DEBUG"
+DIR_INPUT       = "Input/"
+OUT_DIR         = "Output/"
+COLLECT_DATASET = False
 
 # =========================================================
 # CONFIG LOADER
@@ -58,27 +56,64 @@ COLLECT_DATASET = False  # True = save cropped cell images to dataset/ for retra
 class ConfigLoader:
     CONFIG_FILE = "Config.json"
     DEFAULT_CONFIG = {
-        "CAMERA":              "directory",
-        "CONF_THR":            0.5,
-        "TEXT_MIN_CONF":       0.80,
-        "BLANK_CELL_STD_THR":  0.0,
-        "CAMERA_SERIAL":       "",
-        "EXPOSURE_US":         8000,
+        # Camera / detection
+        "CAMERA":               "directory",
+        "CONF_THR":             0.5,
+        "TEXT_MIN_CONF":        0.80,
+        "BLANK_CELL_STD_THR":   0.0,
+        "NMS_IOU_THR":          0.45,
+        "CAMERA_SERIAL":        "",
+        "EXPOSURE_US":          8000,
+        # Dev flags
+        "DEBUG":                True,
+        "IO":                   False,
+        "MODE":                 "DEBUG",
+        "COLLECT_DATASET":      False,
+        "DIR_INPUT":            "Input/",
+        "OUT_DIR":              "Output/",
+        "MODEL_PATH":           "Text_cls-2/best_openvino_model/best.xml",
+        "TEMPLATE_MODEL_PATH":  "IC_Search_openvino_model/IC_Search.xml",
+        # Camera tuning
+        "CAMERA_WARMUP_FRAMES": 5,
+        "CAMERA_RETRY_DELAY":   0.2,
+        "CAMERA_RETRIES":       2,
+        # GPIO pins
+        "GPIO_START_PIN":       17,
+        "GPIO_DONE_PIN":        27,
+        "GPIO_ACK_PIN":         22,
+        "GPIO_FAIL_A_PIN":      24,
+        "GPIO_FAIL_B_PIN":      25,
+        "MOCK_START_DELAY_MS":  200,
+        "MOCK_DONE_DELAY_MS":   100,
+        # Cell grid geometry
+        "CELL_SHRINK":          0.95,
+        "CELL_EXPAND":          1.2,
+        "COL_GAP_PCT":          40.0,
+        "GRID_MARGIN_TOP":      0.0,
+        "GRID_MARGIN_BOT":      15.0,
+        # Dataset collection
+        "DATA_DIR":             "Dataset",
+        "DATA_SPLIT":           "train",
+        # Logging
+        "LOG_DIR":              "logs",
+        "LOG_RETENTION":        365,
+        # Annotation settings (non-color)
+        "ANN_BORDER_PX":        1,
+        "ANN_SHOW_LABELS":      True,
+        "WARMUP_FRAMES":        5,
     }
     _VALID_CAMERA = {"camera", "directory"}
 
     @classmethod
     def load(cls) -> dict:
         if not os.path.exists(cls.CONFIG_FILE):
-            cls.save(cls.DEFAULT_CONFIG)
-            return dict(cls.DEFAULT_CONFIG)
+            raise ConfigError("Config.json not found — create it before running.")
         try:
             with open(cls.CONFIG_FILE, "r") as f:
                 data = json.load(f)
         except Exception as e:
             raise ConfigError(f"Config.json unreadable: {e}")
         cfg = dict(cls.DEFAULT_CONFIG)
-        # Only apply keys that belong in Config.json (ignore dev flags if present)
         for k in cls.DEFAULT_CONFIG:
             if k in data:
                 cfg[k] = data[k]
@@ -90,12 +125,30 @@ class ConfigLoader:
             raise ConfigError("TEXT_MIN_CONF must be in (0, 1]")
         if not (0.0 <= cfg["BLANK_CELL_STD_THR"] <= 255.0):
             raise ConfigError("BLANK_CELL_STD_THR must be in [0, 255]")
+        if not isinstance(cfg["DEBUG"], bool):
+            raise ConfigError("DEBUG must be a boolean")
+        if not isinstance(cfg["IO"], bool):
+            raise ConfigError("IO must be a boolean")
+        if not isinstance(cfg["COLLECT_DATASET"], bool):
+            raise ConfigError("COLLECT_DATASET must be a boolean")
+        if not isinstance(cfg["LOG_RETENTION"], int) or cfg["LOG_RETENTION"] < 1:
+            raise ConfigError("LOG_RETENTION must be a positive integer")
         return cfg
 
     @classmethod
     def save(cls, data: dict):
         with open(cls.CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)
+
+    @classmethod
+    def update(cls, updates: dict):
+        """Merge partial updates into saved config. Only known keys are accepted."""
+        cfg = cls.load()
+        for k, v in updates.items():
+            if k in cls.DEFAULT_CONFIG:
+                cfg[k] = v
+        cls.save(cfg)
+        return cfg
 
 # =========================================================
 # STAGE & ERROR FLAGS
@@ -171,10 +224,6 @@ class Image:
 # =========================================================
 # CAMERA
 # =========================================================
-_CAMERA_WARMUP_FRAMES = 5
-_CAMERA_RETRY_DELAY   = 0.2
-_CAMERA_RETRIES       = 2
-
 class Camera:
     """
     Unified camera source.
@@ -183,11 +232,16 @@ class Camera:
     """
 
     def __init__(self, mode: str, serial: str = "",
-                 exposure_us: int = 8000, input_dir: str = "Input"):
+                 exposure_us: int = 8000, input_dir: str = "Input",
+                 retry_delay: float = 0.2, retries: int = 2,
+                 warmup_frames: int = 5):
         self._mode        = mode
         self._serial      = serial
         self._exposure_us = exposure_us
         self._input_dir   = input_dir
+        self._retry_delay = retry_delay
+        self._retries     = retries
+        self._warmup_frames = warmup_frames
 
         self._camera      = None
         self._pylon       = None
@@ -252,7 +306,7 @@ class Camera:
     # ---- grab ----
     def grab(self) -> np.ndarray:
         """Return BGR ndarray or raise CameraError."""
-        for attempt in range(_CAMERA_RETRIES + 1):
+        for attempt in range(self._retries + 1):
             try:
                 img = self._grab_once()
                 if img is not None:
@@ -260,8 +314,8 @@ class Camera:
             except CameraError:
                 raise
             except Exception as e:
-                if attempt < _CAMERA_RETRIES:
-                    time.sleep(_CAMERA_RETRY_DELAY)
+                if attempt < self._retries:
+                    time.sleep(self._retry_delay)
                 else:
                     raise CameraError(f"Grab failed after retries: {e}")
         raise CameraError("Grab returned None after retries")
@@ -302,12 +356,12 @@ class Camera:
     # ---- misc ----
     def warmup(self):
         if self._mode == "camera":
-            for _ in range(_CAMERA_WARMUP_FRAMES):
+            for _ in range(self._warmup_frames):
                 try:
                     self._grab_basler()
                 except Exception:
                     pass
-            print(f"[Camera] Warmup done ({_CAMERA_WARMUP_FRAMES} frames).")
+            print(f"[Camera] Warmup done ({self._warmup_frames} frames).")
 
     def set_exposure(self, us: int):
         self._exposure_us = int(us)
@@ -354,26 +408,26 @@ class Camera:
 # =========================================================
 # RASPBERRY IO
 # =========================================================
-START_PIN  = 17
-DONE_PIN   = 27
-ACK_PIN    = 22
-FAIL_A_PIN = 24
-FAIL_B_PIN = 25
-
-# Mock-mode self-pulse delays (IO=False). Replace with real IO when hardware is ready.
-_MOCK_START_DELAY_MS = 200   # simulated delay before START_PIN fires each cycle
-_MOCK_DONE_DELAY_MS  = 100   # simulated delay after ACK before DONE_PIN fires
-
 class RaspberryIO:
     """
     BCM-mode GPIO handler.
     Falls back to mock logging when IO=False or RPi.GPIO unavailable.
     """
 
-    def __init__(self, io_enabled: bool = True):
-        self._enabled = io_enabled
-        self._gpio_ok = False
-        self._GPIO    = None
+    def __init__(self, io_enabled: bool = True,
+                 start_pin: int = 17, done_pin: int = 27, ack_pin: int = 22,
+                 fail_a_pin: int = 24, fail_b_pin: int = 25,
+                 mock_start_delay_ms: int = 200, mock_done_delay_ms: int = 100):
+        self._enabled             = io_enabled
+        self._gpio_ok             = False
+        self._GPIO                = None
+        self._start_pin           = start_pin
+        self._done_pin            = done_pin
+        self._ack_pin             = ack_pin
+        self._fail_a_pin          = fail_a_pin
+        self._fail_b_pin          = fail_b_pin
+        self._mock_start_delay_ms = mock_start_delay_ms
+        self._mock_done_delay_ms  = mock_done_delay_ms
 
         if not io_enabled:
             print("[IO] IO=False — mock mode.")
@@ -384,11 +438,11 @@ class RaspberryIO:
             self._GPIO = GPIO
             GPIO.setwarnings(False)
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(START_PIN,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            GPIO.setup(DONE_PIN,   GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-            GPIO.setup(ACK_PIN,    GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(FAIL_A_PIN, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(FAIL_B_PIN, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._start_pin,  GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
+            GPIO.setup(self._done_pin,   GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
+            GPIO.setup(self._ack_pin,    GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._fail_a_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._fail_b_pin, GPIO.OUT, initial=GPIO.LOW)
             self._gpio_ok = True
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
@@ -402,26 +456,25 @@ class RaspberryIO:
             print(f"[IO MOCK] {pin_name or pin} → {state}")
 
     def set_fail_a(self, v: bool):
-        self._out(FAIL_A_PIN, v, "FAIL_A_PIN")
+        self._out(self._fail_a_pin, v, "FAIL_A_PIN")
 
     def set_fail_b(self, v: bool):
-        self._out(FAIL_B_PIN, v, "FAIL_B_PIN")
+        self._out(self._fail_b_pin, v, "FAIL_B_PIN")
 
     def pulse_ack(self, ms: int = 50):
-        self._out(ACK_PIN, True,  "ACK_PIN")
+        self._out(self._ack_pin, True,  "ACK_PIN")
         time.sleep(ms / 1000.0)
-        self._out(ACK_PIN, False, "ACK_PIN")
+        self._out(self._ack_pin, False, "ACK_PIN")
 
     def clear_outputs(self):
-        self._out(ACK_PIN,    False, "ACK_PIN")
-        self._out(FAIL_A_PIN, False, "FAIL_A_PIN")
-        self._out(FAIL_B_PIN, False, "FAIL_B_PIN")
+        self._out(self._ack_pin,    False, "ACK_PIN")
+        self._out(self._fail_a_pin, False, "FAIL_A_PIN")
+        self._out(self._fail_b_pin, False, "FAIL_B_PIN")
 
     def wait_for_start(self, stop_flag_fn) -> bool:
         """Block until START_PIN rising edge or stop_flag_fn() returns True."""
         if not self._gpio_ok:
-            # Mock: self-pulse after _MOCK_START_DELAY_MS, honouring stop requests.
-            deadline = time.monotonic() + _MOCK_START_DELAY_MS / 1000
+            deadline = time.monotonic() + self._mock_start_delay_ms / 1000
             while time.monotonic() < deadline:
                 if stop_flag_fn():
                     return False
@@ -432,9 +485,9 @@ class RaspberryIO:
             return True
         GPIO = self._GPIO
         while not stop_flag_fn():
-            if GPIO.input(START_PIN) == GPIO.HIGH:
+            if GPIO.input(self._start_pin) == GPIO.HIGH:
                 time.sleep(0.005)
-                if GPIO.input(START_PIN) == GPIO.HIGH:
+                if GPIO.input(self._start_pin) == GPIO.HIGH:
                     return True
             time.sleep(0.005)
         return False
@@ -442,8 +495,7 @@ class RaspberryIO:
     def wait_for_done(self, stop_flag_fn) -> bool:
         """Block until DONE_PIN rising edge or stop_flag_fn() returns True."""
         if not self._gpio_ok:
-            # Mock: self-pulse after _MOCK_DONE_DELAY_MS, honouring stop requests.
-            deadline = time.monotonic() + _MOCK_DONE_DELAY_MS / 1000
+            deadline = time.monotonic() + self._mock_done_delay_ms / 1000
             while time.monotonic() < deadline:
                 if stop_flag_fn():
                     return False
@@ -454,9 +506,9 @@ class RaspberryIO:
             return True
         GPIO = self._GPIO
         while not stop_flag_fn():
-            if GPIO.input(DONE_PIN) == GPIO.HIGH:
+            if GPIO.input(self._done_pin) == GPIO.HIGH:
                 time.sleep(0.005)
-                if GPIO.input(DONE_PIN) == GPIO.HIGH:
+                if GPIO.input(self._done_pin) == GPIO.HIGH:
                     return True
             time.sleep(0.005)
         return False
@@ -465,7 +517,7 @@ class RaspberryIO:
         """Non-blocking: True if DONE_PIN is currently HIGH. Always False in mock mode."""
         if not self._gpio_ok:
             return False
-        return self._GPIO.input(DONE_PIN) == self._GPIO.HIGH
+        return self._GPIO.input(self._done_pin) == self._GPIO.HIGH
 
     def drain_start_pin(self, timeout_ms: int = 500):
         """Wait until START_PIN is LOW (or timeout) to discard stale HIGH after resume."""
@@ -475,7 +527,7 @@ class RaspberryIO:
         GPIO = self._GPIO
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
-            if not GPIO.input(START_PIN):
+            if not GPIO.input(self._start_pin):
                 return
             time.sleep(0.01)
 
@@ -499,10 +551,10 @@ class Detector:
     Output shape: [1, 2]  — index 0 = NoText, index 1 = Text
     """
 
-    MODEL_XML = MODEL_PATH
-
     def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80,
-                 blank_cell_std_thr: float = 0.0, **_):
+                 blank_cell_std_thr: float = 0.0,
+                 model_path: str = "Text_cls-2/best_openvino_model/best.xml",
+                 **_):
         self._conf_thr           = conf_thr
         self._text_min_conf      = text_min_conf
         self._blank_cell_std_thr = blank_cell_std_thr
@@ -510,16 +562,17 @@ class Detector:
         self._ready    = False
         try:
             import openvino as ov
-            if not os.path.exists(self.MODEL_XML):
-                raise ModelError(f"Model not found: {self.MODEL_XML}")
+            self._model_xml = model_path
+            if not os.path.exists(self._model_xml):
+                raise ModelError(f"Model not found: {self._model_xml}")
             core  = ov.Core()
-            model = core.read_model(self.MODEL_XML)
+            model = core.read_model(self._model_xml)
             self._compiled = core.compile_model(model, "CPU", {
                 "INFERENCE_PRECISION_HINT": "f32",
                 "PERFORMANCE_HINT":         "LATENCY",
             })
             self._ready = True
-            print(f"[Detector] OpenVINO classifier loaded: {self.MODEL_XML}")
+            print(f"[Detector] OpenVINO classifier loaded: {self._model_xml}")
         except ModelError:
             raise
         except Exception as e:
@@ -572,18 +625,7 @@ class Detector:
         """Stub — classifier cannot detect IC positions. Draw IC areas in Setup to create template."""
         return []
 
-# =========================================================
-# CELL GRID CONSTANTS
-# =========================================================
-_CELL_SHRINK    = 0.95   # IC rect shrunk before slicing (keeps grid off raw edges)
-_CELL_EXPAND    = 1.2   # each cell expanded after slicing (overlapping neighbours)
-_COL_GAP_PCT    = 40.0   # column gap as % of (shrunk) IC width
-_GRID_MARGIN_TOP = 0.0  # % of shrunk IC height — dead band before row 1
-_GRID_MARGIN_BOT = 15.0  # % of shrunk IC height — dead band after row 3
-
-# Dataset collection (used only when COLLECT_DATASET = True)
-_DATA_DIR   = "Dataset"
-_DATA_SPLIT = "train"    # "train" | "val" | "test"
+# Dataset collection run counter
 _data_run_counter = 0
 _dataset_lock     = threading.Lock()
 
@@ -591,15 +633,12 @@ _dataset_lock     = threading.Lock()
 _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 # =========================================================
-# VISUAL SETTINGS  (live-editable from the Settings panel)
+# VISUAL CONSTANTS  (fixed — not configurable at runtime)
 # =========================================================
-_ann_border_px   = 1           # ROI cell border thickness (px)
-_ann_show_labels = True        # draw R{row}C{col} inside each cell
-_ann_color_ok    = "#00C800"   # hex — Text  / PASS cell border
-_ann_color_ng    = "#DD0000"   # hex — NoText / FAIL cell border
-_tmpl_color_a    = "#FFD700"   # hex — IC_A overlay in setup view
-_tmpl_color_b    = "#00E5FF"   # hex — IC_B overlay in setup view
-_warmup_frames   = 5           # classifier warmup passes on startup
+_ann_color_ok = "#00C800"   # hex — Text  / PASS cell border
+_ann_color_ng = "#DD0000"   # hex — NoText / FAIL cell border
+_tmpl_color_a = "#FFD700"   # hex — IC_A overlay in setup view
+_tmpl_color_b = "#00E5FF"   # hex — IC_B overlay in setup view
 
 def _hex_to_bgr(h: str) -> tuple:
     """Convert '#RRGGBB' hex string to OpenCV BGR 3-tuple."""
@@ -612,35 +651,39 @@ def _valid_hex(s: str) -> bool:
     return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
 
 
-def _build_cells(x: int, y: int, w: int, h: int) -> list:
+def _build_cells(x: int, y: int, w: int, h: int,
+                 cell_shrink: float = 0.95, cell_expand: float = 1.2,
+                 col_gap_pct: float = 40.0,
+                 grid_margin_top: float = 0.0,
+                 grid_margin_bot: float = 15.0) -> list:
     """
     Build the 3-row × 2-col cell list for one IC bounding rect.
 
     Steps:
-      1. Apply horizontal shrink (_CELL_SHRINK, L/R) and independent
-         vertical margins (_GRID_MARGIN_TOP / _GRID_MARGIN_BOT, top/bot).
-      2. Slice the resulting rect into a 3×2 grid with _COL_GAP_PCT applied.
-      3. Expand every cell by _CELL_EXPAND (centred), so adjacent cells
+      1. Apply horizontal shrink (cell_shrink, L/R) and independent
+         vertical margins (grid_margin_top / grid_margin_bot, top/bot).
+      2. Slice the resulting rect into a 3×2 grid with col_gap_pct applied.
+      3. Expand every cell by cell_expand (centred), so adjacent cells
          overlap — text marks near a boundary are covered by both cells.
     """
     # Step 1 — shrink (centred)
-    sw = max(1, int(w * _CELL_SHRINK))
-    sh = max(1, int(h * _CELL_SHRINK))
+    sw = max(1, int(w * cell_shrink))
+    sh = max(1, int(h * cell_shrink))
     sx = x + (w - sw) // 2
     sy = y + (h - sh) // 2
 
     # Step 2 — vertical margins then 3×2 grid on usable area
-    usable_y0 = sy + int(sh * _GRID_MARGIN_TOP / 100.0)
-    usable_y1 = sy + sh - int(sh * _GRID_MARGIN_BOT / 100.0)
+    usable_y0 = sy + int(sh * grid_margin_top / 100.0)
+    usable_y1 = sy + sh - int(sh * grid_margin_bot / 100.0)
     usable_h  = max(1, usable_y1 - usable_y0)
-    col_gap   = int(sw * _COL_GAP_PCT / 100.0)
+    col_gap   = int(sw * col_gap_pct / 100.0)
     cw        = max(1, (sw - col_gap) // 2)
     ch        = max(1, usable_h // 3)
     col_starts = [sx, sx + cw + col_gap]
 
     # Step 3 — expand each cell (centred)
-    exp_w = max(1, int(cw * _CELL_EXPAND))
-    exp_h = max(1, int(ch * _CELL_EXPAND))
+    exp_w = max(1, int(cw * cell_expand))
+    exp_h = max(1, int(ch * cell_expand))
     dw    = (exp_w - cw) // 2
     dh    = (exp_h - ch) // 2
 
@@ -653,7 +696,8 @@ def _build_cells(x: int, y: int, w: int, h: int) -> list:
     return cells
 
 def _save_cell_crops(image_bgr: np.ndarray, cells: list,
-                     cell_hits: list, ic_label: str, run_num: int):
+                     cell_hits: list, ic_label: str, run_num: int,
+                     data_dir: str = "Dataset", data_split: str = "train"):
     """
     Save each ROI cell crop to Dataset/<split>/Text/ or .../NoText/.
     Called only when COLLECT_DATASET = True.
@@ -662,7 +706,7 @@ def _save_cell_crops(image_bgr: np.ndarray, cells: list,
     ih, iw = image_bgr.shape[:2]
     for idx, (cx, cy, cw, ch) in enumerate(cells):
         class_name = "Text" if cell_hits[idx] else "NoText"
-        folder = os.path.join(_DATA_DIR, _DATA_SPLIT, class_name)
+        folder = os.path.join(data_dir, data_split, class_name)
         os.makedirs(folder, exist_ok=True)
         x1, y1 = max(0, cx),       max(0, cy)
         x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
@@ -826,10 +870,18 @@ class TemplateManager:
         cv2.imwrite(_TEMPLATE_PREVIEW, preview)
 
     @staticmethod
-    def compute_rois(template: dict) -> tuple:
+    def compute_rois(template: dict, grid_cfg: dict | None = None) -> tuple:
         """Returns (ic_a_cells, ic_b_cells) — list of 6 (x,y,w,h) per IC."""
+        g = grid_cfg or {}
         def _cells(box: dict) -> list:
-            return _build_cells(box["x"], box["y"], box["w"], box["h"])
+            return _build_cells(
+                box["x"], box["y"], box["w"], box["h"],
+                cell_shrink=g.get("CELL_SHRINK", 0.95),
+                cell_expand=g.get("CELL_EXPAND", 1.2),
+                col_gap_pct=g.get("COL_GAP_PCT", 40.0),
+                grid_margin_top=g.get("GRID_MARGIN_TOP", 0.0),
+                grid_margin_bot=g.get("GRID_MARGIN_BOT", 15.0),
+            )
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
 # =========================================================
@@ -918,12 +970,28 @@ class Inspector:
     """
 
     def __init__(self, detector: Detector, template: dict,
-                 template_matcher: "TemplateMatcher | None" = None):
+                 template_matcher: "TemplateMatcher | None" = None,
+                 cell_shrink: float = 0.95, cell_expand: float = 1.2,
+                 col_gap_pct: float = 40.0,
+                 grid_margin_top: float = 0.0, grid_margin_bot: float = 15.0,
+                 collect_dataset: bool = False,
+                 data_dir: str = "Dataset", data_split: str = "train",
+                 ann_border_px: int = 1, ann_show_labels: bool = True):
         self._detector         = detector
         self._template         = template
         self._template_matcher = template_matcher
         self._ic_b_dx = template["ic_b"]["x"] - template["ic_a"]["x"]
         self._ic_b_dy = template["ic_b"]["y"] - template["ic_a"]["y"]
+        self._cell_shrink     = cell_shrink
+        self._cell_expand     = cell_expand
+        self._col_gap_pct     = col_gap_pct
+        self._grid_margin_top = grid_margin_top
+        self._grid_margin_bot = grid_margin_bot
+        self._collect_dataset = collect_dataset
+        self._data_dir        = data_dir
+        self._data_split      = data_split
+        self._ann_border_px   = ann_border_px
+        self._ann_show_labels = ann_show_labels
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -935,7 +1003,13 @@ class Inspector:
         Phase 1 — locate IC_A via TemplateMatcher (preferred) or fixed template coords.
         Phase 2 — crop each ROI cell and classify as Text / NoText.
         """
-        tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template)
+        _gcfg = {
+            "CELL_SHRINK": self._cell_shrink, "CELL_EXPAND": self._cell_expand,
+            "COL_GAP_PCT": self._col_gap_pct,
+            "GRID_MARGIN_TOP": self._grid_margin_top,
+            "GRID_MARGIN_BOT": self._grid_margin_bot,
+        }
+        tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template, _gcfg)
         annotated = image_bgr  # draw in-place; caller saves raw before calling inspect()
 
         # Phase 1: locate ICs
@@ -964,23 +1038,27 @@ class Inspector:
         missing_a, hits_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
         missing_b, hits_b = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
 
-        if COLLECT_DATASET:
+        if self._collect_dataset:
             global _data_run_counter
             with _dataset_lock:
                 _data_run_counter += 1
                 run_num = _data_run_counter
-            _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", run_num)
-            _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", run_num)
+            _save_cell_crops(image_bgr, ic_a_cells, hits_a, "A", run_num,
+                             self._data_dir, self._data_split)
+            _save_cell_crops(image_bgr, ic_b_cells, hits_b, "B", run_num,
+                             self._data_dir, self._data_split)
 
         if missing_a or missing_b:
             raise MarkMissingError(missing_a, missing_b, annotated)
 
         return True, True, [], [], annotated
 
-    @staticmethod
-    def _rect_to_cells(rect: QtCore.QRect) -> list:
+    def _rect_to_cells(self, rect: QtCore.QRect) -> list:
         """Divide a QRect into a shrunk+expanded 3-row × 2-col cell grid."""
-        return _build_cells(rect.x(), rect.y(), rect.width(), rect.height())
+        return _build_cells(rect.x(), rect.y(), rect.width(), rect.height(),
+                            self._cell_shrink, self._cell_expand,
+                            self._col_gap_pct,
+                            self._grid_margin_top, self._grid_margin_bot)
 
     def _check_ic(self, image_bgr: np.ndarray, cells: list,
                   annotated: np.ndarray, debug: bool) -> tuple:
@@ -1015,8 +1093,8 @@ class Inspector:
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
                           (min(iw, cx + cw), min(ih, cy + ch)),
-                          color, _ann_border_px)
-            if _ann_show_labels:
+                          color, self._ann_border_px)
+            if self._ann_show_labels:
                 label = f"R{row}C{col}"
                 (tw, th), _ = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
@@ -1031,13 +1109,11 @@ class Inspector:
 # =========================================================
 # LOGGER
 # =========================================================
-_LOG_DIR = "logs"
-_LOG_RETENTION = 365
-
 class Logger:
 
-    def __init__(self, log_dir: str = _LOG_DIR):
+    def __init__(self, log_dir: str = "logs", log_retention: int = 365):
         self._dir         = log_dir
+        self._retention   = log_retention
         self._session_log: str | None = None
         os.makedirs(log_dir, exist_ok=True)
         self._rotate()
@@ -1048,7 +1124,7 @@ class Logger:
 
     def _rotate(self):
         logs = sorted(glob.glob(os.path.join(self._dir, "inspect_*.log")))
-        while len(logs) > _LOG_RETENTION:
+        while len(logs) > self._retention:
             try:
                 os.remove(logs.pop(0))
             except OSError:
@@ -1477,8 +1553,8 @@ class RunWorker(QtCore.QThread):
 
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
-        io_mock  = not IO
-        debug    = DEBUG
+        io_mock  = not self._cfg.get("IO", False)
+        debug    = self._cfg.get("DEBUG", True)
 
         # Camera preflight — verify camera is reachable before entering the loop.
         if cam_mode == "camera":
@@ -1545,7 +1621,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
                     img_id, "PASS", [], "PASS", [],
-                    cycle_ms, MODE, io_mock)
+                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
 
                 cv2.imwrite(ann_path, img_bgr)
 
@@ -1565,7 +1641,7 @@ class RunWorker(QtCore.QThread):
                     img_id,
                     "FAIL" if e.missing_a else "PASS", e.missing_a,
                     "FAIL" if e.missing_b else "PASS", e.missing_b,
-                    cycle_ms, MODE, io_mock)
+                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
 
                 cv2.imwrite(ann_path, img_bgr)
 
@@ -1588,7 +1664,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_cycle_ms.emit(cycle_ms)
                 self._logger.log_inspection(
                     img_id, "FAIL", all_cells, "FAIL", all_cells,
-                    cycle_ms, MODE, io_mock)
+                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
 
                 self._gpio.set_fail_a(True)
                 self._gpio.set_fail_b(True)
@@ -1715,7 +1791,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._camera:    Camera | None  = None
         self._detector:  Detector | None = None
         self._gpio       = None
-        self._logger            = Logger()
+        self._logger            = Logger(
+            log_dir=cfg.get("LOG_DIR", "logs"),
+            log_retention=int(cfg.get("LOG_RETENTION", 365)))
         self._worker:           RunWorker | None        = None
 
         self._stats_pass  = 0
@@ -1887,33 +1965,17 @@ class MainWindow(QtWidgets.QMainWindow):
             row.addWidget(widget)
             parent.addLayout(row)
 
-        self._input_warmup = QtWidgets.QLineEdit(str(_warmup_frames))
+        self._input_warmup = QtWidgets.QLineEdit(str(self._cfg.get("WARMUP_FRAMES", 5)))
         self._input_warmup.setFixedWidth(52)
         _srow(settings_lay, "Warmup frames", self._input_warmup)
 
-        self._input_border = QtWidgets.QLineEdit(str(_ann_border_px))
+        self._input_border = QtWidgets.QLineEdit(str(self._cfg.get("ANN_BORDER_PX", 1)))
         self._input_border.setFixedWidth(52)
         _srow(settings_lay, "Border thickness (px)", self._input_border)
 
         self._chk_labels = QtWidgets.QCheckBox("Show cell labels")
-        self._chk_labels.setChecked(_ann_show_labels)
+        self._chk_labels.setChecked(bool(self._cfg.get("ANN_SHOW_LABELS", True)))
         settings_lay.addWidget(self._chk_labels)
-
-        self._input_color_ok = QtWidgets.QLineEdit(_ann_color_ok)
-        self._input_color_ok.setFixedWidth(80)
-        _srow(settings_lay, "PASS cell color", self._input_color_ok)
-
-        self._input_color_ng = QtWidgets.QLineEdit(_ann_color_ng)
-        self._input_color_ng.setFixedWidth(80)
-        _srow(settings_lay, "FAIL cell color", self._input_color_ng)
-
-        self._input_color_a = QtWidgets.QLineEdit(_tmpl_color_a)
-        self._input_color_a.setFixedWidth(80)
-        _srow(settings_lay, "IC_A overlay color", self._input_color_a)
-
-        self._input_color_b = QtWidgets.QLineEdit(_tmpl_color_b)
-        self._input_color_b.setFixedWidth(80)
-        _srow(settings_lay, "IC_B overlay color", self._input_color_b)
 
         btn_apply = QtWidgets.QPushButton("Apply")
         btn_apply.clicked.connect(self._apply_settings)
@@ -1978,39 +2040,25 @@ class MainWindow(QtWidgets.QMainWindow):
     # Settings apply
     # ----------------------------------------------------------
     def _apply_settings(self):
-        global _ann_border_px, _ann_show_labels
-        global _ann_color_ok, _ann_color_ng
-        global _tmpl_color_a, _tmpl_color_b, _warmup_frames
+        try:
+            wf = max(1, int(self._input_warmup.text()))
+        except ValueError:
+            wf = self._cfg.get("WARMUP_FRAMES", 5)
+            self._input_warmup.setText(str(wf))
 
         try:
-            _warmup_frames = max(1, int(self._input_warmup.text()))
+            bp = max(1, int(self._input_border.text()))
         except ValueError:
-            self._input_warmup.setText(str(_warmup_frames))
+            bp = self._cfg.get("ANN_BORDER_PX", 1)
+            self._input_border.setText(str(bp))
 
-        try:
-            _ann_border_px = max(1, int(self._input_border.text()))
-        except ValueError:
-            self._input_border.setText(str(_ann_border_px))
+        show_labels = self._chk_labels.isChecked()
 
-        _ann_show_labels = self._chk_labels.isChecked()
+        self._cfg.update({"WARMUP_FRAMES": wf, "ANN_BORDER_PX": bp,
+                          "ANN_SHOW_LABELS": show_labels})
+        ConfigLoader.save(self._cfg)
 
-        for attr, field in [
-            ("_ann_color_ok", self._input_color_ok),
-            ("_ann_color_ng", self._input_color_ng),
-            ("_tmpl_color_a", self._input_color_a),
-            ("_tmpl_color_b", self._input_color_b),
-        ]:
-            val = field.text().strip()
-            if not val.startswith("#"):
-                val = "#" + val
-            if _valid_hex(val):
-                globals()[attr] = val
-            else:
-                field.setText(globals()[attr])
-
-        print(f"[Settings] border={_ann_border_px}px  labels={_ann_show_labels}  "
-              f"ok={_ann_color_ok}  ng={_ann_color_ng}  "
-              f"ic_a={_tmpl_color_a}  ic_b={_tmpl_color_b}  warmup={_warmup_frames}")
+        print(f"[Settings] border={bp}px  labels={show_labels}  warmup={wf}")
 
     # ----------------------------------------------------------
     # System init
@@ -2022,12 +2070,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 conf_thr=cfg.get("CONF_THR", 0.5),
                 text_min_conf=cfg.get("TEXT_MIN_CONF", 0.80),
                 blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
+                model_path=cfg.get("MODEL_PATH",
+                                   "Text_cls-2/best_openvino_model/best.xml"),
             )
         except ModelError as e:
             self._show_error(f"Classifier model load failed: {e}")
 
         try:
-            self._gpio = RaspberryIO(io_enabled=IO)
+            self._gpio = RaspberryIO(
+                io_enabled=cfg.get("IO", False),
+                start_pin=cfg.get("GPIO_START_PIN", 17),
+                done_pin=cfg.get("GPIO_DONE_PIN", 27),
+                ack_pin=cfg.get("GPIO_ACK_PIN", 22),
+                fail_a_pin=cfg.get("GPIO_FAIL_A_PIN", 24),
+                fail_b_pin=cfg.get("GPIO_FAIL_B_PIN", 25),
+                mock_start_delay_ms=cfg.get("MOCK_START_DELAY_MS", 200),
+                mock_done_delay_ms=cfg.get("MOCK_DONE_DELAY_MS", 100),
+            )
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
 
@@ -2036,7 +2095,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 mode=cfg.get("CAMERA", "directory"),
                 serial=cfg.get("CAMERA_SERIAL", ""),
                 exposure_us=cfg.get("EXPOSURE_US", 8000),
-                input_dir=DIR_INPUT,
+                input_dir=cfg.get("DIR_INPUT", "Input/"),
+                retry_delay=cfg.get("CAMERA_RETRY_DELAY", 0.2),
+                retries=cfg.get("CAMERA_RETRIES", 2),
+                warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
             )
             self._camera.open()
         except CameraError as e:
@@ -2045,7 +2107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._camera and cfg.get("CAMERA") == "camera":
             self._camera.warmup()
         if self._detector and self._detector.is_ready():
-            self._detector.warmup(frames=_warmup_frames)
+            self._detector.warmup(frames=cfg.get("WARMUP_FRAMES", 5))
 
         # Load and display first image on startup (no overlays yet)
         if self._camera:
@@ -2217,7 +2279,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._session_start_time = time.monotonic()
 
-        mode = "DEBUG" if DEBUG else "RUN"
+        mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
         self._logger.start_session(mode)
 
         # IC localization via TemplateMatcher when patch exists; else fixed template coords.
@@ -2233,7 +2295,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
             )
 
-        inspector = Inspector(self._detector, tmpl, template_matcher=matcher)
+        inspector = Inspector(
+            self._detector, tmpl, template_matcher=matcher,
+            cell_shrink=self._cfg.get("CELL_SHRINK", 0.95),
+            cell_expand=self._cfg.get("CELL_EXPAND", 1.2),
+            col_gap_pct=self._cfg.get("COL_GAP_PCT", 40.0),
+            grid_margin_top=self._cfg.get("GRID_MARGIN_TOP", 0.0),
+            grid_margin_bot=self._cfg.get("GRID_MARGIN_BOT", 15.0),
+            collect_dataset=self._cfg.get("COLLECT_DATASET", False),
+            data_dir=self._cfg.get("DATA_DIR", "Dataset"),
+            data_split=self._cfg.get("DATA_SPLIT", "train"),
+            ann_border_px=self._cfg.get("ANN_BORDER_PX", 1),
+            ann_show_labels=self._cfg.get("ANN_SHOW_LABELS", True),
+        )
         gpio      = self._gpio or RaspberryIO(io_enabled=False)
 
         self._worker = RunWorker(
@@ -2299,7 +2373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_fail.setText("0")
         self._lbl_error.setText("0")
         self._session_start_time = time.monotonic()
-        self._logger.start_session("DEBUG" if DEBUG else "RUN")
+        self._logger.start_session("DEBUG" if self._cfg.get("DEBUG", True) else "RUN")
 
     def _on_run_done(self):
         """Called when the worker loop exits (Stop pressed)."""
@@ -2404,13 +2478,22 @@ def main():
         print(f"[Config] {e}")
         sys.exit(1)
 
-    os.makedirs(_LOG_DIR,   exist_ok=True)
+    global DEBUG, IO, MODE, DIR_INPUT, OUT_DIR, COLLECT_DATASET
+    DEBUG           = bool(cfg.get("DEBUG", True))
+    IO              = bool(cfg.get("IO", False))
+    MODE            = str(cfg.get("MODE", "DEBUG"))
+    DIR_INPUT       = str(cfg.get("DIR_INPUT", "Input/"))
+    OUT_DIR         = str(cfg.get("OUT_DIR", "Output/"))
+    COLLECT_DATASET = bool(cfg.get("COLLECT_DATASET", False))
+
+    os.makedirs(cfg.get("LOG_DIR", "logs"), exist_ok=True)
     os.makedirs("templates", exist_ok=True)
-    os.makedirs(DIR_INPUT,   exist_ok=True)
-    if COLLECT_DATASET:
-        os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "Text"),   exist_ok=True)
-        os.makedirs(os.path.join(_DATA_DIR, _DATA_SPLIT, "NoText"), exist_ok=True)
-        print(f"[Dataset] Collection ON → {_DATA_DIR}/{_DATA_SPLIT}/")
+    os.makedirs(cfg.get("DIR_INPUT", "Input/"), exist_ok=True)
+    if cfg.get("COLLECT_DATASET", False):
+        _dd, _ds = cfg.get("DATA_DIR", "Dataset"), cfg.get("DATA_SPLIT", "train")
+        os.makedirs(os.path.join(_dd, _ds, "Text"),   exist_ok=True)
+        os.makedirs(os.path.join(_dd, _ds, "NoText"), exist_ok=True)
+        print(f"[Dataset] Collection ON → {_dd}/{_ds}/")
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)

@@ -1805,13 +1805,6 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_setup.setStyleSheet("font-weight:bold;font-size:13px")
         setup_lay.addWidget(lbl_setup)
 
-        lbl_exp = QtWidgets.QLabel("Exposure (µs)")
-        lbl_exp.setStyleSheet("font-weight:bold")
-        setup_lay.addWidget(lbl_exp)
-        self._input_exposure = QtWidgets.QLineEdit(
-            str(self._cfg.get("EXPOSURE_US", 8000)))
-        setup_lay.addWidget(self._input_exposure)
-
         self._lbl_tmpl_status = QtWidgets.QLabel("No template saved.")
         self._lbl_tmpl_status.setStyleSheet(
             "font-size:11px;color:#E2FDFF;padding:4px 0px;")
@@ -2165,10 +2158,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_detect_confirmed(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         self._view.clear_overlays()
-        try:
-            exposure = int(self._input_exposure.text())
-        except ValueError:
-            exposure = 8000
+        exposure = int(self._cfg.get("EXPOSURE_US", 8000))
 
         patch_saved = False
         strip_h_val = 0

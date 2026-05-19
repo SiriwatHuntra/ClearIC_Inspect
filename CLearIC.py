@@ -1559,7 +1559,7 @@ class ImageView(QtWidgets.QLabel):
             return
         h, w = self._orig.shape[:2]
         rgb  = cv2.cvtColor(self._orig, cv2.COLOR_BGR2RGB)
-        qi   = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        qi   = QtGui.QImage(bytes(rgb.data), w, h, 3 * w, QtGui.QImage.Format_RGB888)
         pix  = QtGui.QPixmap.fromImage(qi)
         pix  = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
                           QtCore.Qt.SmoothTransformation)
@@ -2082,11 +2082,16 @@ class ThumbnailWorker(QtCore.QThread):
             img = cv2.imread(path)
             if img is None:
                 continue
-            img = cv2.resize(img, (self._thumb_w, self._thumb_h))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = img.shape
-            qimg = QtGui.QImage(img.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
-            self.sig_thumb.emit(idx, QtGui.QPixmap.fromImage(qimg))
+            qimg = QtGui.QImage(bytes(img.data), w, h, ch * w,
+                                QtGui.QImage.Format_RGB888)
+            # Scale to fit the thumbnail box while keeping the image's own aspect ratio
+            pix = QtGui.QPixmap.fromImage(qimg).scaled(
+                self._thumb_w, self._thumb_h,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation)
+            self.sig_thumb.emit(idx, pix)
         self.sig_done.emit()
 
 
@@ -2109,8 +2114,9 @@ class ImageCard(QtWidgets.QFrame):
             card_bg = "#478B8D"
         else:
             card_bg = "#788BFF"
-        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
-        self.setStyleSheet(f"background:{card_bg};border-radius:5px;")
+        # Scoped selector: only this QFrame, not child labels
+        self.setStyleSheet(
+            f"QFrame#image_card{{background:{card_bg};border-radius:5px;}}")
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -2119,11 +2125,11 @@ class ImageCard(QtWidgets.QFrame):
         self._thumb = QtWidgets.QLabel()
         self._thumb.setFixedSize(thumb_w, thumb_h)
         self._thumb.setAlignment(QtCore.Qt.AlignCenter)
-        self._thumb.setStyleSheet("")
+        self._thumb.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         lay.addWidget(self._thumb)
 
         name_lbl = QtWidgets.QLabel(filename)
-        name_lbl.setStyleSheet("font-size:9px;color:#E2FDFF")
+        name_lbl.setStyleSheet("font-size:9px;color:#E2FDFF;background:transparent;")
         name_lbl.setAlignment(QtCore.Qt.AlignCenter)
         metrics = QtGui.QFontMetrics(name_lbl.font())
         elided  = metrics.elidedText(filename, QtCore.Qt.ElideMiddle, card_w - 6)
@@ -2156,6 +2162,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._subfolder      = "RealImg"    # "RealImg" or "Image"
         self._suffix_filter  = "_NG"        # "_NG", "_G", or "" (all)
         self._cards: list    = []
+        self._current_base: str = ""
         self._thumb_worker: ThumbnailWorker | None = None
         self._scan_worker:  FolderScanWorker | None = None
 
@@ -2184,14 +2191,17 @@ class ImageBrowserPage(QtWidgets.QWidget):
         grid_page = QtWidgets.QWidget()
         grid_lay  = QtWidgets.QVBoxLayout(grid_page)
         grid_lay.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea{border:none;background:transparent}")
         self._grid_area = QtWidgets.QWidget()
-        self._grid_area.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
-                                      QtWidgets.QSizePolicy.Expanding)
         self._grid_layout = QtWidgets.QGridLayout(self._grid_area)
         self._grid_layout.setSpacing(6)
-        self._grid_layout.setAlignment(
-            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
-        grid_lay.addWidget(self._grid_area)
+        self._grid_layout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self._scroll.setWidget(self._grid_area)
+        grid_lay.addWidget(self._scroll, stretch=1)
         self._stack.addWidget(grid_page)   # index 0
 
         # Stack index 1: image page
@@ -2276,23 +2286,28 @@ class ImageBrowserPage(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(150, self._rebuild_grid)
 
     def _card_size(self, n_images: int):
-        """Calculate card/thumbnail dimensions so all rows fit with no scrollbar."""
+        """Calculate card/thumbnail dimensions so all rows fit in the viewport."""
+        vp_w = self._scroll.viewport().width()
+        vp_h = self._scroll.viewport().height()
+        if vp_w < 4 or vp_h < 4:    # not yet laid out — return safe defaults
+            return 100, 96, 96, 72
+
         n_rows = max(1, math.ceil(n_images / self._COLS))
         sp     = self._grid_layout.horizontalSpacing()
+        sp_v   = self._grid_layout.verticalSpacing()
 
-        # Width: 4 cards fill available width
-        w_avail = max(1, self._grid_area.width()  - sp * (self._COLS - 1) - 4)
+        # Width: 4 cards fill viewport width
+        w_avail = max(1, vp_w - sp * (self._COLS - 1) - 4)
         card_w  = max(60, w_avail // self._COLS)
 
-        # Height: all rows visible without scrolling
-        sp_v    = self._grid_layout.verticalSpacing()
-        h_avail = max(1, self._grid_area.height() - sp_v * (n_rows - 1) - 4)
+        # Height: all rows fit in viewport height
+        h_avail = max(1, vp_h - sp_v * (n_rows - 1) - 4)
         card_h  = max(50, h_avail // n_rows)
 
-        # Thumbnail inside card (2px margin, 20px filename label)
+        # Thumbnail area fills card minus 2px margin and 22px filename label
         thumb_w = card_w - 4
-        thumb_h = min(card_h - 22, int(thumb_w * 0.75))  # cap at 4:3 ratio
-        card_h  = thumb_h + 22
+        thumb_h = max(1, card_h - 22)
+        # card_h already set above — no ratio cap; Qt scales the image within the box
 
         return card_w, card_h, max(1, thumb_w), max(1, thumb_h)
 
@@ -2416,15 +2431,15 @@ class ImageBrowserPage(QtWidgets.QWidget):
         if not self._paths:
             return
         self._cur_idx = max(0, min(idx, len(self._paths) - 1))
+        # Switch to image page FIRST so _img_view has its real size when _refresh fires
+        self._stack.setCurrentIndex(1)
+        self._btn_back.show()
         path = self._paths[self._cur_idx]
         img  = cv2.imread(path)
         if img is not None:
             self._img_view.set_image(img)
-        fname = os.path.basename(path)
         self._lbl_nav.setText(
-            f"{self._cur_idx + 1} / {len(self._paths)}   {fname}")
-        self._stack.setCurrentIndex(1)
-        self._btn_back.show()
+            f"{self._cur_idx + 1} / {len(self._paths)}   {os.path.basename(path)}")
 
     def _step_image(self, delta: int):
         self._show_image(self._cur_idx + delta)
@@ -2437,9 +2452,8 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _on_src_toggle(self, btn):
         self._subfolder = "RealImg" if self._grp_src.id(btn) == 0 else "Image"
-        if hasattr(self, "_current_base"):
+        if self._current_base:
             self._load_folder(self._current_base)
-        # Also update image view if open
         if self._stack.currentIndex() == 1:
             self._show_image(self._cur_idx)
 

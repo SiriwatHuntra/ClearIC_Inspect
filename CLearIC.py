@@ -749,21 +749,25 @@ _TEMPLATE_FULL    = "templates/tmpl_full.npy"   # combined patch (top strip + IC
 _TEMPLATE_BOT     = "templates/tmpl_bot.npy"    # deprecated — kept for backward-compat load
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
-_CONTOUR_MIN_AREA = 30  # px² — discard noise blobs smaller than this
+def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
+    """BGR → dense adaptive-threshold binary. Used for setup-time IC auto-detection."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 21, 5)
 
 def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
-    """BGR → contour edge image for template matching.
-    Gaussian blur → Canny → filter small contours → draw on blank canvas.
-    More robust than adaptive threshold for IC pin edges under lighting variation.
+    """BGR → edge image for template matching.
+    Uses Otsu auto-threshold to drive Canny (adapts to image brightness instead of
+    fixed levels that pick up camera grain), then dilates edges so matchTemplate
+    has enough signal even with small positional shifts.
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    canvas = np.zeros_like(edges)
-    significant = [c for c in contours if cv2.contourArea(c) >= _CONTOUR_MIN_AREA]
-    cv2.drawContours(canvas, significant, -1, 255, 1)
-    return canvas
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    otsu_thr, _ = cv2.threshold(blurred, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges = cv2.Canny(blurred, otsu_thr * 0.5, otsu_thr)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    return cv2.dilate(edges, kernel, iterations=1)
 
 class TemplateManager:
 
@@ -802,25 +806,25 @@ class TemplateManager:
     @staticmethod
     def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
-        Extract a single combined patch: [IC body | bot_strip] and apply
-        contour-edge preprocessing (_contour_template).
+        Extract the pin-area patch ONLY (below the IC body):
+          patch spans [X1, Y2] → [X2, Y3]
+          where Y2 = ic bottom, Y3 = Y2 + pin_height (50% of IC height)
 
-        Strip height = IC_H * 0.5 below the IC (bot strip only; top strip disabled).
-        Returns (full_patch, strip_h) where strip_h is the pixel offset from the patch
-        top to the IC top edge (0 because patch starts at IC top).
+        Returns (patch, strip_h) where strip_h = y - y_start = -(IC height).
+        strip_h is negative because the patch starts below the IC top.
+        TemplateMatcher uses: patch_top = ic_y - strip_h  →  ic_y + IC_h  ✓
         """
         x, y = ic_rect.x(), ic_rect.y()
         w, h = ic_rect.width(), ic_rect.height()
-        h1 = max(1, int(h * 0.5))  # strip height = 50% of IC height
+        h1 = max(1, int(h * 0.5))  # pin strip height = 50% of IC height
 
         img_h, img_w = image_bgr.shape[:2]
-        # y_start = max(0, y - h1)  # top strip disabled
-        y_start = y
-        y_end   = min(img_h, y + h + h1)
+        y_start = y + h                    # Y2: IC bottom
+        y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area
         x_end   = min(x + w, img_w)
 
         full_bin = _contour_template(image_bgr)[y_start:y_end, x:x_end]
-        strip_h  = 0  # y - y_start  # top strip disabled; patch starts at IC top
+        strip_h  = y - y_start  # = -h  (patch is below IC top by IC height)
 
         return full_bin, strip_h
 
@@ -857,27 +861,26 @@ class TemplateManager:
     def save_preview(image_bgr: np.ndarray,
                      ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         """
-        Save an annotated preview image showing what the program detected:
-        - IC_A box (yellow) and IC_B box (cyan) with labels
-        - 3×2 cell grid inside each IC box
-        - Top/bottom strip ROIs used for template matching (magenta), at their
-          actual computed positions per the strip formula
+        Save an annotated preview image:
+        - IC_A (yellow) and IC_B (cyan) boxes with 3×2 cell grids and labels
+        - Magenta outline of the actual template patch region saved for IC_A
+          (IC body + 50% strip below — matches extract_patches geometry exactly)
+        - Teal overlay of the _contour_template edges within that patch region
         Saved to templates/template_preview.png for visual verification.
         """
         os.makedirs("templates", exist_ok=True)
-        img_h = image_bgr.shape[0]
+        img_h, img_w = image_bgr.shape[:2]
         preview = image_bgr.copy()
 
+        # ── IC boxes, cell grids, centre crosses ────────────────────────────
         for rect, color, label in [
-            (ic_a, (0, 255, 255), "IC_A"),   # yellow in BGR
-            (ic_b, (255, 215, 0), "IC_B"),   # cyan in BGR
+            (ic_a, (0, 255, 255), "IC_A"),
+            (ic_b, (255, 215, 0), "IC_B"),
         ]:
             x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
-            # Outer IC box
             cv2.rectangle(preview, (x, y), (x + w, y + h), color, 2)
             cv2.putText(preview, label, (x + 4, y + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            # 3×2 cell grid
             cw, ch = w // 2, h // 3
             for row in range(3):
                 for col in range(2):
@@ -886,22 +889,38 @@ class TemplateManager:
                     cv2.putText(preview, f"R{row+1}C{col+1}",
                                 (cx + 2, cy + 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
-            # Center cross at IC centroid
             cx, cy = x + w // 2, y + h // 2
             arm = max(12, min(w, h) // 6)
             cv2.line(preview, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2)
             cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
             cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
-            # Strip ROI — same geometry as extract_patches
-            h1 = max(1, int(h * 0.5))
-            y1 = max(0, y - h1)
-            y2 = max(0, min(y + h, img_h - h1))
-            cv2.rectangle(preview, (x, y1), (x + w, y1 + h1), (255, 0, 255), 2)
-            cv2.rectangle(preview, (x, y2), (x + w, y2 + h1), (255, 0, 255), 2)
-            cv2.putText(preview, "TOP leads", (x + 2, y1 + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
-            cv2.putText(preview, "BOT leads", (x + 2, y2 + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
+
+        # ── Template patch region (IC_A only) ───────────────────────────────
+        # Geometry must match extract_patches exactly: IC body + 50% strip below
+        # Pin area: [X1, Y2] → [X2, Y3], matches extract_patches geometry exactly
+        ax, ay = ic_a.x(), ic_a.y()
+        aw, ah = ic_a.width(), ic_a.height()
+        h1       = max(1, int(ah * 0.5))
+        patch_y1 = ay + ah                    # Y2: IC bottom
+        patch_y2 = min(img_h, ay + ah + h1)  # Y3: pin area bottom
+        patch_x2 = min(ax + aw, img_w)
+
+        # Magenta border showing the saved pin patch extent
+        cv2.rectangle(preview,
+                      (ax, patch_y1), (patch_x2, patch_y2),
+                      (255, 0, 255), 2)
+        cv2.putText(preview, "Pin patch",
+                    (ax + 2, patch_y2 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
+
+        # ── Contour edge overlay (teal) inside pin patch only ───────────────
+        contour_full = _contour_template(image_bgr)
+        patch_edges  = contour_full[patch_y1:patch_y2, ax:patch_x2]
+        edge_mask    = patch_edges > 0
+        roi          = preview[patch_y1:patch_y2, ax:patch_x2].astype(np.float32)
+        teal         = np.array([180, 200, 0], dtype=np.float32)  # BGR teal
+        roi[edge_mask] = roi[edge_mask] * 0.3 + teal * 0.7
+        preview[patch_y1:patch_y2, ax:patch_x2] = roi.clip(0, 255).astype(np.uint8)
 
         cv2.imwrite(_TEMPLATE_PREVIEW, preview)
 
@@ -976,9 +995,12 @@ class TemplateMatcher:
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
-        Returns (QRect, score). Raises TemplateError when score < threshold.
-        Matches the combined (top strip + IC body + bot strip) patch against the frame.
+        Returns (QRect, score).
+        Matches the pin-area patch (below IC body) against the frame.
         Searches only within ±search_margin of the expected position.
+        strip_h is negative (patch starts below IC top), so:
+          exp_patch_y = ic_y - strip_h = ic_y + IC_h
+          ic_y        = matched_patch_y + strip_h = matched_patch_y - IC_h
         """
         # Apply same preprocessing as extract_patches: Canny contour edges
         filtered = _contour_template(image_bgr)
@@ -1001,14 +1023,14 @@ def _find_second_ic(image_bgr: np.ndarray,
                     conf_thr: float = 0.4) -> tuple:
     """
     Search the opposite image half for a second IC using the ref_rect crop as a
-    template.  Preprocessing matches extract_patches (_contour_template).
+    template.  Uses dense adaptive binary (not contour) for reliable setup-time matching.
 
     Returns (QRect, score).  QRect is None if score < conf_thr.
     """
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
 
-    binary = _contour_template(image_bgr)
+    binary = _adaptive_binary(image_bgr)
 
     ty1, ty2 = max(0, y), min(img_h, y + h)
     tx1, tx2 = max(0, x), min(img_w, x + w)

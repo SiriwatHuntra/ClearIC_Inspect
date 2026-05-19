@@ -749,11 +749,21 @@ _TEMPLATE_FULL    = "templates/tmpl_full.npy"   # combined patch (top strip + IC
 _TEMPLATE_BOT     = "templates/tmpl_bot.npy"    # deprecated — kept for backward-compat load
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
-def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
-    """BGR → adaptive-threshold binary (Gaussian, 21px block) for template matching."""
+_CONTOUR_MIN_AREA = 30  # px² — discard noise blobs smaller than this
+
+def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
+    """BGR → contour edge image for template matching.
+    Gaussian blur → Canny → filter small contours → draw on blank canvas.
+    More robust than adaptive threshold for IC pin edges under lighting variation.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 21, 5)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    canvas = np.zeros_like(edges)
+    significant = [c for c in contours if cv2.contourArea(c) >= _CONTOUR_MIN_AREA]
+    cv2.drawContours(canvas, significant, -1, 255, 1)
+    return canvas
 
 class TemplateManager:
 
@@ -793,7 +803,7 @@ class TemplateManager:
     def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
         Extract a single combined patch: [IC body | bot_strip] and apply
-        adaptive-threshold preprocessing.
+        contour-edge preprocessing (_contour_template).
 
         Strip height = IC_H * 0.5 below the IC (bot strip only; top strip disabled).
         Returns (full_patch, strip_h) where strip_h is the pixel offset from the patch
@@ -809,7 +819,7 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)
         x_end   = min(x + w, img_w)
 
-        full_bin = _adaptive_binary(image_bgr)[y_start:y_end, x:x_end]
+        full_bin = _contour_template(image_bgr)[y_start:y_end, x:x_end]
         strip_h  = 0  # y - y_start  # top strip disabled; patch starts at IC top
 
         return full_bin, strip_h
@@ -970,8 +980,8 @@ class TemplateMatcher:
         Matches the combined (top strip + IC body + bot strip) patch against the frame.
         Searches only within ±search_margin of the expected position.
         """
-        # Apply same preprocessing as extract_patches: grayscale → adaptive threshold
-        filtered = _adaptive_binary(image_bgr)
+        # Apply same preprocessing as extract_patches: Canny contour edges
+        filtered = _contour_template(image_bgr)
 
         # Expected top of combined patch in image (IC_y minus the top-strip offset)
         exp_y = self._ic_y - self._strip_h
@@ -991,14 +1001,14 @@ def _find_second_ic(image_bgr: np.ndarray,
                     conf_thr: float = 0.4) -> tuple:
     """
     Search the opposite image half for a second IC using the ref_rect crop as a
-    template.  Preprocessing matches extract_patches (bilateral → Otsu binary).
+    template.  Preprocessing matches extract_patches (_contour_template).
 
     Returns (QRect, score).  QRect is None if score < conf_thr.
     """
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
 
-    binary = _adaptive_binary(image_bgr)
+    binary = _contour_template(image_bgr)
 
     ty1, ty2 = max(0, y), min(img_h, y + h)
     tx1, tx2 = max(0, x), min(img_w, x + w)
@@ -1904,8 +1914,7 @@ class RunWorker(QtCore.QThread):
             except OSError:
                 final_real = tmp_real   # rename failed, keep original name
 
-            if not tmpl_error:
-                cv2.imwrite(ann_path, ann)
+            cv2.imwrite(ann_path, ann)
 
             # ── Emit signals and log ─────────────────────────────────
             self.sig_image.emit(img_bgr)
@@ -1919,9 +1928,7 @@ class RunWorker(QtCore.QThread):
                 self._gpio.set_fail_b(False)
             else:
                 err = MarkMissingError(miss_a, miss_b, ann)
-                self.sig_fail.emit(err,
-                                   ann_path if not tmpl_error else "",
-                                   img_id)
+                self.sig_fail.emit(err, ann_path, img_id)
                 self._logger.log_inspection(
                     img_id,
                     "FAIL" if miss_a else "PASS", miss_a,
@@ -2950,9 +2957,6 @@ class MainWindow(QtWidgets.QMainWindow):
             msg += "\nPatch file saved (tmpl_full.npy)"
         msg += "\nPreview saved to templates/template_preview.png"
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
-
-        self._setup_state = 'idle'
-        self._update_setup_buttons()
 
 
     # ----------------------------------------------------------

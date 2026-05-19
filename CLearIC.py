@@ -97,6 +97,10 @@ class ConfigLoader:
         "ANN_BORDER_PX":        1,
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
+        # Template edge extraction (bilateral filter)
+        "TMPL_BILATERAL_D":           9,      # pixel neighbourhood diameter
+        "TMPL_BILATERAL_SIGMA_COLOR": 75.0,   # intensity range blended (higher = more grain suppression)
+        "TMPL_BILATERAL_SIGMA_SPACE": 75.0,   # spatial extent (coupled to d when d > 0)
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -755,17 +759,20 @@ def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY, 21, 5)
 
-def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
+def _contour_template(image_bgr: np.ndarray,
+                      bilateral_d: int = 9,
+                      sigma_color: float = 75.0,
+                      sigma_space: float = 75.0) -> np.ndarray:
     """BGR → edge image for template matching.
-    Uses Otsu auto-threshold to drive Canny (adapts to image brightness instead of
-    fixed levels that pick up camera grain), then dilates edges so matchTemplate
-    has enough signal even with small positional shifts.
+    Bilateral filter preserves structural edges while smoothing camera grain,
+    producing cleaner Canny edges than Gaussian pre-smoothing.
+    Edges are dilated so matchTemplate has signal even with small positional shifts.
     """
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    otsu_thr, _ = cv2.threshold(blurred, 0, 255,
+    gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    smoothed = cv2.bilateralFilter(gray, bilateral_d, sigma_color, sigma_space)
+    otsu_thr, _ = cv2.threshold(smoothed, 0, 255,
                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    edges = cv2.Canny(blurred, otsu_thr * 0.5, otsu_thr)
+    edges  = cv2.Canny(smoothed, otsu_thr * 0.5, otsu_thr)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     return cv2.dilate(edges, kernel, iterations=1)
 
@@ -804,7 +811,10 @@ class TemplateManager:
             json.dump(data, f, indent=2)
 
     @staticmethod
-    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
+    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect,
+                        bilateral_d: int = 9,
+                        sigma_color: float = 75.0,
+                        sigma_space: float = 75.0) -> tuple:
         """
         Extract the pin-area patch ONLY (below the IC body):
           patch spans [X1, Y2] → [X2, Y3]
@@ -823,7 +833,8 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area
         x_end   = min(x + w, img_w)
 
-        full_bin = _contour_template(image_bgr)[y_start:y_end, x:x_end]
+        full_bin = _contour_template(image_bgr,
+                                     bilateral_d, sigma_color, sigma_space)[y_start:y_end, x:x_end]
         strip_h  = y - y_start  # = -h  (patch is below IC top by IC height)
 
         return full_bin, strip_h
@@ -859,7 +870,10 @@ class TemplateManager:
 
     @staticmethod
     def save_preview(image_bgr: np.ndarray,
-                     ic_a: QtCore.QRect, ic_b: QtCore.QRect):
+                     ic_a: QtCore.QRect, ic_b: QtCore.QRect,
+                     bilateral_d: int = 9,
+                     sigma_color: float = 75.0,
+                     sigma_space: float = 75.0):
         """
         Save an annotated preview image:
         - IC_A (yellow) and IC_B (cyan) boxes with 3×2 cell grids and labels
@@ -914,7 +928,7 @@ class TemplateManager:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
 
         # ── Contour edge overlay (teal) inside pin patch only ───────────────
-        contour_full = _contour_template(image_bgr)
+        contour_full = _contour_template(image_bgr, bilateral_d, sigma_color, sigma_space)
         patch_edges  = contour_full[patch_y1:patch_y2, ax:patch_x2]
         edge_mask    = patch_edges > 0
         roi          = preview[patch_y1:patch_y2, ax:patch_x2].astype(np.float32)
@@ -956,67 +970,70 @@ class TemplateMatcher:
                  strip_h: int = 0,
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
-                 search_margin: int = 60):
-        self._patch     = full_patch
-        self._threshold = threshold
-        self._strip_h   = strip_h   # px from patch top to IC top edge
-        self._patch_w   = full_patch.shape[1]
-        self._ic_x      = ic_x   # expected IC_A left edge from template
-        self._ic_y      = ic_y   # expected IC_A top from template
-        self._ic_w      = ic_w
-        self._ic_h      = ic_h
-        self._margin    = search_margin   # px around expected pos to search
-
-    def _match_in_roi(self, filtered: np.ndarray, patch: np.ndarray,
-                      exp_x: int, exp_y: int) -> tuple:
-        """
-        Search for patch within ±margin around (exp_x, exp_y).
-        Returns (abs_x, abs_y, score). Falls back to full image if ROI is too small.
-        """
-        img_h, img_w = filtered.shape[:2]
-        ph, pw = patch.shape[:2]
-        m = self._margin
-
-        rx1 = max(0, exp_x - m)
-        ry1 = max(0, exp_y - m)
-        rx2 = min(img_w, exp_x + pw + m)
-        ry2 = min(img_h, exp_y + ph + m)
-        roi  = filtered[ry1:ry2, rx1:rx2]
-
-        if roi.shape[0] < ph or roi.shape[1] < pw:
-            # ROI too small — fall back to full-image search
-            res = cv2.matchTemplate(filtered, patch, cv2.TM_CCOEFF_NORMED)
-            _, score, _, loc = cv2.minMaxLoc(res)
-            return loc[0], loc[1], float(score)
-
-        res = cv2.matchTemplate(roi, patch, cv2.TM_CCOEFF_NORMED)
-        _, score, _, loc = cv2.minMaxLoc(res)
-        return loc[0] + rx1, loc[1] + ry1, float(score)
+                 search_margin: int = 60,
+                 bilateral_d: int = 9,
+                 sigma_color: float = 75.0,
+                 sigma_space: float = 75.0):
+        self._patch         = full_patch
+        self._threshold     = threshold
+        self._strip_h       = strip_h   # px from patch top to IC top edge
+        self._patch_w       = full_patch.shape[1]
+        self._ic_x          = ic_x   # expected IC_A left edge from template
+        self._ic_y          = ic_y   # expected IC_A top from template
+        self._ic_w          = ic_w
+        self._ic_h          = ic_h
+        self._margin        = search_margin   # px around expected pos to search
+        self._bilateral_d   = bilateral_d
+        self._sigma_color   = sigma_color
+        self._sigma_space   = sigma_space
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
         Returns (QRect, score).
         Matches the pin-area patch (below IC body) against the frame.
-        Searches only within ±search_margin of the expected position.
+        Bilateral filter is applied only to the ±search_margin ROI for speed.
         strip_h is negative (patch starts below IC top), so:
           exp_patch_y = ic_y - strip_h = ic_y + IC_h
           ic_y        = matched_patch_y + strip_h = matched_patch_y - IC_h
         """
-        # Apply same preprocessing as extract_patches: Canny contour edges
-        filtered = _contour_template(image_bgr)
-
-        # Expected top of combined patch in image (IC_y minus the top-strip offset)
+        img_h, img_w = image_bgr.shape[:2]
+        ph, pw = self._patch.shape[:2]
+        m     = self._margin
         exp_y = self._ic_y - self._strip_h
 
-        mx, my, score = self._match_in_roi(filtered, self._patch, self._ic_x, exp_y)
+        rx1 = max(0, self._ic_x - m)
+        ry1 = max(0, exp_y - m)
+        rx2 = min(img_w, self._ic_x + pw + m)
+        ry2 = min(img_h, exp_y + ph + m)
+
+        roi_bgr  = image_bgr[ry1:ry2, rx1:rx2]
+        filtered = _contour_template(roi_bgr,
+                                     self._bilateral_d,
+                                     self._sigma_color,
+                                     self._sigma_space)
+
+        if filtered.shape[0] < ph or filtered.shape[1] < pw:
+            # ROI too small — fall back to full-frame search
+            full = _contour_template(image_bgr,
+                                     self._bilateral_d,
+                                     self._sigma_color,
+                                     self._sigma_space)
+            res = cv2.matchTemplate(full, self._patch, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            ic_y = loc[1] + self._strip_h
+            return QtCore.QRect(loc[0], ic_y, self._ic_w, self._ic_h), float(score)
+
+        res = cv2.matchTemplate(filtered, self._patch, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+        abs_x = loc[0] + rx1
+        abs_y = loc[1] + ry1
+        ic_y  = abs_y + self._strip_h
 
         if score < self._threshold:
             print(f"[TemplateMatcher] Low match score {score:.3f} < {self._threshold:.3f} — "
                   "using best-match position anyway")
 
-        ic_y = my + self._strip_h
-        ic_x = mx
-        return QtCore.QRect(ic_x, ic_y, self._ic_w, self._ic_h), score
+        return QtCore.QRect(abs_x, ic_y, self._ic_w, self._ic_h), float(score)
 
 def _find_second_ic(image_bgr: np.ndarray,
                     ref_rect: QtCore.QRect,
@@ -2952,12 +2969,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view.clear_overlays()
         exposure = int(self._cfg.get("EXPOSURE_US", 8000))
 
+        bd = int(self._cfg.get("TMPL_BILATERAL_D", 9))
+        sc = float(self._cfg.get("TMPL_BILATERAL_SIGMA_COLOR", 75.0))
+        ss = float(self._cfg.get("TMPL_BILATERAL_SIGMA_SPACE", 75.0))
+
         patch_saved = False
         strip_h_val = 0
         if self._setup_image is not None:
             try:
                 full_patch, strip_h_val = \
-                    TemplateManager.extract_patches(self._setup_image, ic_a)
+                    TemplateManager.extract_patches(self._setup_image, ic_a,
+                                                   bilateral_d=bd,
+                                                   sigma_color=sc,
+                                                   sigma_space=ss)
                 TemplateManager.save_patches(full_patch)
                 patch_saved = True
             except Exception as e:
@@ -2970,7 +2994,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._setup_image is not None:
             try:
-                TemplateManager.save_preview(self._setup_image, ic_a, ic_b)
+                TemplateManager.save_preview(self._setup_image, ic_a, ic_b,
+                                             bilateral_d=bd,
+                                             sigma_color=sc,
+                                             sigma_space=ss)
             except Exception:
                 pass
 
@@ -3027,6 +3054,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 strip_h=tmpl.get("strip_h", 0),
                 ic_x=ic_a["x"], ic_y=ic_a["y"],
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
+                bilateral_d=int(self._cfg.get("TMPL_BILATERAL_D", 9)),
+                sigma_color=float(self._cfg.get("TMPL_BILATERAL_SIGMA_COLOR", 75.0)),
+                sigma_space=float(self._cfg.get("TMPL_BILATERAL_SIGMA_SPACE", 75.0)),
             )
 
         inspector = Inspector(

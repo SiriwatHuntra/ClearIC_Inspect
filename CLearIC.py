@@ -97,13 +97,6 @@ class ConfigLoader:
         "ANN_BORDER_PX":        1,
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
-        # Template edge extraction (bilateral → Sobel → Sauvola)
-        "TMPL_BILATERAL_D":           9,      # bilateral pixel neighbourhood diameter
-        "TMPL_BILATERAL_SIGMA_COLOR": 75.0,   # intensity range blended (higher = more grain suppression)
-        "TMPL_BILATERAL_SIGMA_SPACE": 75.0,   # spatial extent (coupled to d when d > 0)
-        "TMPL_SAUVOLA_K":             0.2,    # Sauvola k — lower = more edges kept
-        "TMPL_SAUVOLA_R":             64.0,   # Sauvola R — normalisation range for local std
-        "TMPL_SAUVOLA_WIN":           21,     # Sauvola window size in pixels (odd number)
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -226,6 +219,11 @@ def _next_image_id() -> str:
     with _counter_lock:
         _img_counter += 1
         return datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{_img_counter:03d}"
+
+def _reset_image_counter():
+    global _img_counter
+    with _counter_lock:
+        _img_counter = 0
 
 @dataclass
 class Image:
@@ -762,45 +760,19 @@ def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY, 21, 5)
 
-def _sauvola(gray: np.ndarray,
-             k: float = 0.2, r: float = 64.0, win: int = 21) -> np.ndarray:
-    """Sauvola local thresholding — robust to low-contrast regions and grain.
-    T(x,y) = mean * (1 + k * (std/R - 1))
-    High-std (edge) zones: threshold near mean.
-    Low-std (flat/grain) zones: threshold below mean → suppresses uniform noise.
-    """
-    g    = gray.astype(np.float32)
-    mean = cv2.boxFilter(g,    -1, (win, win))
-    sq   = cv2.boxFilter(g**2, -1, (win, win))
-    std  = np.sqrt(np.clip(sq - mean**2, 0, None))
-    thr  = mean * (1.0 + k * (std / r - 1.0))
-    return (g >= thr).astype(np.uint8) * 255
-
-
-def _sobel_mag(gray: np.ndarray) -> np.ndarray:
-    """Sobel gradient magnitude normalised to uint8 — no threshold needed."""
-    sx  = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sy  = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = np.sqrt(sx ** 2 + sy ** 2)
-    cv2.normalize(mag, mag, 0, 255, cv2.NORM_MINMAX)
-    return mag.astype(np.uint8)
-
-
-def _contour_template(image_bgr: np.ndarray,
-                      bilateral_d: int = 9,
-                      sigma_color: float = 75.0,
-                      sigma_space: float = 75.0,
-                      sauvola_k: float = 0.2,
-                      sauvola_r: float = 64.0,
-                      sauvola_win: int = 21) -> np.ndarray:
+def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
     """BGR → binary edge map for template matching.
-    Pipeline: bilateral → Sobel magnitude → Sauvola threshold.
-    Bilateral suppresses grain; Sobel makes edges exposure-invariant (DC-free);
-    Sauvola binarises locally so edge strength variation across lighting is handled.
+    Pipeline: Gaussian blur → Otsu-driven Canny → dilate.
+    Otsu auto-threshold adapts to image brightness; dilation widens edges
+    so matchTemplate has signal even with small positional shifts.
     """
-    gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    smoothed = cv2.bilateralFilter(gray, bilateral_d, sigma_color, sigma_space)
-    return _sauvola(_sobel_mag(smoothed), k=sauvola_k, r=sauvola_r, win=sauvola_win)
+    gray    = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    otsu_thr, _ = cv2.threshold(blurred, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges  = cv2.Canny(blurred, otsu_thr * 0.5, otsu_thr)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    return cv2.dilate(edges, kernel, iterations=1)
 
 class TemplateManager:
 
@@ -837,13 +809,7 @@ class TemplateManager:
             json.dump(data, f, indent=2)
 
     @staticmethod
-    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect,
-                        bilateral_d: int = 9,
-                        sigma_color: float = 75.0,
-                        sigma_space: float = 75.0,
-                        sauvola_k: float = 0.2,
-                        sauvola_r: float = 64.0,
-                        sauvola_win: int = 21) -> tuple:
+    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
         """
         Extract the pin-area patch ONLY (below the IC body):
           patch spans [X1, Y2] → [X2, Y3]
@@ -862,10 +828,7 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area
         x_end   = min(x + w, img_w)
 
-        full_bin = _contour_template(image_bgr,
-                                     bilateral_d, sigma_color, sigma_space,
-                                     sauvola_k, sauvola_r,
-                                     sauvola_win)[y_start:y_end, x:x_end]
+        full_bin = _contour_template(image_bgr)[y_start:y_end, x:x_end]
         strip_h  = y - y_start  # = -h  (patch is below IC top by IC height)
 
         return full_bin, strip_h
@@ -901,13 +864,7 @@ class TemplateManager:
 
     @staticmethod
     def save_preview(image_bgr: np.ndarray,
-                     ic_a: QtCore.QRect, ic_b: QtCore.QRect,
-                     bilateral_d: int = 9,
-                     sigma_color: float = 75.0,
-                     sigma_space: float = 75.0,
-                     sauvola_k: float = 0.2,
-                     sauvola_r: float = 64.0,
-                     sauvola_win: int = 21):
+                     ic_a: QtCore.QRect, ic_b: QtCore.QRect):
         """
         Save an annotated preview image:
         - IC_A (yellow) and IC_B (cyan) boxes with 3×2 cell grids and labels
@@ -962,9 +919,7 @@ class TemplateManager:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
 
         # ── Contour edge overlay (teal) inside pin patch only ───────────────
-        contour_full = _contour_template(image_bgr,
-                                         bilateral_d, sigma_color, sigma_space,
-                                         sauvola_k, sauvola_r, sauvola_win)
+        contour_full = _contour_template(image_bgr)
         patch_edges  = contour_full[patch_y1:patch_y2, ax:patch_x2]
         edge_mask    = patch_edges > 0
         roi          = preview[patch_y1:patch_y2, ax:patch_x2].astype(np.float32)
@@ -1006,34 +961,22 @@ class TemplateMatcher:
                  strip_h: int = 0,
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
-                 search_margin: int = 60,
-                 bilateral_d: int = 9,
-                 sigma_color: float = 75.0,
-                 sigma_space: float = 75.0,
-                 sauvola_k: float = 0.2,
-                 sauvola_r: float = 64.0,
-                 sauvola_win: int = 21):
-        self._patch       = full_patch
-        self._threshold   = threshold
-        self._strip_h     = strip_h   # px from patch top to IC top edge
-        self._patch_w     = full_patch.shape[1]
-        self._ic_x        = ic_x   # expected IC_A left edge from template
-        self._ic_y        = ic_y   # expected IC_A top from template
-        self._ic_w        = ic_w
-        self._ic_h        = ic_h
-        self._margin      = search_margin   # px around expected pos to search
-        self._bilateral_d = bilateral_d
-        self._sigma_color = sigma_color
-        self._sigma_space = sigma_space
-        self._sauvola_k   = sauvola_k
-        self._sauvola_r   = sauvola_r
-        self._sauvola_win = sauvola_win
+                 search_margin: int = 60):
+        self._patch     = full_patch
+        self._threshold = threshold
+        self._strip_h   = strip_h   # px from patch top to IC top edge
+        self._patch_w   = full_patch.shape[1]
+        self._ic_x      = ic_x   # expected IC_A left edge from template
+        self._ic_y      = ic_y   # expected IC_A top from template
+        self._ic_w      = ic_w
+        self._ic_h      = ic_h
+        self._margin    = search_margin   # px around expected pos to search
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
         Returns (QRect, score).
         Matches the pin-area patch (below IC body) against the frame.
-        Bilateral filter is applied only to the ±search_margin ROI for speed.
+        Preprocessing is applied only to the ±search_margin ROI for speed.
         strip_h is negative (patch starts below IC top), so:
           exp_patch_y = ic_y - strip_h = ic_y + IC_h
           ic_y        = matched_patch_y + strip_h = matched_patch_y - IC_h
@@ -1049,15 +992,11 @@ class TemplateMatcher:
         ry2 = min(img_h, exp_y + ph + m)
 
         roi_bgr  = image_bgr[ry1:ry2, rx1:rx2]
-        filtered = _contour_template(roi_bgr,
-                                     self._bilateral_d, self._sigma_color, self._sigma_space,
-                                     self._sauvola_k, self._sauvola_r, self._sauvola_win)
+        filtered = _contour_template(roi_bgr)
 
         if filtered.shape[0] < ph or filtered.shape[1] < pw:
             # ROI too small — fall back to full-frame search
-            full = _contour_template(image_bgr,
-                                     self._bilateral_d, self._sigma_color, self._sigma_space,
-                                     self._sauvola_k, self._sauvola_r, self._sauvola_win)
+            full = _contour_template(image_bgr)
             res = cv2.matchTemplate(full, self._patch, cv2.TM_CCOEFF_NORMED)
             _, score, _, loc = cv2.minMaxLoc(res)
             ic_y = loc[1] + self._strip_h
@@ -1845,6 +1784,7 @@ class RunWorker(QtCore.QThread):
 
     def _handle_lot_end(self):
         """Auto-advance lot on GPIO LOT_END signal and emit new lot number."""
+        _reset_image_counter()
         self._lot_number = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.sig_session_reset.emit(self._lot_number)
 
@@ -1863,6 +1803,7 @@ class RunWorker(QtCore.QThread):
                 return
 
         self.sig_status.emit("Running…")
+        _reset_image_counter()
         _cycle = 0
 
         while not self._stop:
@@ -1896,6 +1837,7 @@ class RunWorker(QtCore.QThread):
                     break
                 if self._gpio.is_done_signaled():
                     self._camera.reset()
+                    _reset_image_counter()
                     new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
                     self._lot_number = new_lot
                     self.sig_session_reset.emit(new_lot)
@@ -1942,31 +1884,37 @@ class RunWorker(QtCore.QThread):
                     print(f"[RunWorker] Alignment rejected: {te}")
 
             except MarkMissingError as e1:
-                is_retry = True
-                retry_delay = self._cfg.get("RETRY_DELAY_MS", 250) / 1000
-                time.sleep(retry_delay)
-                try:
-                    img_bgr2 = self._camera.grab()
+                if cam_mode == "camera":
+                    is_retry = True
+                    retry_delay = self._cfg.get("RETRY_DELAY_MS", 250) / 1000
+                    time.sleep(retry_delay)
                     try:
-                        self._inspector.inspect(img_bgr2, debug=debug)
-                        # Retry passed — use retry frame
-                        img_bgr = img_bgr2
-                        ann     = img_bgr2
-                        miss_a  = []
-                        miss_b  = []
-                    except MarkMissingError as e2:
-                        img_bgr = img_bgr2
-                        ann     = e2.annotated
-                        miss_a  = (_resolve_ic(e1.missing_a, e1.confs_a, e2.confs_a)
-                                   if e1.missing_a else [])
-                        miss_b  = (_resolve_ic(e1.missing_b, e1.confs_b, e2.confs_b)
-                                   if e1.missing_b else [])
-                    except TemplateError:
+                        img_bgr2 = self._camera.grab()
+                        try:
+                            self._inspector.inspect(img_bgr2, debug=debug)
+                            # Retry passed — use retry frame
+                            img_bgr = img_bgr2
+                            ann     = img_bgr2
+                            miss_a  = []
+                            miss_b  = []
+                        except MarkMissingError as e2:
+                            img_bgr = img_bgr2
+                            ann     = e2.annotated
+                            miss_a  = (_resolve_ic(e1.missing_a, e1.confs_a, e2.confs_a)
+                                       if e1.missing_a else [])
+                            miss_b  = (_resolve_ic(e1.missing_b, e1.confs_b, e2.confs_b)
+                                       if e1.missing_b else [])
+                        except TemplateError:
+                            miss_a, miss_b = e1.missing_a, e1.missing_b
+                            ann = e1.annotated if e1.annotated is not None else img_bgr2
+                    except CameraError:
                         miss_a, miss_b = e1.missing_a, e1.missing_b
-                        ann = e1.annotated or img_bgr2
-                except CameraError:
-                    miss_a, miss_b = e1.missing_a, e1.missing_b
-                    ann = e1.annotated or img_bgr
+                        ann = e1.annotated if e1.annotated is not None else img_bgr
+                else:
+                    # Directory mode: each file is a distinct IC — no meaningful retry
+                    miss_a = e1.missing_a
+                    miss_b = e1.missing_b
+                    ann    = e1.annotated if e1.annotated is not None else img_bgr
 
             except Exception as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
@@ -2039,6 +1987,7 @@ class RunWorker(QtCore.QThread):
                     break                           # directory done → standby
                 if self._gpio.is_done_signaled():
                     self._camera.reset()
+                    _reset_image_counter()
                     new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
                     self._lot_number = new_lot
                     self.sig_session_reset.emit(new_lot)   # IO signal → new batch
@@ -3009,21 +2958,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view.clear_overlays()
         exposure = int(self._cfg.get("EXPOSURE_US", 8000))
 
-        bd = int(self._cfg.get("TMPL_BILATERAL_D", 9))
-        sc = float(self._cfg.get("TMPL_BILATERAL_SIGMA_COLOR", 75.0))
-        ss = float(self._cfg.get("TMPL_BILATERAL_SIGMA_SPACE", 75.0))
-        sk = float(self._cfg.get("TMPL_SAUVOLA_K", 0.2))
-        sr = float(self._cfg.get("TMPL_SAUVOLA_R", 64.0))
-        sw = int(self._cfg.get("TMPL_SAUVOLA_WIN", 21))
-
         patch_saved = False
         strip_h_val = 0
         if self._setup_image is not None:
             try:
                 full_patch, strip_h_val = \
-                    TemplateManager.extract_patches(self._setup_image, ic_a,
-                                                   bilateral_d=bd, sigma_color=sc, sigma_space=ss,
-                                                   sauvola_k=sk, sauvola_r=sr, sauvola_win=sw)
+                    TemplateManager.extract_patches(self._setup_image, ic_a)
                 TemplateManager.save_patches(full_patch)
                 patch_saved = True
             except Exception as e:
@@ -3036,9 +2976,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._setup_image is not None:
             try:
-                TemplateManager.save_preview(self._setup_image, ic_a, ic_b,
-                                             bilateral_d=bd, sigma_color=sc, sigma_space=ss,
-                                             sauvola_k=sk, sauvola_r=sr, sauvola_win=sw)
+                TemplateManager.save_preview(self._setup_image, ic_a, ic_b)
             except Exception:
                 pass
 
@@ -3095,12 +3033,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 strip_h=tmpl.get("strip_h", 0),
                 ic_x=ic_a["x"], ic_y=ic_a["y"],
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
-                bilateral_d=int(self._cfg.get("TMPL_BILATERAL_D", 9)),
-                sigma_color=float(self._cfg.get("TMPL_BILATERAL_SIGMA_COLOR", 75.0)),
-                sigma_space=float(self._cfg.get("TMPL_BILATERAL_SIGMA_SPACE", 75.0)),
-                sauvola_k=float(self._cfg.get("TMPL_SAUVOLA_K", 0.2)),
-                sauvola_r=float(self._cfg.get("TMPL_SAUVOLA_R", 64.0)),
-                sauvola_win=int(self._cfg.get("TMPL_SAUVOLA_WIN", 21)),
             )
 
         inspector = Inspector(

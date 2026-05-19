@@ -2068,13 +2068,12 @@ class ThumbnailWorker(QtCore.QThread):
     sig_thumb = QtCore.pyqtSignal(int, object)   # (index, QPixmap)
     sig_done  = QtCore.pyqtSignal()
 
-    _THUMB_W = 130
-    _THUMB_H = 98
-
-    def __init__(self, paths: list, parent=None):
+    def __init__(self, paths: list, thumb_w: int = 130, thumb_h: int = 98, parent=None):
         super().__init__(parent)
-        self._paths = paths
-        self._stop  = False
+        self._paths   = paths
+        self._thumb_w = thumb_w
+        self._thumb_h = thumb_h
+        self._stop    = False
 
     def stop(self):
         self._stop = True
@@ -2086,7 +2085,7 @@ class ThumbnailWorker(QtCore.QThread):
             img = cv2.imread(path)
             if img is None:
                 continue
-            img = cv2.resize(img, (self._THUMB_W, self._THUMB_H))
+            img = cv2.resize(img, (self._thumb_w, self._thumb_h))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = img.shape
             qimg = QtGui.QImage(img.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
@@ -2095,33 +2094,42 @@ class ThumbnailWorker(QtCore.QThread):
 
 
 class ImageCard(QtWidgets.QFrame):
-    """Thumbnail card: 150×130 px with image + filename label."""
+    """Thumbnail card with dynamic sizing — color by result suffix."""
     clicked = QtCore.pyqtSignal(int)
 
-    _W, _H = 150, 130
-
-    def __init__(self, idx: int, filename: str, parent=None):
+    def __init__(self, idx: int, filename: str,
+                 card_w: int, card_h: int, thumb_w: int, thumb_h: int,
+                 parent=None):
         super().__init__(parent)
         self._idx = idx
-        self.setFixedSize(self._W, self._H)
+        self.setFixedSize(card_w, card_h)
         self.setObjectName("image_card")
         self.setCursor(QtCore.Qt.PointingHandCursor)
+
+        if "_NG" in filename:
+            card_bg = "#FA6781"
+        elif "_G" in filename:
+            card_bg = "#478B8D"
+        else:
+            card_bg = "#788BFF"
+        self.setStyleSheet(
+            f"QFrame#image_card{{background:{card_bg};border-radius:5px}}")
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(2)
 
         self._thumb = QtWidgets.QLabel()
-        self._thumb.setFixedSize(ThumbnailWorker._THUMB_W, ThumbnailWorker._THUMB_H)
+        self._thumb.setFixedSize(thumb_w, thumb_h)
         self._thumb.setAlignment(QtCore.Qt.AlignCenter)
-        self._thumb.setStyleSheet("background:#788BFF;border-radius:3px")
+        self._thumb.setStyleSheet("background:transparent")
         lay.addWidget(self._thumb)
 
         name_lbl = QtWidgets.QLabel(filename)
         name_lbl.setStyleSheet("font-size:9px;color:#E2FDFF")
         name_lbl.setAlignment(QtCore.Qt.AlignCenter)
         metrics = QtGui.QFontMetrics(name_lbl.font())
-        elided  = metrics.elidedText(filename, QtCore.Qt.ElideMiddle, self._W - 6)
+        elided  = metrics.elidedText(filename, QtCore.Qt.ElideMiddle, card_w - 6)
         name_lbl.setText(elided)
         lay.addWidget(name_lbl)
 
@@ -2248,8 +2256,9 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         # Count label
         self._lbl_count = QtWidgets.QLabel("—")
-        self._lbl_count.setStyleSheet("font-size:10px;color:#E2FDFF")
+        self._lbl_count.setStyleSheet("font-size:16px;font-weight:bold;color:#E2FDFF")
         self._lbl_count.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_count.setWordWrap(True)
         right_lay.addWidget(self._lbl_count)
 
         right_lay.addStretch()
@@ -2261,6 +2270,23 @@ class ImageBrowserPage(QtWidgets.QWidget):
         right_lay.addWidget(self._btn_back)
 
         root.addWidget(right)
+
+    # ── resize ───────────────────────────────────────────────
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._paths and e.size().width() != e.oldSize().width():
+            QtCore.QTimer.singleShot(150, self._rebuild_grid)
+
+    def _card_size(self):
+        """Calculate card/thumbnail dimensions so 4 cards fill the viewport width."""
+        vp_w = self._scroll.viewport().width()
+        spacing = self._grid_layout.horizontalSpacing()
+        card_w  = max(80, (vp_w - spacing * (self._COLS - 1)) // self._COLS)
+        thumb_w = card_w - 4
+        thumb_h = int(thumb_w * 0.75)   # 4:3 aspect ratio
+        card_h  = thumb_h + 22          # filename label + margins
+        return card_w, card_h, thumb_w, thumb_h
 
     # ── helpers ─────────────────────────────────────────────
 
@@ -2346,23 +2372,25 @@ class ImageBrowserPage(QtWidgets.QWidget):
                 item.widget().deleteLater()
         self._cards = []
 
-        for idx, path in enumerate(self._paths):
-            fname = os.path.basename(path)
-            card  = ImageCard(idx, fname)
-            card.clicked.connect(self._on_card_clicked)
-            row, col = divmod(idx, self._COLS)
-            self._grid_layout.addWidget(card, row, col)
-            self._cards.append(card)
-
-        # Switch to grid view if not already
+        # Switch to grid view and hide Back before creating cards
         self._stack.setCurrentIndex(0)
         self._btn_back.hide()
 
         if not self._paths:
             return
 
+        card_w, card_h, thumb_w, thumb_h = self._card_size()
+
+        for idx, path in enumerate(self._paths):
+            fname = os.path.basename(path)
+            card  = ImageCard(idx, fname, card_w, card_h, thumb_w, thumb_h)
+            card.clicked.connect(self._on_card_clicked)
+            row, col = divmod(idx, self._COLS)
+            self._grid_layout.addWidget(card, row, col)
+            self._cards.append(card)
+
         # Start loading thumbnails in background
-        self._thumb_worker = ThumbnailWorker(self._paths)
+        self._thumb_worker = ThumbnailWorker(self._paths, thumb_w, thumb_h)
         self._thumb_worker.sig_thumb.connect(self._on_thumbnail_ready)
         self._thumb_worker.start()
 

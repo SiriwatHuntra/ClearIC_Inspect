@@ -30,6 +30,7 @@ import os
 import csv
 import json
 import glob
+import math
 import time
 import threading
 from enum import Enum
@@ -1370,10 +1371,6 @@ QTabBar::tab:selected {
     color: #FFFFFF;
     font-weight: bold;
 }
-QFrame#image_card {
-    background: #788BFF;
-    border-radius: 5px;
-}
 QFrame#panel_right {
     background: #5465FF;
 }
@@ -2112,8 +2109,8 @@ class ImageCard(QtWidgets.QFrame):
             card_bg = "#478B8D"
         else:
             card_bg = "#788BFF"
-        self.setStyleSheet(
-            f"QFrame#image_card{{background:{card_bg};border-radius:5px}}")
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.setStyleSheet(f"background:{card_bg};border-radius:5px;")
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -2122,7 +2119,7 @@ class ImageCard(QtWidgets.QFrame):
         self._thumb = QtWidgets.QLabel()
         self._thumb.setFixedSize(thumb_w, thumb_h)
         self._thumb.setAlignment(QtCore.Qt.AlignCenter)
-        self._thumb.setStyleSheet("background:transparent")
+        self._thumb.setStyleSheet("")
         lay.addWidget(self._thumb)
 
         name_lbl = QtWidgets.QLabel(filename)
@@ -2187,14 +2184,14 @@ class ImageBrowserPage(QtWidgets.QWidget):
         grid_page = QtWidgets.QWidget()
         grid_lay  = QtWidgets.QVBoxLayout(grid_page)
         grid_lay.setContentsMargins(0, 0, 0, 0)
-        self._scroll = QtWidgets.QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setStyleSheet("QScrollArea{border:none}")
-        self._grid_container = QtWidgets.QWidget()
-        self._grid_layout    = QtWidgets.QGridLayout(self._grid_container)
+        self._grid_area = QtWidgets.QWidget()
+        self._grid_area.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                      QtWidgets.QSizePolicy.Expanding)
+        self._grid_layout = QtWidgets.QGridLayout(self._grid_area)
         self._grid_layout.setSpacing(6)
-        self._scroll.setWidget(self._grid_container)
-        grid_lay.addWidget(self._scroll)
+        self._grid_layout.setAlignment(
+            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        grid_lay.addWidget(self._grid_area)
         self._stack.addWidget(grid_page)   # index 0
 
         # Stack index 1: image page
@@ -2275,18 +2272,29 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if self._paths and e.size().width() != e.oldSize().width():
+        if self._paths and e.size() != e.oldSize():
             QtCore.QTimer.singleShot(150, self._rebuild_grid)
 
-    def _card_size(self):
-        """Calculate card/thumbnail dimensions so 4 cards fill the viewport width."""
-        vp_w = self._scroll.viewport().width()
-        spacing = self._grid_layout.horizontalSpacing()
-        card_w  = max(80, (vp_w - spacing * (self._COLS - 1)) // self._COLS)
+    def _card_size(self, n_images: int):
+        """Calculate card/thumbnail dimensions so all rows fit with no scrollbar."""
+        n_rows = max(1, math.ceil(n_images / self._COLS))
+        sp     = self._grid_layout.horizontalSpacing()
+
+        # Width: 4 cards fill available width
+        w_avail = max(1, self._grid_area.width()  - sp * (self._COLS - 1) - 4)
+        card_w  = max(60, w_avail // self._COLS)
+
+        # Height: all rows visible without scrolling
+        sp_v    = self._grid_layout.verticalSpacing()
+        h_avail = max(1, self._grid_area.height() - sp_v * (n_rows - 1) - 4)
+        card_h  = max(50, h_avail // n_rows)
+
+        # Thumbnail inside card (2px margin, 20px filename label)
         thumb_w = card_w - 4
-        thumb_h = int(thumb_w * 0.75)   # 4:3 aspect ratio
-        card_h  = thumb_h + 22          # filename label + margins
-        return card_w, card_h, thumb_w, thumb_h
+        thumb_h = min(card_h - 22, int(thumb_w * 0.75))  # cap at 4:3 ratio
+        card_h  = thumb_h + 22
+
+        return card_w, card_h, max(1, thumb_w), max(1, thumb_h)
 
     # ── helpers ─────────────────────────────────────────────
 
@@ -2379,7 +2387,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         if not self._paths:
             return
 
-        card_w, card_h, thumb_w, thumb_h = self._card_size()
+        card_w, card_h, thumb_w, thumb_h = self._card_size(len(self._paths))
 
         for idx, path in enumerate(self._paths):
             fname = os.path.basename(path)

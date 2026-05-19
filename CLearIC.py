@@ -1354,6 +1354,26 @@ STYLE = """
 QMainWindow, QWidget#root {
     background: #5465FF;
 }
+QTabWidget::pane {
+    background: #5465FF;
+    border: none;
+}
+QTabBar::tab {
+    background: #788BFF;
+    color: #FFFFFF;
+    padding: 6px 18px;
+    border-radius: 4px 4px 0 0;
+    font-size: 12px;
+}
+QTabBar::tab:selected {
+    background: #5465FF;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+QFrame#image_card {
+    background: #788BFF;
+    border-radius: 5px;
+}
 QFrame#panel_right {
     background: #5465FF;
 }
@@ -1528,19 +1548,26 @@ class ImageView(QtWidgets.QLabel):
             self._orig = img.copy()
         QtCore.QTimer.singleShot(0, self._refresh)
 
+    def sizeHint(self):
+        return QtCore.QSize(320, 240)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(1, 1)
+
     def _refresh(self):
         if self._orig is None:
+            return
+        lw, lh = self.width(), self.height()
+        if lw < 2 or lh < 2:   # widget not yet sized — skip to avoid feedback loop
             return
         h, w = self._orig.shape[:2]
         rgb  = cv2.cvtColor(self._orig, cv2.COLOR_BGR2RGB)
         qi   = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
         pix  = QtGui.QPixmap.fromImage(qi)
-        lw, lh = self.width(), self.height()
-        if lw > 0 and lh > 0:
-            pix = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
-                             QtCore.Qt.SmoothTransformation)
-        if self._orig.shape[1] > 0:
-            self._scale = pix.width() / self._orig.shape[1]
+        pix  = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
+                          QtCore.Qt.SmoothTransformation)
+        if w > 0:
+            self._scale = pix.width() / w
         self._offset = QtCore.QPoint((lw - pix.width())  // 2,
                                      (lh - pix.height()) // 2)
         self.setPixmap(pix)
@@ -1549,7 +1576,8 @@ class ImageView(QtWidgets.QLabel):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        QtCore.QTimer.singleShot(0, self._refresh)
+        if e.size() != e.oldSize():
+            QtCore.QTimer.singleShot(0, self._refresh)
 
     # ---- coordinate helper ----
     def _to_img(self, pt: QtCore.QPoint) -> QtCore.QPoint:
@@ -1996,201 +2024,393 @@ class LotStartDialog(QtWidgets.QDialog):
 
 
 # =========================================================
-# NG IMAGE BROWSER DIALOG
+# IMAGE BROWSER — worker threads + widgets
 # =========================================================
-class NGBrowserDialog(QtWidgets.QDialog):
-    """
-    Browse inspection output images by date → lot → image.
-    Supports live NG list (from current session) and disk-based navigation.
-    Toggle between annotated (Image/) and raw (RealImg/) views.
-    """
 
-    def __init__(self, out_dir: str = "Output/", parent=None):
+class FolderScanWorker(QtCore.QThread):
+    """Scans Output/ directory tree; emits flat list of (label, leaf_dir_path)."""
+    sig_entries = QtCore.pyqtSignal(list)   # [(label, path), ...]
+
+    def __init__(self, out_dir: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Image Browser")
-        self._out_dir    = out_dir
-        self._img_list   = []   # list of (ann_path, real_path, label)
-        self._idx        = 0
-        self._show_raw   = False
+        self._out_dir = out_dir
 
-        self.setMinimumSize(820, 620)
-        root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
-
-        # ── Navigation bar ───────────────────────────────────
-        nav = QtWidgets.QHBoxLayout()
-        self._btn_home = QtWidgets.QPushButton("⌂ Home")
-        self._btn_home.clicked.connect(self._go_home)
-        nav.addWidget(self._btn_home)
-
-        self._lbl_location = QtWidgets.QLabel("")
-        self._lbl_location.setStyleSheet("font-size:11px;color:#888")
-        nav.addWidget(self._lbl_location, stretch=1)
-
-        self._btn_toggle = QtWidgets.QPushButton("Raw")
-        self._btn_toggle.setCheckable(True)
-        self._btn_toggle.clicked.connect(self._toggle_raw)
-        nav.addWidget(self._btn_toggle)
-        root.addLayout(nav)
-
-        # ── Image view ───────────────────────────────────────
-        self._view = ImageView()
-        root.addWidget(self._view, stretch=1)
-
-        # ── Info + prev/next ─────────────────────────────────
-        ctrl = QtWidgets.QHBoxLayout()
-        self._btn_prev = QtWidgets.QPushButton("<<")
-        self._btn_prev.setFixedWidth(60)
-        self._btn_prev.clicked.connect(lambda: self._step(-1))
-        ctrl.addWidget(self._btn_prev)
-
-        self._lbl_info = QtWidgets.QLabel("—")
-        self._lbl_info.setAlignment(QtCore.Qt.AlignCenter)
-        ctrl.addWidget(self._lbl_info, stretch=1)
-
-        self._btn_next = QtWidgets.QPushButton(">>")
-        self._btn_next.setFixedWidth(60)
-        self._btn_next.clicked.connect(lambda: self._step(1))
-        ctrl.addWidget(self._btn_next)
-        root.addLayout(ctrl)
-
-        # ── Directory picker (home screen) ───────────────────
-        self._picker = QtWidgets.QWidget()
-        picker_lay = QtWidgets.QVBoxLayout(self._picker)
-        picker_lay.addWidget(QtWidgets.QLabel("Select date folder:"))
-        self._date_list = QtWidgets.QListWidget()
-        self._date_list.itemDoubleClicked.connect(self._on_date_picked)
-        picker_lay.addWidget(self._date_list)
-
-        picker_lay.addWidget(QtWidgets.QLabel("Select lot:"))
-        self._lot_list = QtWidgets.QListWidget()
-        self._lot_list.itemDoubleClicked.connect(self._on_lot_picked)
-        picker_lay.addWidget(self._lot_list)
-
-        btn_open = QtWidgets.QPushButton("Open selected lot")
-        btn_open.clicked.connect(self._open_selected)
-        picker_lay.addWidget(btn_open)
-        root.addWidget(self._picker)
-
-        self._go_home()
-
-    # ── Directory navigation ─────────────────────────────────
-
-    def _go_home(self):
-        self._picker.show()
-        self._view.hide()
-        self._btn_prev.setEnabled(False)
-        self._btn_next.setEnabled(False)
-        self._lbl_info.setText("Select a date and lot to browse.")
-        self._lbl_location.setText("")
-        self._date_list.clear()
-        self._lot_list.clear()
-
+    def run(self):
+        entries = []
         if not os.path.isdir(self._out_dir):
+            self.sig_entries.emit(entries)
             return
         dates = sorted(
             [d for d in os.listdir(self._out_dir)
              if os.path.isdir(os.path.join(self._out_dir, d))],
             reverse=True)
-        self._date_list.addItems(dates)
+        for date in dates:
+            date_dir = os.path.join(self._out_dir, date)
+            img_dir  = os.path.join(date_dir, "Image")
+            if os.path.isdir(img_dir):
+                # Direct layout: date/Image exists
+                entries.append((date, date_dir))
+            else:
+                # Lot layout: date/lot/Image
+                lots = sorted(
+                    [d for d in os.listdir(date_dir)
+                     if os.path.isdir(os.path.join(date_dir, d))],
+                    reverse=True)
+                for lot in lots:
+                    lot_img = os.path.join(date_dir, lot, "Image")
+                    if os.path.isdir(lot_img):
+                        entries.append((f"  {date}/{lot}", os.path.join(date_dir, lot)))
+        self.sig_entries.emit(entries)
 
-    def _on_date_picked(self, item: QtWidgets.QListWidgetItem):
-        self._lot_list.clear()
-        date_dir = os.path.join(self._out_dir, item.text())
-        lots = sorted(
-            [d for d in os.listdir(date_dir)
-             if os.path.isdir(os.path.join(date_dir, d))],
-            reverse=True)
-        self._lot_list.addItems(lots)
-        self._selected_date = item.text()
 
-    def _on_lot_picked(self, item: QtWidgets.QListWidgetItem):
-        self._open_lot(getattr(self, "_selected_date", ""), item.text())
+class ThumbnailWorker(QtCore.QThread):
+    """Loads image thumbnails one-by-one in a background thread."""
+    sig_thumb = QtCore.pyqtSignal(int, object)   # (index, QPixmap)
+    sig_done  = QtCore.pyqtSignal()
 
-    def _open_selected(self):
-        date_items = self._date_list.selectedItems()
-        lot_items  = self._lot_list.selectedItems()
-        if not date_items or not lot_items:
-            return
-        self._open_lot(date_items[0].text(), lot_items[0].text())
+    _THUMB_W = 130
+    _THUMB_H = 98
 
-    def _open_lot(self, date: str, lot: str):
-        ann_dir  = os.path.join(self._out_dir, date, lot, "Image")
-        real_dir = os.path.join(self._out_dir, date, lot, "RealImg")
-        images = sorted(
-            glob.glob(os.path.join(ann_dir, "*.jpg")) +
-            glob.glob(os.path.join(ann_dir, "*.png")))
-        if not images:
-            self._lbl_info.setText("No images found in this lot.")
-            return
-        self._img_list = []
-        for ann_path in images:
-            fname = os.path.basename(ann_path)
-            real_path = os.path.join(real_dir, fname)
-            self._img_list.append((ann_path, real_path, fname))
-        self._lbl_location.setText(f"{date} / {lot}")
-        self._idx = 0
-        self._picker.hide()
-        self._view.show()
-        self._btn_prev.setEnabled(True)
-        self._btn_next.setEnabled(True)
-        self._show(0)
+    def __init__(self, paths: list, parent=None):
+        super().__init__(parent)
+        self._paths = paths
+        self._stop  = False
 
-    # ── Live session load ────────────────────────────────────
+    def stop(self):
+        self._stop = True
 
-    def load_session_ng(self, ng_list: list, out_dir: str = ""):
-        """
-        Load from current session's NG list.
-        ng_list: [{"ann_path": str, "real_path": str, "image_id": str,
-                   "missing_a": list, "missing_b": list}, ...]
-        """
-        if not ng_list:
-            return
-        if out_dir:
-            self._out_dir = out_dir
-        self._img_list = []
-        for item in ng_list:
-            label = item["image_id"]
-            if item.get("missing_a"):
-                label += f"  IC_A miss:{item['missing_a']}"
-            if item.get("missing_b"):
-                label += f"  IC_B miss:{item['missing_b']}"
-            self._img_list.append((
-                item.get("ann_path", ""),
-                item.get("real_path", ""),
-                label,
-            ))
-        self._idx = 0
-        self._picker.hide()
-        self._view.show()
-        self._btn_prev.setEnabled(True)
-        self._btn_next.setEnabled(True)
-        self._lbl_location.setText("Current session — NG images")
-        self._show(0)
-
-    # ── Image display ────────────────────────────────────────
-
-    def _show(self, idx: int):
-        if not self._img_list:
-            return
-        self._idx = idx % len(self._img_list)
-        ann_path, real_path, label = self._img_list[self._idx]
-        path = real_path if self._show_raw else ann_path
-        if path and os.path.exists(path):
+    def run(self):
+        for idx, path in enumerate(self._paths):
+            if self._stop:
+                break
             img = cv2.imread(path)
-            if img is not None:
-                self._view.set_image(img)
-        self._lbl_info.setText(
-            f"{self._idx + 1} / {len(self._img_list)}   {label}")
+            if img is None:
+                continue
+            img = cv2.resize(img, (self._THUMB_W, self._THUMB_H))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, ch = img.shape
+            qimg = QtGui.QImage(img.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
+            self.sig_thumb.emit(idx, QtGui.QPixmap.fromImage(qimg))
+        self.sig_done.emit()
 
-    def _step(self, delta: int):
-        self._show(self._idx + delta)
 
-    def _toggle_raw(self):
-        self._show_raw = self._btn_toggle.isChecked()
-        self._btn_toggle.setText("Annotated" if self._show_raw else "Raw")
-        self._show(self._idx)
+class ImageCard(QtWidgets.QFrame):
+    """Thumbnail card: 150×130 px with image + filename label."""
+    clicked = QtCore.pyqtSignal(int)
+
+    _W, _H = 150, 130
+
+    def __init__(self, idx: int, filename: str, parent=None):
+        super().__init__(parent)
+        self._idx = idx
+        self.setFixedSize(self._W, self._H)
+        self.setObjectName("image_card")
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(2)
+
+        self._thumb = QtWidgets.QLabel()
+        self._thumb.setFixedSize(ThumbnailWorker._THUMB_W, ThumbnailWorker._THUMB_H)
+        self._thumb.setAlignment(QtCore.Qt.AlignCenter)
+        self._thumb.setStyleSheet("background:#788BFF;border-radius:3px")
+        lay.addWidget(self._thumb)
+
+        name_lbl = QtWidgets.QLabel(filename)
+        name_lbl.setStyleSheet("font-size:9px;color:#E2FDFF")
+        name_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        metrics = QtGui.QFontMetrics(name_lbl.font())
+        elided  = metrics.elidedText(filename, QtCore.Qt.ElideMiddle, self._W - 6)
+        name_lbl.setText(elided)
+        lay.addWidget(name_lbl)
+
+    def set_thumbnail(self, pixmap: QtGui.QPixmap):
+        self._thumb.setPixmap(pixmap)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit(self._idx)
+        super().mousePressEvent(event)
+
+
+class ImageBrowserPage(QtWidgets.QWidget):
+    """
+    Full-page image browser tab.
+    Left: date/lot folder list. Centre: grid or single image. Right: toggle controls.
+    """
+
+    _COLS = 4    # grid columns
+
+    def __init__(self, out_dir: str = "Output/", parent=None):
+        super().__init__(parent)
+        self._out_dir       = out_dir
+        self._all_paths: list = []     # all files in selected folder/subfolder
+        self._paths: list    = []      # filtered paths shown in grid
+        self._cur_idx        = 0
+        self._subfolder      = "RealImg"    # "RealImg" or "Image"
+        self._suffix_filter  = "_NG"        # "_NG", "_G", or "" (all)
+        self._cards: list    = []
+        self._thumb_worker: ThumbnailWorker | None = None
+        self._scan_worker:  FolderScanWorker | None = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        # ── Left: folder list ────────────────────────────────
+        self._folder_list = QtWidgets.QListWidget()
+        self._folder_list.setFixedWidth(200)
+        self._folder_list.setStyleSheet(
+            "QListWidget{background:#788BFF;border-radius:6px;color:#FFFFFF;font-size:11px}"
+            "QListWidget::item:selected{background:#5465FF;color:#FFFFFF}"
+        )
+        self._folder_list.itemClicked.connect(self._on_folder_selected)
+        root.addWidget(self._folder_list)
+
+        # ── Centre: stacked (grid / image) ──────────────────
+        self._stack = QtWidgets.QStackedWidget()
+        root.addWidget(self._stack, stretch=1)
+
+        # Stack index 0: grid page
+        grid_page = QtWidgets.QWidget()
+        grid_lay  = QtWidgets.QVBoxLayout(grid_page)
+        grid_lay.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet("QScrollArea{border:none}")
+        self._grid_container = QtWidgets.QWidget()
+        self._grid_layout    = QtWidgets.QGridLayout(self._grid_container)
+        self._grid_layout.setSpacing(6)
+        self._scroll.setWidget(self._grid_container)
+        grid_lay.addWidget(self._scroll)
+        self._stack.addWidget(grid_page)   # index 0
+
+        # Stack index 1: image page
+        img_page = QtWidgets.QWidget()
+        img_lay  = QtWidgets.QVBoxLayout(img_page)
+        img_lay.setContentsMargins(0, 0, 0, 0)
+        img_lay.setSpacing(4)
+        self._img_view = ImageView()
+        img_lay.addWidget(self._img_view, stretch=1)
+        # Bottom nav
+        nav = QtWidgets.QHBoxLayout()
+        self._btn_prev = QtWidgets.QPushButton("←")
+        self._btn_prev.setFixedWidth(48)
+        self._btn_prev.clicked.connect(lambda: self._step_image(-1))
+        nav.addWidget(self._btn_prev)
+        self._lbl_nav = QtWidgets.QLabel("—")
+        self._lbl_nav.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_nav.setStyleSheet("color:#E2FDFF;font-size:11px")
+        nav.addWidget(self._lbl_nav, stretch=1)
+        self._btn_next = QtWidgets.QPushButton("→")
+        self._btn_next.setFixedWidth(48)
+        self._btn_next.clicked.connect(lambda: self._step_image(1))
+        nav.addWidget(self._btn_next)
+        img_lay.addLayout(nav)
+        self._stack.addWidget(img_page)   # index 1
+
+        # ── Right: controls ──────────────────────────────────
+        right = QtWidgets.QFrame()
+        right.setObjectName("panel_right")
+        right.setFixedWidth(160)
+        right_lay = QtWidgets.QVBoxLayout(right)
+        right_lay.setContentsMargins(8, 8, 8, 8)
+        right_lay.setSpacing(10)
+
+        # Source toggle: RealImg / Image
+        right_lay.addWidget(self._section_label("Source"))
+        self._grp_src = QtWidgets.QButtonGroup(self)
+        self._btn_realimg = self._toggle_btn("RealImg", checked=True)
+        self._btn_annimg  = self._toggle_btn("Image",   checked=False)
+        self._grp_src.addButton(self._btn_realimg, 0)
+        self._grp_src.addButton(self._btn_annimg,  1)
+        right_lay.addWidget(self._btn_realimg)
+        right_lay.addWidget(self._btn_annimg)
+        self._grp_src.buttonClicked.connect(self._on_src_toggle)
+
+        # Filter toggle: _NG / _G / All
+        right_lay.addWidget(self._section_label("Filter"))
+        self._grp_flt = QtWidgets.QButtonGroup(self)
+        self._btn_flt_ng  = self._toggle_btn("_NG", checked=True)
+        self._btn_flt_g   = self._toggle_btn("_G",  checked=False)
+        self._btn_flt_all = self._toggle_btn("All", checked=False)
+        self._grp_flt.addButton(self._btn_flt_ng,  0)
+        self._grp_flt.addButton(self._btn_flt_g,   1)
+        self._grp_flt.addButton(self._btn_flt_all, 2)
+        right_lay.addWidget(self._btn_flt_ng)
+        right_lay.addWidget(self._btn_flt_g)
+        right_lay.addWidget(self._btn_flt_all)
+        self._grp_flt.buttonClicked.connect(self._on_filter_toggle)
+
+        # Count label
+        self._lbl_count = QtWidgets.QLabel("—")
+        self._lbl_count.setStyleSheet("font-size:10px;color:#E2FDFF")
+        self._lbl_count.setAlignment(QtCore.Qt.AlignCenter)
+        right_lay.addWidget(self._lbl_count)
+
+        right_lay.addStretch()
+
+        # Back button (shown in image view mode)
+        self._btn_back = QtWidgets.QPushButton("← Back")
+        self._btn_back.clicked.connect(self._back_to_grid)
+        self._btn_back.hide()
+        right_lay.addWidget(self._btn_back)
+
+        root.addWidget(right)
+
+    # ── helpers ─────────────────────────────────────────────
+
+    def _section_label(self, text: str) -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel(text)
+        lbl.setStyleSheet("font-size:11px;font-weight:bold;color:#E2FDFF")
+        return lbl
+
+    def _toggle_btn(self, text: str, checked: bool) -> QtWidgets.QPushButton:
+        btn = QtWidgets.QPushButton(text)
+        btn.setCheckable(True)
+        btn.setChecked(checked)
+        btn.setStyleSheet(
+            "QPushButton{background:#788BFF;color:#FFFFFF;border-radius:4px;"
+            "padding:5px 8px;font-size:11px}"
+            "QPushButton:checked{background:#FFFFFF;color:#5465FF;font-weight:bold}"
+        )
+        return btn
+
+    # ── folder refresh ───────────────────────────────────────
+
+    def refresh(self):
+        """Called when the Image Browser tab is activated."""
+        if self._scan_worker and self._scan_worker.isRunning():
+            return
+        self._folder_list.clear()
+        self._scan_worker = FolderScanWorker(self._out_dir)
+        self._scan_worker.sig_entries.connect(self._on_scan_done)
+        self._scan_worker.start()
+
+    def _on_scan_done(self, entries: list):
+        self._folder_list.clear()
+        for label, _path in entries:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.UserRole, _path)
+            self._folder_list.addItem(item)
+
+    def _on_folder_selected(self, item: QtWidgets.QListWidgetItem):
+        path = item.data(QtCore.Qt.UserRole)
+        self._load_folder(path)
+
+    # ── image loading ────────────────────────────────────────
+
+    def _load_folder(self, base_path: str):
+        """Collect files from base_path/subfolder, apply filter, rebuild grid."""
+        img_dir = os.path.join(base_path, self._subfolder)
+        if not os.path.isdir(img_dir):
+            self._all_paths = []
+        else:
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            files = []
+            for ext in exts:
+                files.extend(glob.glob(os.path.join(img_dir, ext)))
+            self._all_paths = sorted(files)
+
+        self._current_base = base_path
+        self._apply_filter_and_build_grid()
+
+    def _apply_filter_and_build_grid(self):
+        """Filter self._all_paths by suffix, rebuild grid."""
+        if self._suffix_filter:
+            filtered = [p for p in self._all_paths
+                        if self._suffix_filter in os.path.basename(p)]
+            # Fall back to all if no matching suffix found (old files without suffix)
+            self._paths = filtered if filtered else self._all_paths
+        else:
+            self._paths = list(self._all_paths)
+
+        self._lbl_count.setText(f"{len(self._paths)} images")
+        self._rebuild_grid()
+
+    def _rebuild_grid(self):
+        """Clear grid and create ImageCard placeholders; start ThumbnailWorker."""
+        # Stop any running thumbnail worker
+        if self._thumb_worker and self._thumb_worker.isRunning():
+            self._thumb_worker.stop()
+            self._thumb_worker.wait(500)
+
+        # Clear existing cards
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._cards = []
+
+        for idx, path in enumerate(self._paths):
+            fname = os.path.basename(path)
+            card  = ImageCard(idx, fname)
+            card.clicked.connect(self._on_card_clicked)
+            row, col = divmod(idx, self._COLS)
+            self._grid_layout.addWidget(card, row, col)
+            self._cards.append(card)
+
+        # Switch to grid view if not already
+        self._stack.setCurrentIndex(0)
+        self._btn_back.hide()
+
+        if not self._paths:
+            return
+
+        # Start loading thumbnails in background
+        self._thumb_worker = ThumbnailWorker(self._paths)
+        self._thumb_worker.sig_thumb.connect(self._on_thumbnail_ready)
+        self._thumb_worker.start()
+
+    def _on_thumbnail_ready(self, idx: int, pixmap: QtGui.QPixmap):
+        if idx < len(self._cards):
+            self._cards[idx].set_thumbnail(pixmap)
+
+    # ── image view ───────────────────────────────────────────
+
+    def _on_card_clicked(self, idx: int):
+        self._cur_idx = idx
+        self._show_image(idx)
+
+    def _show_image(self, idx: int):
+        if not self._paths:
+            return
+        self._cur_idx = max(0, min(idx, len(self._paths) - 1))
+        path = self._paths[self._cur_idx]
+        img  = cv2.imread(path)
+        if img is not None:
+            self._img_view.set_image(img)
+        fname = os.path.basename(path)
+        self._lbl_nav.setText(
+            f"{self._cur_idx + 1} / {len(self._paths)}   {fname}")
+        self._stack.setCurrentIndex(1)
+        self._btn_back.show()
+
+    def _step_image(self, delta: int):
+        self._show_image(self._cur_idx + delta)
+
+    def _back_to_grid(self):
+        self._stack.setCurrentIndex(0)
+        self._btn_back.hide()
+
+    # ── toggle handlers ──────────────────────────────────────
+
+    def _on_src_toggle(self, btn):
+        self._subfolder = "RealImg" if self._grp_src.id(btn) == 0 else "Image"
+        if hasattr(self, "_current_base"):
+            self._load_folder(self._current_base)
+        # Also update image view if open
+        if self._stack.currentIndex() == 1:
+            self._show_image(self._cur_idx)
+
+    def _on_filter_toggle(self, btn):
+        flt_id = self._grp_flt.id(btn)
+        self._suffix_filter = {0: "_NG", 1: "_G", 2: ""}[flt_id]
+        self._apply_filter_and_build_grid()
 
 
 # =========================================================
@@ -2219,7 +2439,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._session_start_time = 0.0
         self._lot_number         = ""
         self._package_name       = ""
-        self._ng_images: list    = []          # [{ann_path, real_path, image_id, missing_a, missing_b}]
 
         # setup state
         self._pending_ic_a:  QtCore.QRect | None = None
@@ -2239,11 +2458,23 @@ class MainWindow(QtWidgets.QMainWindow):
     # UI construction
     # ----------------------------------------------------------
     def _build_ui(self):
-        central = QtWidgets.QWidget()
-        central.setObjectName("root")
-        self.setCentralWidget(central)
+        # ── Tab wrapper ──────────────────────────────────────
+        tabs = QtWidgets.QTabWidget()
+        tabs.setObjectName("root")
+        self.setCentralWidget(tabs)
 
-        root = QtWidgets.QHBoxLayout(central)
+        insp_page = QtWidgets.QWidget()
+        insp_page.setObjectName("root")
+        tabs.addTab(insp_page, "Inspection")
+
+        out_dir = self._cfg.get("OUT_DIR", "Output/")
+        self._browser = ImageBrowserPage(out_dir=out_dir)
+        tabs.addTab(self._browser, "Image Browser")
+        tabs.currentChanged.connect(
+            lambda i: self._browser.refresh() if i == 1 else None)
+
+        # All existing layout now goes into insp_page
+        root = QtWidgets.QHBoxLayout(insp_page)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
@@ -2342,11 +2573,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._stop_run)
         ctrl_lay.addWidget(self._btn_stop)
-
-        self._btn_ng_review = QtWidgets.QPushButton("Review NG (0)")
-        self._btn_ng_review.setEnabled(False)
-        self._btn_ng_review.clicked.connect(self._open_ng_browser)
-        ctrl_lay.addWidget(self._btn_ng_review)
 
         right_lay.addWidget(ctrl_frame)
 
@@ -2710,9 +2936,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._package_name = tmpl.get("package_name", "")
 
         self._session_start_time = time.monotonic()
-        self._ng_images          = []
-        self._btn_ng_review.setText("Review NG (0)")
-        self._btn_ng_review.setEnabled(False)
 
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
         self._logger.start_lot(self._lot_number, self._package_name, mode)
@@ -2810,9 +3033,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_fail.setText("0")
         self._lbl_error.setText("0")
         self._lbl_yield.setText("—")
-        self._ng_images = []
-        self._btn_ng_review.setText("Review NG (0)")
-        self._btn_ng_review.setEnabled(False)
         self._session_start_time = time.monotonic()
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
         self._logger.start_lot(new_lot, self._package_name, mode)
@@ -2837,9 +3057,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_fail.setText("0")
         self._lbl_error.setText("0")
         self._lbl_yield.setText("—")
-        self._ng_images = []
-        self._btn_ng_review.setText("Review NG (0)")
-        self._btn_ng_review.setEnabled(False)
         self._lbl_status.setText("Standby.")
         self._reload_default_image()
 
@@ -2885,20 +3102,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_total += 1
         self._lbl_fail.setText(str(self._stats_fail))
         self._update_yield()
-        if ann_path:
-            # Build real_path by swapping Image/ → RealImg/ in the ann_path
-            real_path = ann_path.replace(
-                os.sep + "Image" + os.sep,
-                os.sep + "RealImg" + os.sep)
-            self._ng_images.append({
-                "ann_path":  ann_path,
-                "real_path": real_path,
-                "image_id":  img_id,
-                "missing_a": err.missing_a,
-                "missing_b": err.missing_b,
-            })
-            self._btn_ng_review.setText(f"Review NG ({len(self._ng_images)})")
-            self._btn_ng_review.setEnabled(True)
 
     def _on_worker_error(self, msg: str):
         self._stats_error += 1
@@ -2912,13 +3115,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_action.setText("Start")
         self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
-
-    def _open_ng_browser(self):
-        out_dir = self._cfg.get("OUT_DIR", "Output/")
-        dlg = NGBrowserDialog(out_dir=out_dir, parent=self)
-        if self._ng_images:
-            dlg.load_session_ng(self._ng_images, out_dir)
-        dlg.exec_()
 
     # ----------------------------------------------------------
     # Error banner

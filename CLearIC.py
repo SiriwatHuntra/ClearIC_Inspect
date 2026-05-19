@@ -27,6 +27,7 @@ Sections (in order)
 
 import sys
 import os
+import csv
 import json
 import glob
 import time
@@ -68,6 +69,7 @@ class ConfigLoader:
         "CAMERA_WARMUP_FRAMES": 5,
         "CAMERA_RETRY_DELAY":   0.2,
         "CAMERA_RETRIES":       2,
+        "RETRY_DELAY_MS":       250,
         # GPIO pins
         "GPIO_START_PIN":       17,
         "GPIO_DONE_PIN":        27,
@@ -173,10 +175,13 @@ class InspectionError(Exception):
 
 class MarkMissingError(InspectionError):
     def __init__(self, missing_a: list, missing_b: list,
-                 annotated: "np.ndarray | None" = None):
+                 annotated: "np.ndarray | None" = None,
+                 confs_a: list = None, confs_b: list = None):
         self.missing_a = missing_a
         self.missing_b = missing_b
         self.annotated = annotated
+        self.confs_a   = confs_a or []   # per-cell Text confidence (6 floats) for IC_A
+        self.confs_b   = confs_b or []   # per-cell Text confidence (6 floats) for IC_B
         parts = []
         if missing_a:
             parts.append(f"IC_A={missing_a}")
@@ -1093,8 +1098,8 @@ class Inspector:
                 print("[Inspector] No TemplateMatcher — using fixed template coordinates")
 
         # Phase 2: crop each cell and classify as Text / NoText
-        missing_a, hits_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
-        missing_b, hits_b = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
+        missing_a, hits_a, confs_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
+        missing_b, hits_b, confs_b = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
 
         if self._collect_dataset:
             global _data_run_counter
@@ -1107,7 +1112,7 @@ class Inspector:
                              self._data_dir, self._data_split)
 
         if missing_a or missing_b:
-            raise MarkMissingError(missing_a, missing_b, annotated)
+            raise MarkMissingError(missing_a, missing_b, annotated, confs_a, confs_b)
 
         return True, True, [], [], annotated
 
@@ -1122,13 +1127,15 @@ class Inspector:
                   annotated: np.ndarray, debug: bool) -> tuple:
         """
         Crop each ROI cell from image_bgr and classify as Text / NoText.
-        Returns (missing, hits_flags).
+        Returns (missing, hits_flags, text_confs).
+        text_confs: per-cell Text-class confidence (6 floats, 0–1).
         """
         ih, iw = image_bgr.shape[:2]
-        color_ok   = _hex_to_bgr(_ann_color_ok)
-        color_ng   = _hex_to_bgr(_ann_color_ng)
-        missing    = []
-        hits_flags = []
+        color_ok    = _hex_to_bgr(_ann_color_ok)
+        color_ng    = _hex_to_bgr(_ann_color_ng)
+        missing     = []
+        hits_flags  = []
+        text_confs  = []
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
@@ -1139,14 +1146,17 @@ class Inspector:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 crop = cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
             cls_idx, conf = self._detector.classify_crop(crop)
-            present = (cls_idx == 1)   # 1 = Text (mark present)
+            present   = (cls_idx == 1)   # 1 = Text (mark present)
+            text_conf = conf if cls_idx == 1 else (1.0 - conf)  # Text-class probability
             hits_flags.append(present)
+            text_confs.append(text_conf)
             if debug:
                 lbl = "Text" if present else "NoText"
                 _dbg_g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
-                      f"cls={lbl} conf={conf:.3f}  raw_std={_dbg_g.std():.1f}")
+                      f"cls={lbl} conf={conf:.3f} text_conf={text_conf:.3f}  "
+                      f"raw_std={_dbg_g.std():.1f}")
             color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
@@ -1162,101 +1172,180 @@ class Inspector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             if not present:
                 missing.append([row, col])
-        return missing, hits_flags
+        return missing, hits_flags, text_confs
 
 # =========================================================
 # LOGGER
 # =========================================================
 class Logger:
+    """
+    Dual-CSV logging system.
+
+    Operation log  — one file per calendar day, appended across all lots.
+      File: logs/op_YYYYMMDD.csv
+      Columns: timestamp, event, lot_number, detail, cycle_ms
+
+    Result log — one file per lot run, written incrementally.
+      File: logs/result_{lot}_{YYYYMMDD_HHMMSS}.csv
+      Header block: lot metadata rows.
+      Data rows: one per inspection.
+      Footer block: summary appended at lot end.
+    """
+
+    _OP_HEADER   = ["timestamp", "event", "lot_number", "detail", "cycle_ms"]
+    _RES_HEADER  = ["timestamp", "image_id", "ic_a_result",
+                    "ic_b_result", "cycle_ms", "is_retry"]
 
     def __init__(self, log_dir: str = "logs", log_retention: int = 365):
-        self._dir         = log_dir
-        self._retention   = log_retention
-        self._session_log: str | None = None
+        self._dir        = log_dir
+        self._retention  = log_retention
+        self._lot        = ""
+        self._package    = ""
+        self._res_path:  str | None = None
+        self._pass_ct    = 0
+        self._fail_ct    = 0
+        self._err_ct     = 0
         os.makedirs(log_dir, exist_ok=True)
         self._rotate()
 
-    def _log_path(self) -> str:
-        return os.path.join(self._dir,
-                            f"inspect_{datetime.now():%Y%m%d}.log")
+    # ── internal helpers ────────────────────────────────────────
+
+    def _op_path(self) -> str:
+        return os.path.join(self._dir, f"op_{datetime.now():%Y%m%d}.csv")
 
     def _rotate(self):
-        logs = sorted(glob.glob(os.path.join(self._dir, "inspect_*.log")))
-        while len(logs) > self._retention:
-            try:
-                os.remove(logs.pop(0))
-            except OSError:
-                pass
+        for pattern in ("op_*.csv", "result_*.csv"):
+            logs = sorted(glob.glob(os.path.join(self._dir, pattern)))
+            while len(logs) > self._retention:
+                try:
+                    os.remove(logs.pop(0))
+                except OSError:
+                    pass
 
-    def _append(self, record: dict):
-        path = self._session_log if self._session_log else self._log_path()
+    def _op_append(self, event: str, detail: str = "", cycle_ms: float = 0):
+        path = self._op_path()
+        write_header = not os.path.exists(path)
         try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(self._OP_HEADER)
+                w.writerow([
+                    datetime.now().isoformat(),
+                    event,
+                    self._lot,
+                    detail,
+                    round(cycle_ms, 1),
+                ])
         except Exception as e:
-            print(f"[Logger] Write failed: {e}", file=sys.stderr)
+            print(f"[Logger] op write failed: {e}", file=sys.stderr)
 
-    def start_session(self, mode: str):
+    def _res_write(self, row: list):
+        if not self._res_path:
+            return
+        try:
+            with open(self._res_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+        except Exception as e:
+            print(f"[Logger] result write failed: {e}", file=sys.stderr)
+
+    def _write_result_header(self, lot: str, package: str, mode: str):
+        if not self._res_path:
+            return
+        try:
+            with open(self._res_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["LOT_NUMBER", lot])
+                w.writerow(["PACKAGE",    package])
+                w.writerow(["START_TIME", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                w.writerow(["MODE",       mode])
+                w.writerow([])                       # blank separator
+                w.writerow(self._RES_HEADER)
+        except Exception as e:
+            print(f"[Logger] result header write failed: {e}", file=sys.stderr)
+
+    def _write_result_footer(self, pass_ct: int, fail_ct: int,
+                             err_ct: int, elapsed_s: float):
+        if not self._res_path:
+            return
+        total  = pass_ct + fail_ct
+        yield_ = f"{pass_ct / total * 100:.1f}" if total else "N/A"
+        try:
+            with open(self._res_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([])
+                w.writerow(["TOTAL",       total])
+                w.writerow(["PASS",        pass_ct])
+                w.writerow(["FAIL",        fail_ct])
+                w.writerow(["YIELD_PCT",   yield_])
+                w.writerow(["END_TIME",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                w.writerow(["DURATION_S",  round(elapsed_s, 1)])
+        except Exception as e:
+            print(f"[Logger] result footer write failed: {e}", file=sys.stderr)
+
+    # ── public interface ────────────────────────────────────────
+
+    def start_lot(self, lot_number: str, package: str, mode: str):
         self._rotate()
+        self._lot     = lot_number
+        self._package = package
+        self._pass_ct = self._fail_ct = self._err_ct = 0
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_log = os.path.join(self._dir, f"inspect_{ts}.log")
-        self._append({"event": "SESSION_START",
-                       "timestamp": datetime.now().isoformat(),
-                       "mode": mode})
+        safe_lot = "".join(c if c.isalnum() or c in "-_" else "_" for c in lot_number)
+        self._res_path = os.path.join(self._dir, f"result_{safe_lot}_{ts}.csv")
+        self._write_result_header(lot_number, package, mode)
+        self._op_append("SESSION_START", f"mode={mode}")
 
-    def log_session_end(self, reason: str,
-                        pass_ct: int, fail_ct: int, err_ct: int,
-                        elapsed_s: float):
-        self._append({"event": "SESSION_END",
-                       "timestamp": datetime.now().isoformat(),
-                       "reason": reason,
-                       "total_pass": pass_ct,
-                       "total_fail": fail_ct,
-                       "total_error": err_ct,
-                       "duration_s": round(elapsed_s, 1)})
-        self._session_log = None
-
-    def log_pause(self):
-        self._append({"event": "PAUSE",
-                       "timestamp": datetime.now().isoformat()})
-
-    def log_resume(self):
-        self._append({"event": "RESUME",
-                       "timestamp": datetime.now().isoformat()})
+    def end_lot(self, reason: str,
+                pass_ct: int, fail_ct: int, err_ct: int, elapsed_s: float):
+        total  = pass_ct + fail_ct
+        yield_ = f"{pass_ct / total * 100:.1f}%" if total else "N/A"
+        self._op_append("SESSION_END",
+                         f"reason={reason} pass={pass_ct} fail={fail_ct} "
+                         f"error={err_ct} yield={yield_}")
+        self._write_result_footer(pass_ct, fail_ct, err_ct, elapsed_s)
+        self._res_path = None
 
     def log_inspection(self, image_id: str,
                        ic_a_result: str, ic_a_missing: list,
                        ic_b_result: str, ic_b_missing: list,
-                       cycle_ms: float, mode: str, io_mock: bool):
-        self._append({
-            "timestamp":   datetime.now().isoformat(),
-            "image_id":    image_id,
-            "ic_a_result": ic_a_result,
-            "ic_a_missing": ic_a_missing,
-            "ic_b_result": ic_b_result,
-            "ic_b_missing": ic_b_missing,
-            "cycle_time_ms": round(cycle_ms, 1),
-            "mode":        mode,
-            "io_mock":     io_mock,
-        })
+                       cycle_ms: float, is_retry: bool):
+        passed = (ic_a_result == "PASS" and ic_b_result == "PASS")
+        event  = "PASS" if passed else "FAIL"
+        # Build detail: image filename + missing cells if any
+        detail_parts = [image_id]
+        if ic_a_missing:
+            detail_parts.append(f"miss_a={ic_a_missing}")
+        if ic_b_missing:
+            detail_parts.append(f"miss_b={ic_b_missing}")
+        detail_parts.append(f"is_retry={1 if is_retry else 0}")
+        self._op_append(event, " ".join(detail_parts), cycle_ms)
+        # Result log row
+        self._res_write([
+            datetime.now().isoformat(),
+            image_id,
+            ic_a_result,
+            ic_b_result,
+            round(cycle_ms, 1),
+            1 if is_retry else 0,
+        ])
+        if passed:
+            self._pass_ct += 1
+        else:
+            self._fail_ct += 1
 
     def log_error(self, error_type: str, message: str, cycle_ms: float = 0):
-        self._append({
-            "timestamp":     datetime.now().isoformat(),
-            "event":         "ERROR",
-            "error_type":    error_type,
-            "error_message": message,
-            "cycle_time_ms": round(cycle_ms, 1),
-        })
+        self._op_append("ERROR", f"{error_type}: {message}", cycle_ms)
+        self._err_ct += 1
+
+    def log_pause(self):
+        self._op_append("PAUSE")
+
+    def log_resume(self):
+        self._op_append("RESUME")
 
     def log_io_mock(self, pin_name: str, state: str):
         print(f"[IO MOCK] {pin_name} → {state}")
-        self._append({
-            "timestamp": datetime.now().isoformat(),
-            "event":     "IO_MOCK",
-            "pin":       pin_name,
-            "state":     state,
-        })
 
 # =========================================================
 # STYLESHEET
@@ -1565,20 +1654,35 @@ class ImageView(QtWidgets.QLabel):
 # =========================================================
 # RUN WORKER
 # =========================================================
-def _output_paths(img_id: str, out_dir: str = "Output/") -> tuple:
+def _output_dirs(out_dir: str, lot_number: str) -> tuple:
     """
-    Returns (real_path, annotated_path) for today's date-based output folders.
-      date/RealImg/img_id.jpg   — raw image
-      date/Image/img_id.jpg     — annotated image
-    Creates directories on first call.
+    Returns (real_dir, ann_dir) for today + lot_number, creating dirs.
+    Structure: out_dir/YYYYMMDD/lot_number/RealImg|Image/
     """
     date     = datetime.now().strftime("%Y%m%d")
-    real_dir = os.path.join(out_dir, date, "RealImg")
-    ann_dir  = os.path.join(out_dir, date, "Image")
+    real_dir = os.path.join(out_dir, date, lot_number, "RealImg")
+    ann_dir  = os.path.join(out_dir, date, lot_number, "Image")
     os.makedirs(real_dir, exist_ok=True)
     os.makedirs(ann_dir,  exist_ok=True)
-    return (os.path.join(real_dir, f"{img_id}.jpg"),
-            os.path.join(ann_dir,  f"{img_id}.jpg"))
+    return real_dir, ann_dir
+
+
+def _resolve_ic(missing_first: list, confs_first: list, confs_second: list) -> list:
+    """
+    Confidence-weighted retry resolution for a single IC.
+    Only re-evaluates cells that were MISSING on the first attempt.
+    Formula: w = 0.7 * text_conf_second + 0.3 * text_conf_first
+    A cell is PASS (Text present) only if w >= 0.90.
+    Returns updated missing list (cells still failing after weighting).
+    """
+    still_missing = []
+    for row, col in missing_first:
+        idx = (row - 1) * 2 + (col - 1)
+        c1 = confs_first[idx]  if idx < len(confs_first)  else 0.0
+        c2 = confs_second[idx] if idx < len(confs_second) else 0.0
+        if 0.7 * c2 + 0.3 * c1 < 0.90:
+            still_missing.append([row, col])
+    return still_missing
 
 class RunWorker(QtCore.QThread):
     """
@@ -1588,26 +1692,27 @@ class RunWorker(QtCore.QThread):
     MANUAL=False + CAMERA='directory': auto-loops with short delay between cycles
     CAMERA='camera': waits for GPIO START_PIN (or trigger() if MANUAL=True)
     """
-    sig_image    = QtCore.pyqtSignal(object)     # annotated BGR ndarray
-    sig_result   = QtCore.pyqtSignal(bool, bool) # ic_a_pass, ic_b_pass
-    sig_fail     = QtCore.pyqtSignal(object)     # MarkMissingError
+    sig_image    = QtCore.pyqtSignal(object)          # annotated BGR ndarray
+    sig_result   = QtCore.pyqtSignal(bool, bool)      # ic_a_pass, ic_b_pass
+    sig_fail     = QtCore.pyqtSignal(object, str, str) # (MarkMissingError, ann_path, img_id)
     sig_error    = QtCore.pyqtSignal(str)
     sig_status   = QtCore.pyqtSignal(str)
     sig_cycle_ms = QtCore.pyqtSignal(float)
-    sig_done          = QtCore.pyqtSignal()  # worker loop exited (Stop pressed)
-    sig_session_reset = QtCore.pyqtSignal() # batch complete → clear counts, new log
+    sig_done          = QtCore.pyqtSignal()   # worker loop exited (Stop pressed)
+    sig_session_reset = QtCore.pyqtSignal(str) # batch complete → new lot_number
     sig_paused        = QtCore.pyqtSignal()
     sig_resumed       = QtCore.pyqtSignal()
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
-                 cfg: dict, parent=None):
+                 cfg: dict, lot_number: str = "", parent=None):
         super().__init__(parent)
-        self._camera    = camera
-        self._inspector = inspector
-        self._gpio      = gpio
-        self._logger    = logger
-        self._cfg       = cfg
+        self._camera     = camera
+        self._inspector  = inspector
+        self._gpio       = gpio
+        self._logger     = logger
+        self._cfg        = cfg
+        self._lot_number = lot_number
         self._stop    = False
         self._running = threading.Event()
         self._running.set()
@@ -1625,17 +1730,9 @@ class RunWorker(QtCore.QThread):
         self._running.set()
 
     def _handle_lot_end(self):
-        """Move NG images to a timestamped archive folder and emit session reset."""
-        import shutil
-        out_dir = self._cfg.get("OUT_DIR", "Output/")
-        ng_src  = os.path.join(out_dir, "NGPIC")
-        if os.path.isdir(ng_src) and os.listdir(ng_src):
-            stamp   = datetime.now().strftime("%Y%m%d%H%M%S")
-            ng_dest = os.path.join(out_dir, "ImageNG", stamp)
-            os.makedirs(ng_dest, exist_ok=True)
-            for f in os.listdir(ng_src):
-                shutil.move(os.path.join(ng_src, f), os.path.join(ng_dest, f))
-        self.sig_session_reset.emit()
+        """Auto-advance lot on GPIO LOT_END signal and emit new lot number."""
+        self._lot_number = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.sig_session_reset.emit(self._lot_number)
 
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
@@ -1685,7 +1782,9 @@ class RunWorker(QtCore.QThread):
                     break
                 if self._gpio.is_done_signaled():
                     self._camera.reset()
-                    self.sig_session_reset.emit()
+                    new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self._lot_number = new_lot
+                    self.sig_session_reset.emit(new_lot)
                     continue
 
             # ── Capture guard ────────────────────────────────────────
@@ -1699,90 +1798,119 @@ class RunWorker(QtCore.QThread):
                                        (time.perf_counter() - t0) * 1000)
                 self.sig_error.emit(f"Camera error: {e}")
                 self.sig_status.emit("ERROR — machine blocked, restart required.")
-                # No ACK pulsed — machine stays blocked waiting; operator must reset.
                 break
 
             img_id = _next_image_id()
 
-            # Save raw before any processing
-            real_path, ann_path = _output_paths(img_id, self._cfg.get("OUT_DIR", "Output/"))
-            cv2.imwrite(real_path, img_bgr)
+            # Save raw with temp name before result is known
+            out_dir  = self._cfg.get("OUT_DIR", "Output/")
+            real_dir, ann_dir = _output_dirs(out_dir, self._lot_number)
+            tmp_real = os.path.join(real_dir, f"{img_id}.jpg")
+            cv2.imwrite(tmp_real, img_bgr)
 
             self.sig_status.emit("Inspecting…")
 
-            # ── Inspect ─────────────────────────────────────────────
+            # ── Inspect (with one retry on fail) ────────────────────
+            is_retry    = False
+            miss_a      = []
+            miss_b      = []
+            ann         = img_bgr
+            tmpl_error  = False
+
             try:
                 self._inspector.inspect(img_bgr, debug=debug)
-                # img_bgr is now annotated in-place
+                # pass — img_bgr annotated in-place; miss_a/miss_b stay []
 
-                cycle_ms = (time.perf_counter() - t0) * 1000
-                self.sig_image.emit(img_bgr)
-                self.sig_result.emit(True, True)
-                self.sig_cycle_ms.emit(cycle_ms)
-                self._logger.log_inspection(
-                    img_id, "PASS", [], "PASS", [],
-                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
-
-                cv2.imwrite(ann_path, img_bgr)
-
-                # GPIO: both FAIL pins LOW → BUSY LOW (result ready)
-                self._gpio.set_fail_a(False)
-                self._gpio.set_fail_b(False)
-                self._gpio.set_busy(False)
-
-            except MarkMissingError as e:
-                cycle_ms = (time.perf_counter() - t0) * 1000
-                # img_bgr IS e.annotated (drawn in-place); raw already at real_path
-
-                self.sig_image.emit(img_bgr)
-                self.sig_fail.emit(e)
-                self.sig_cycle_ms.emit(cycle_ms)
-                self._logger.log_inspection(
-                    img_id,
-                    "FAIL" if e.missing_a else "PASS", e.missing_a,
-                    "FAIL" if e.missing_b else "PASS", e.missing_b,
-                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
-
-                cv2.imwrite(ann_path, img_bgr)
-
-                # GPIO: set FAIL pins → BUSY LOW (result ready)
-                self._gpio.set_fail_a(bool(e.missing_a))
-                self._gpio.set_fail_b(bool(e.missing_b))
-                self._gpio.set_busy(False)
-
-            except TemplateError as e:
-                # Rotation/misalignment rejection — signal machine FAIL for both ICs,
-                # then continue the loop (next frame may align correctly).
-                cycle_ms = (time.perf_counter() - t0) * 1000
-                all_cells = [[r, c] for r in range(1, 4) for c in range(1, 3)]
-                err = MarkMissingError(all_cells, all_cells, None)
-                # ann_path intentionally NOT written — no annotation drawn for alignment errors;
-                # only raw (real_path) is on disk for this cycle.
-
-                self.sig_image.emit(img_bgr)
-                self.sig_fail.emit(err)
-                self.sig_cycle_ms.emit(cycle_ms)
-                self._logger.log_inspection(
-                    img_id, "FAIL", all_cells, "FAIL", all_cells,
-                    cycle_ms, self._cfg.get("MODE", "DEBUG"), io_mock)
-
-                self._gpio.set_fail_a(True)
-                self._gpio.set_fail_b(True)
-                self._gpio.set_busy(False)
-
+            except TemplateError as te:
+                tmpl_error = True
+                miss_a = miss_b = [[r, c] for r in range(1, 4) for c in range(1, 3)]
                 if debug:
-                    print(f"[RunWorker] Alignment rejected: {e}")
+                    print(f"[RunWorker] Alignment rejected: {te}")
+
+            except MarkMissingError as e1:
+                is_retry = True
+                retry_delay = self._cfg.get("RETRY_DELAY_MS", 250) / 1000
+                time.sleep(retry_delay)
+                try:
+                    img_bgr2 = self._camera.grab()
+                    try:
+                        self._inspector.inspect(img_bgr2, debug=debug)
+                        # Retry passed — use retry frame
+                        img_bgr = img_bgr2
+                        ann     = img_bgr2
+                        miss_a  = []
+                        miss_b  = []
+                    except MarkMissingError as e2:
+                        img_bgr = img_bgr2
+                        ann     = e2.annotated
+                        miss_a  = (_resolve_ic(e1.missing_a, e1.confs_a, e2.confs_a)
+                                   if e1.missing_a else [])
+                        miss_b  = (_resolve_ic(e1.missing_b, e1.confs_b, e2.confs_b)
+                                   if e1.missing_b else [])
+                    except TemplateError:
+                        miss_a, miss_b = e1.missing_a, e1.missing_b
+                        ann = e1.annotated or img_bgr2
+                except CameraError:
+                    miss_a, miss_b = e1.missing_a, e1.missing_b
+                    ann = e1.annotated or img_bgr
 
             except Exception as e:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
                 self.sig_error.emit(f"Unexpected error: {e}")
                 self.sig_status.emit("ERROR — machine blocked, restart required.")
-                # No ACK pulsed — machine stays blocked waiting; operator must reset.
+                try:
+                    os.remove(tmp_real)
+                except OSError:
+                    pass
                 break
 
-            finally:
+            # ── Finalize paths and save ──────────────────────────────
+            pass_a   = not miss_a
+            pass_b   = not miss_b
+            passed   = pass_a and pass_b and not tmpl_error
+            suffix   = "_G" if passed else "_NG"
+            cycle_ms = (time.perf_counter() - t0) * 1000
+
+            final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
+            ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")
+            try:
+                os.rename(tmp_real, final_real)
+            except OSError:
+                final_real = tmp_real   # rename failed, keep original name
+
+            if not tmpl_error:
+                cv2.imwrite(ann_path, ann)
+
+            # ── Emit signals and log ─────────────────────────────────
+            self.sig_image.emit(img_bgr)
+            self.sig_cycle_ms.emit(cycle_ms)
+
+            if passed:
+                self.sig_result.emit(True, True)
+                self._logger.log_inspection(
+                    img_id, "PASS", [], "PASS", [], cycle_ms, is_retry)
+                self._gpio.set_fail_a(False)
+                self._gpio.set_fail_b(False)
+            else:
+                err = MarkMissingError(miss_a, miss_b, ann)
+                self.sig_fail.emit(err,
+                                   ann_path if not tmpl_error else "",
+                                   img_id)
+                self._logger.log_inspection(
+                    img_id,
+                    "FAIL" if miss_a else "PASS", miss_a,
+                    "FAIL" if miss_b else "PASS", miss_b,
+                    cycle_ms, is_retry)
+                self._gpio.set_fail_a(bool(miss_a) or tmpl_error)
+                self._gpio.set_fail_b(bool(miss_b) or tmpl_error)
+
+            self._gpio.set_busy(False)
+
+            try:
                 del img_bgr
+            except NameError:
+                pass
 
             _cycle += 1
             if _cycle % 100 == 0:
@@ -1800,7 +1928,9 @@ class RunWorker(QtCore.QThread):
                     break                           # directory done → standby
                 if self._gpio.is_done_signaled():
                     self._camera.reset()
-                    self.sig_session_reset.emit()   # IO signal → new batch, keep running
+                    new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self._lot_number = new_lot
+                    self.sig_session_reset.emit(new_lot)   # IO signal → new batch
 
             # ── Pause checkpoint ─────────────────────────────────────
             # Sits after DONE handshake + clear_outputs so the machine
@@ -1819,6 +1949,249 @@ class RunWorker(QtCore.QThread):
         if cam_mode != "camera":
             self.sig_done.emit()
         self.sig_status.emit("Standby.")
+
+# =========================================================
+# LOT START DIALOG
+# =========================================================
+class LotStartDialog(QtWidgets.QDialog):
+    """
+    Shown before a run starts. Operator enters a lot number.
+    API hook: override get_lot_number_from_api() to inject from an external system;
+    when it returns a non-empty string the dialog is skipped entirely.
+    """
+
+    @staticmethod
+    def get_lot_number_from_api() -> str:
+        """Plugin point: replace to inject lot number from an internal API."""
+        return ""   # empty = show dialog; non-empty = skip dialog
+
+    @classmethod
+    def request(cls, parent=None) -> str | None:
+        """Returns lot number string, or None if operator cancelled."""
+        api_lot = cls.get_lot_number_from_api()
+        if api_lot:
+            return api_lot
+        dlg = cls(parent)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            text = dlg._edit.text().strip()
+            return text if text else datetime.now().strftime("%Y%m%d_%H%M%S")
+        return None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Start Lot")
+        self.setFixedWidth(300)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.addWidget(QtWidgets.QLabel("Enter Lot Number:"))
+        self._edit = QtWidgets.QLineEdit()
+        self._edit.setPlaceholderText("Leave blank for auto timestamp")
+        lay.addWidget(self._edit)
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self._edit.returnPressed.connect(self.accept)
+
+
+# =========================================================
+# NG IMAGE BROWSER DIALOG
+# =========================================================
+class NGBrowserDialog(QtWidgets.QDialog):
+    """
+    Browse inspection output images by date → lot → image.
+    Supports live NG list (from current session) and disk-based navigation.
+    Toggle between annotated (Image/) and raw (RealImg/) views.
+    """
+
+    def __init__(self, out_dir: str = "Output/", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Image Browser")
+        self._out_dir    = out_dir
+        self._img_list   = []   # list of (ann_path, real_path, label)
+        self._idx        = 0
+        self._show_raw   = False
+
+        self.setMinimumSize(820, 620)
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # ── Navigation bar ───────────────────────────────────
+        nav = QtWidgets.QHBoxLayout()
+        self._btn_home = QtWidgets.QPushButton("⌂ Home")
+        self._btn_home.clicked.connect(self._go_home)
+        nav.addWidget(self._btn_home)
+
+        self._lbl_location = QtWidgets.QLabel("")
+        self._lbl_location.setStyleSheet("font-size:11px;color:#888")
+        nav.addWidget(self._lbl_location, stretch=1)
+
+        self._btn_toggle = QtWidgets.QPushButton("Raw")
+        self._btn_toggle.setCheckable(True)
+        self._btn_toggle.clicked.connect(self._toggle_raw)
+        nav.addWidget(self._btn_toggle)
+        root.addLayout(nav)
+
+        # ── Image view ───────────────────────────────────────
+        self._view = ImageView()
+        root.addWidget(self._view, stretch=1)
+
+        # ── Info + prev/next ─────────────────────────────────
+        ctrl = QtWidgets.QHBoxLayout()
+        self._btn_prev = QtWidgets.QPushButton("<<")
+        self._btn_prev.setFixedWidth(60)
+        self._btn_prev.clicked.connect(lambda: self._step(-1))
+        ctrl.addWidget(self._btn_prev)
+
+        self._lbl_info = QtWidgets.QLabel("—")
+        self._lbl_info.setAlignment(QtCore.Qt.AlignCenter)
+        ctrl.addWidget(self._lbl_info, stretch=1)
+
+        self._btn_next = QtWidgets.QPushButton(">>")
+        self._btn_next.setFixedWidth(60)
+        self._btn_next.clicked.connect(lambda: self._step(1))
+        ctrl.addWidget(self._btn_next)
+        root.addLayout(ctrl)
+
+        # ── Directory picker (home screen) ───────────────────
+        self._picker = QtWidgets.QWidget()
+        picker_lay = QtWidgets.QVBoxLayout(self._picker)
+        picker_lay.addWidget(QtWidgets.QLabel("Select date folder:"))
+        self._date_list = QtWidgets.QListWidget()
+        self._date_list.itemDoubleClicked.connect(self._on_date_picked)
+        picker_lay.addWidget(self._date_list)
+
+        picker_lay.addWidget(QtWidgets.QLabel("Select lot:"))
+        self._lot_list = QtWidgets.QListWidget()
+        self._lot_list.itemDoubleClicked.connect(self._on_lot_picked)
+        picker_lay.addWidget(self._lot_list)
+
+        btn_open = QtWidgets.QPushButton("Open selected lot")
+        btn_open.clicked.connect(self._open_selected)
+        picker_lay.addWidget(btn_open)
+        root.addWidget(self._picker)
+
+        self._go_home()
+
+    # ── Directory navigation ─────────────────────────────────
+
+    def _go_home(self):
+        self._picker.show()
+        self._view.hide()
+        self._btn_prev.setEnabled(False)
+        self._btn_next.setEnabled(False)
+        self._lbl_info.setText("Select a date and lot to browse.")
+        self._lbl_location.setText("")
+        self._date_list.clear()
+        self._lot_list.clear()
+
+        if not os.path.isdir(self._out_dir):
+            return
+        dates = sorted(
+            [d for d in os.listdir(self._out_dir)
+             if os.path.isdir(os.path.join(self._out_dir, d))],
+            reverse=True)
+        self._date_list.addItems(dates)
+
+    def _on_date_picked(self, item: QtWidgets.QListWidgetItem):
+        self._lot_list.clear()
+        date_dir = os.path.join(self._out_dir, item.text())
+        lots = sorted(
+            [d for d in os.listdir(date_dir)
+             if os.path.isdir(os.path.join(date_dir, d))],
+            reverse=True)
+        self._lot_list.addItems(lots)
+        self._selected_date = item.text()
+
+    def _on_lot_picked(self, item: QtWidgets.QListWidgetItem):
+        self._open_lot(getattr(self, "_selected_date", ""), item.text())
+
+    def _open_selected(self):
+        date_items = self._date_list.selectedItems()
+        lot_items  = self._lot_list.selectedItems()
+        if not date_items or not lot_items:
+            return
+        self._open_lot(date_items[0].text(), lot_items[0].text())
+
+    def _open_lot(self, date: str, lot: str):
+        ann_dir  = os.path.join(self._out_dir, date, lot, "Image")
+        real_dir = os.path.join(self._out_dir, date, lot, "RealImg")
+        images = sorted(
+            glob.glob(os.path.join(ann_dir, "*.jpg")) +
+            glob.glob(os.path.join(ann_dir, "*.png")))
+        if not images:
+            self._lbl_info.setText("No images found in this lot.")
+            return
+        self._img_list = []
+        for ann_path in images:
+            fname = os.path.basename(ann_path)
+            real_path = os.path.join(real_dir, fname)
+            self._img_list.append((ann_path, real_path, fname))
+        self._lbl_location.setText(f"{date} / {lot}")
+        self._idx = 0
+        self._picker.hide()
+        self._view.show()
+        self._btn_prev.setEnabled(True)
+        self._btn_next.setEnabled(True)
+        self._show(0)
+
+    # ── Live session load ────────────────────────────────────
+
+    def load_session_ng(self, ng_list: list, out_dir: str = ""):
+        """
+        Load from current session's NG list.
+        ng_list: [{"ann_path": str, "real_path": str, "image_id": str,
+                   "missing_a": list, "missing_b": list}, ...]
+        """
+        if not ng_list:
+            return
+        if out_dir:
+            self._out_dir = out_dir
+        self._img_list = []
+        for item in ng_list:
+            label = item["image_id"]
+            if item.get("missing_a"):
+                label += f"  IC_A miss:{item['missing_a']}"
+            if item.get("missing_b"):
+                label += f"  IC_B miss:{item['missing_b']}"
+            self._img_list.append((
+                item.get("ann_path", ""),
+                item.get("real_path", ""),
+                label,
+            ))
+        self._idx = 0
+        self._picker.hide()
+        self._view.show()
+        self._btn_prev.setEnabled(True)
+        self._btn_next.setEnabled(True)
+        self._lbl_location.setText("Current session — NG images")
+        self._show(0)
+
+    # ── Image display ────────────────────────────────────────
+
+    def _show(self, idx: int):
+        if not self._img_list:
+            return
+        self._idx = idx % len(self._img_list)
+        ann_path, real_path, label = self._img_list[self._idx]
+        path = real_path if self._show_raw else ann_path
+        if path and os.path.exists(path):
+            img = cv2.imread(path)
+            if img is not None:
+                self._view.set_image(img)
+        self._lbl_info.setText(
+            f"{self._idx + 1} / {len(self._img_list)}   {label}")
+
+    def _step(self, delta: int):
+        self._show(self._idx + delta)
+
+    def _toggle_raw(self):
+        self._show_raw = self._btn_toggle.isChecked()
+        self._btn_toggle.setText("Annotated" if self._show_raw else "Raw")
+        self._show(self._idx)
+
 
 # =========================================================
 # MAIN WINDOW
@@ -1840,9 +2213,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_pass  = 0
         self._stats_fail  = 0
         self._stats_error = 0
+        self._stats_total = 0
 
         self._run_state          = "standby"   # "standby" | "running" | "paused"
         self._session_start_time = 0.0
+        self._lot_number         = ""
+        self._package_name       = ""
+        self._ng_images: list    = []          # [{ann_path, real_path, image_id, missing_a, missing_b}]
 
         # setup state
         self._pending_ic_a:  QtCore.QRect | None = None
@@ -1966,6 +2343,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.clicked.connect(self._stop_run)
         ctrl_lay.addWidget(self._btn_stop)
 
+        self._btn_ng_review = QtWidgets.QPushButton("Review NG (0)")
+        self._btn_ng_review.setEnabled(False)
+        self._btn_ng_review.clicked.connect(self._open_ng_browser)
+        ctrl_lay.addWidget(self._btn_ng_review)
+
         right_lay.addWidget(ctrl_frame)
 
         # Stats section
@@ -1981,6 +2363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_status   = self._stat_row(stats_lay, "Status",   "Standby.")
         self._lbl_pass     = self._stat_row(stats_lay, "Pass",     "0")
         self._lbl_fail     = self._stat_row(stats_lay, "Fail",     "0")
+        self._lbl_yield    = self._stat_row(stats_lay, "Yield",    "—")
         self._lbl_error    = self._stat_row(stats_lay, "Error",    "0")
         self._lbl_cycle_ms = self._stat_row(stats_lay, "Last ms",  "—")
 
@@ -2319,10 +2702,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
+        # Ask operator for lot number (or get from API hook)
+        lot = LotStartDialog.request(parent=self)
+        if lot is None:
+            return   # operator cancelled
+        self._lot_number   = lot
+        self._package_name = tmpl.get("package_name", "")
+
         self._session_start_time = time.monotonic()
+        self._ng_images          = []
+        self._btn_ng_review.setText("Review NG (0)")
+        self._btn_ng_review.setEnabled(False)
 
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
-        self._logger.start_session(mode)
+        self._logger.start_lot(self._lot_number, self._package_name, mode)
 
         # IC localization via TemplateMatcher when patch exists; else fixed template coords.
         matcher = None
@@ -2353,7 +2746,8 @@ class MainWindow(QtWidgets.QMainWindow):
         gpio      = self._gpio or RaspberryIO(io_enabled=False)
 
         self._worker = RunWorker(
-            self._camera, inspector, gpio, self._logger, self._cfg)
+            self._camera, inspector, gpio, self._logger, self._cfg,
+            lot_number=self._lot_number)
         self._worker.sig_image.connect(self._on_image)
         self._worker.sig_result.connect(self._on_result)
         self._worker.sig_fail.connect(self._on_fail)
@@ -2394,9 +2788,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._logger.log_resume()
 
     def _stop_run(self):
-        """Called by Stop button — ends session, no sig_done."""
+        """Called by Stop button — ends lot, no sig_done."""
         elapsed = time.monotonic() - self._session_start_time
-        self._logger.log_session_end(
+        self._logger.end_lot(
             "STOPPED", self._stats_pass, self._stats_fail,
             self._stats_error, elapsed)
         if self._worker:
@@ -2404,23 +2798,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.wait(3000)
         self._enter_standby()
 
-    def _on_session_reset(self):
-        """Batch complete (all dir images done or DONE_PIN): log, clear counts, new session."""
+    def _on_session_reset(self, new_lot: str):
+        """Batch complete (all dir images done or lot-end GPIO): end current lot, start new."""
         elapsed = time.monotonic() - self._session_start_time
-        self._logger.log_session_end(
+        self._logger.end_lot(
             "COMPLETE", self._stats_pass, self._stats_fail,
             self._stats_error, elapsed)
-        self._stats_pass = self._stats_fail = self._stats_error = 0
+        self._lot_number = new_lot
+        self._stats_pass = self._stats_fail = self._stats_error = self._stats_total = 0
         self._lbl_pass.setText("0")
         self._lbl_fail.setText("0")
         self._lbl_error.setText("0")
+        self._lbl_yield.setText("—")
+        self._ng_images = []
+        self._btn_ng_review.setText("Review NG (0)")
+        self._btn_ng_review.setEnabled(False)
         self._session_start_time = time.monotonic()
-        self._logger.start_session("DEBUG" if self._cfg.get("DEBUG", True) else "RUN")
+        mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
+        self._logger.start_lot(new_lot, self._package_name, mode)
 
     def _on_run_done(self):
-        """Called when the worker loop exits (Stop pressed)."""
+        """Called when the worker loop exits (directory mode done)."""
         elapsed = time.monotonic() - self._session_start_time
-        self._logger.log_session_end(
+        self._logger.end_lot(
             "COMPLETE", self._stats_pass, self._stats_fail,
             self._stats_error, elapsed)
         self._enter_standby()
@@ -2432,10 +2832,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)
-        self._stats_pass = self._stats_fail = self._stats_error = 0
+        self._stats_pass = self._stats_fail = self._stats_error = self._stats_total = 0
         self._lbl_pass.setText("0")
         self._lbl_fail.setText("0")
         self._lbl_error.setText("0")
+        self._lbl_yield.setText("—")
+        self._ng_images = []
+        self._btn_ng_review.setText("Review NG (0)")
+        self._btn_ng_review.setEnabled(False)
         self._lbl_status.setText("Standby.")
         self._reload_default_image()
 
@@ -2457,35 +2861,64 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_image(self, img: np.ndarray):
         self._view.set_image(img)
 
+    def _update_yield(self):
+        total = self._stats_pass + self._stats_fail
+        if total > 0:
+            self._lbl_yield.setText(f"{self._stats_pass / total * 100:.1f}%")
+        else:
+            self._lbl_yield.setText("—")
+
     def _on_result(self, ia_pass: bool, ib_pass: bool):
         self._update_badge(self._badge_a, ia_pass)
         self._update_badge(self._badge_b, ib_pass)
-        self._stats_pass += (1 if ia_pass else 0) + (1 if ib_pass else 0)
+        self._stats_pass  += 1
+        self._stats_total += 1
         self._lbl_pass.setText(str(self._stats_pass))
-        self._lbl_fail.setText(str(self._stats_fail))
+        self._update_yield()
 
-    def _on_fail(self, err: MarkMissingError):
+    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str):
         ic_a_pass = len(err.missing_a) == 0
         ic_b_pass = len(err.missing_b) == 0
         self._update_badge(self._badge_a, ic_a_pass)
         self._update_badge(self._badge_b, ic_b_pass)
-        self._stats_pass += (1 if ic_a_pass else 0) + (1 if ic_b_pass else 0)
-        self._stats_fail += (0 if ic_a_pass else 1) + (0 if ic_b_pass else 1)
-        self._lbl_pass.setText(str(self._stats_pass))
+        self._stats_fail  += 1
+        self._stats_total += 1
         self._lbl_fail.setText(str(self._stats_fail))
+        self._update_yield()
+        if ann_path:
+            # Build real_path by swapping Image/ → RealImg/ in the ann_path
+            real_path = ann_path.replace(
+                os.sep + "Image" + os.sep,
+                os.sep + "RealImg" + os.sep)
+            self._ng_images.append({
+                "ann_path":  ann_path,
+                "real_path": real_path,
+                "image_id":  img_id,
+                "missing_a": err.missing_a,
+                "missing_b": err.missing_b,
+            })
+            self._btn_ng_review.setText(f"Review NG ({len(self._ng_images)})")
+            self._btn_ng_review.setEnabled(True)
 
     def _on_worker_error(self, msg: str):
         self._stats_error += 1
         self._lbl_error.setText(str(self._stats_error))
         self._show_error(msg)
         elapsed = time.monotonic() - self._session_start_time
-        self._logger.log_session_end(
+        self._logger.end_lot(
             "ERROR", self._stats_pass, self._stats_fail,
             self._stats_error, elapsed)
         self._run_state = "standby"
         self._btn_action.setText("Start")
         self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
+
+    def _open_ng_browser(self):
+        out_dir = self._cfg.get("OUT_DIR", "Output/")
+        dlg = NGBrowserDialog(out_dir=out_dir, parent=self)
+        if self._ng_images:
+            dlg.load_session_ng(self._ng_images, out_dir)
+        dlg.exec_()
 
     # ----------------------------------------------------------
     # Error banner

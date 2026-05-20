@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git status)",
+      "Bash(git show *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys,subprocess; d=json.load(sys.stdin); f=d.get('tool_input',{}).get('file_path',''); r=subprocess.run(['/usr/bin/python3','-m','py_compile',f],capture_output=True,text=True) if f.endswith('CLearIC.py') else None; sys.stdout.write('Syntax OK: '+f+'\\n' if r and r.returncode==0 else ('SyntaxError: '+r.stderr if r else '')); sys.exit(r.returncode if r else 0)\" 2>/dev/null || true",
+            "statusMessage": "Checking CLearIC.py syntax..."
+          }
+        ]
+      }
+    ]
+  }
+}

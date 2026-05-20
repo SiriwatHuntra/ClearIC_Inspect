@@ -188,6 +188,22 @@ ClearIC_Inspect/
 
 ---
 
+## Skills (from `skills-lock.json`)
+
+Installed from `JuliusBrussee/caveman` via the Claude Code skills system:
+
+| Skill | Invoke | Purpose |
+|---|---|---|
+| `cavecrew` | `/cavecrew` | Multi-agent crew orchestration |
+| `caveman` | `/caveman` | General caveman assistant |
+| `caveman-commit` | `/caveman-commit` | Draft and create git commits |
+| `caveman-compress` | `/caveman-compress` | Compress/summarize context |
+| `caveman-help` | `/caveman-help` | Help and usage guide |
+| `caveman-review` | `/caveman-review` | Code review |
+| `caveman-stats` | `/caveman-stats` | Project statistics |
+
+---
+
 ## Model Retraining
 
 Train with `Test/trainModel.py` (Ultralytics YOLO-cls). Export to OpenVINO with `Test/Converter.py`, then update `MODEL_PATH` in `Config.json`.

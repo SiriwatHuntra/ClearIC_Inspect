@@ -6,7 +6,7 @@ Each ROI cell is cropped and classified as Text (present) or NoText (absent).
 
 Sections (in order)
 -------------------
-  ConfigLoader        Config.json loader with defaults
+  ConfigLoader        Config.toml loader with defaults
   Stage / ErrorFlag   State enums
   Exceptions          InspectionError hierarchy
   Image               Image dataclass + ID generator

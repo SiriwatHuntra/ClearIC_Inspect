@@ -21,9 +21,9 @@ Requires a display (physical screen or `DISPLAY`). PyQt5 is system-package only 
 
 ---
 
-## Config: `Config.json` *(all runtime settings)*
+## Config: `Config.toml` *(all runtime settings)*
 
-All configuration lives in `Config.json` — no hardcoded dev flags. `ConfigLoader` merges it against `DEFAULT_CONFIG` on startup.
+All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoader` merges it against `DEFAULT_CONFIG` on startup.
 
 | Key | Default | Effect |
 |---|---|---|
@@ -51,8 +51,12 @@ All configuration lives in `Config.json` — no hardcoded dev flags. `ConfigLoad
 | `ANN_BORDER_PX` | `1` | Cell annotation border thickness |
 | `ANN_SHOW_LABELS` | `True` | Show R1C1 labels on cell overlays |
 | `WARMUP_FRAMES` | `5` | Classifier warmup frames on startup |
+| `SKIP_DONE_WAIT` | `False` | Skip DONE_PIN handshake at end of cycle (IFLV machines with no DONE signal) |
 
 GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23), `GPIO_LOT_END_PIN` (18), `GPIO_FAIL_A_PIN` (24), `GPIO_FAIL_B_PIN` (25).
+
+**IFLV machine pin mapping** (BOARD→BCM from IFLRMIV101.py):
+`GPIO_START_PIN=2`, `GPIO_BUSY_PIN=3`, `GPIO_FAIL_A_PIN=4`, `GPIO_FAIL_B_PIN=4`, `GPIO_LOT_END_PIN=27`, `SKIP_DONE_WAIT=true`.
 
 ---
 
@@ -80,7 +84,8 @@ LotStartDialog → operator enters lot number
   → rename raw to {img_id}_G.jpg or _NG.jpg
   → save annotated to Output/YYYYMMDD/lot/Image/{img_id}_G|NG.jpg
   → GPIO: set BUSY_PIN=False, FAIL_A_PIN, FAIL_B_PIN
-  → wait DONE_PIN (camera mode) → clear outputs → STANDBY
+  → wait DONE_PIN (camera mode, SKIP_DONE_WAIT=false) → clear outputs → STANDBY
+  → OR: SKIP_DONE_WAIT=true → FAIL pins stay set, loop to next START → clear_fail_outputs at START
 ```
 
 Low match score from TemplateMatcher: prints a warning but uses the best-match position regardless (no hard rejection). `TemplateError` is only raised by the Inspector if something else fails.

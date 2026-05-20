@@ -80,6 +80,7 @@ class ConfigLoader:
         "CAMERA":               "directory",
         "CONF_THR":             0.5,
         "TEXT_MIN_CONF":        0.80,
+        "TEXT_NG_THRESHOLD":    2,
         "BLANK_CELL_STD_THR":   0.0,
         "NMS_IOU_THR":          0.45,
         "CAMERA_SERIAL":        "",
@@ -1365,9 +1366,12 @@ class Logger:
     def log_inspection(self, image_id: str,
                        ic_a_result: str, ic_a_missing: list,
                        ic_b_result: str, ic_b_missing: list,
-                       cycle_ms: float, is_retry: bool):
+                       cycle_ms: float, is_retry: bool,
+                       is_suspect: bool = False):
         passed = (ic_a_result == "PASS" and ic_b_result == "PASS")
         event  = "PASS" if passed else "FAIL"
+        if is_suspect:
+            event += "_SUSPECT"
         # Build detail: image filename + missing cells if any
         detail_parts = [image_id]
         if ic_a_missing:
@@ -1375,6 +1379,8 @@ class Logger:
         if ic_b_missing:
             detail_parts.append(f"miss_b={ic_b_missing}")
         detail_parts.append(f"is_retry={1 if is_retry else 0}")
+        if is_suspect:
+            detail_parts.append("suspect=1")
         self._op_append(event, " ".join(detail_parts), cycle_ms)
         # Result log row
         self._res_write([
@@ -1384,6 +1390,7 @@ class Logger:
             ic_b_result,
             round(cycle_ms, 1),
             1 if is_retry else 0,
+            1 if is_suspect else 0,
         ])
         if passed:
             self._pass_ct += 1
@@ -1773,8 +1780,8 @@ class RunWorker(QtCore.QThread):
     CAMERA='camera': waits for GPIO START_PIN (or trigger() if MANUAL=True)
     """
     sig_image    = QtCore.pyqtSignal(object)          # annotated BGR ndarray
-    sig_result   = QtCore.pyqtSignal(bool, bool)      # ic_a_pass, ic_b_pass
-    sig_fail     = QtCore.pyqtSignal(object, str, str) # (MarkMissingError, ann_path, img_id)
+    sig_result   = QtCore.pyqtSignal(bool, bool, bool)       # ic_a_pass, ic_b_pass, is_suspect
+    sig_fail     = QtCore.pyqtSignal(object, str, str, bool) # (MarkMissingError, ann_path, img_id, is_suspect)
     sig_error    = QtCore.pyqtSignal(str)
     sig_status   = QtCore.pyqtSignal(str)
     sig_cycle_ms = QtCore.pyqtSignal(float)
@@ -1957,9 +1964,29 @@ class RunWorker(QtCore.QThread):
             # ── Finalize paths and save ──────────────────────────────
             pass_a   = not miss_a
             pass_b   = not miss_b
-            passed   = pass_a and pass_b and not tmpl_error
-            suffix   = "_G" if passed else "_NG"
             cycle_ms = (time.perf_counter() - t0) * 1000
+
+            # Suspect threshold logic
+            _TOTAL_CELLS   = 12  # 6 cells × 2 ICs
+            _ng_threshold  = int(self._cfg.get("TEXT_NG_THRESHOLD", 2))
+            n_missing      = len(miss_a) + len(miss_b)
+
+            if n_missing == 0:
+                passed     = True
+                is_suspect = False
+                suffix     = "_G"
+            elif n_missing >= _TOTAL_CELLS:
+                passed     = False
+                is_suspect = False
+                suffix     = "_NG"
+            elif n_missing >= _ng_threshold:
+                passed     = False
+                is_suspect = True
+                suffix     = "_NGS"
+            else:
+                passed     = True
+                is_suspect = True
+                suffix     = "_GS"
 
             final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
             ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")
@@ -1975,19 +2002,19 @@ class RunWorker(QtCore.QThread):
             self.sig_cycle_ms.emit(cycle_ms)
 
             if passed:
-                self.sig_result.emit(True, True)
+                self.sig_result.emit(True, True, is_suspect)
                 self._logger.log_inspection(
-                    img_id, "PASS", [], "PASS", [], cycle_ms, is_retry)
+                    img_id, "PASS", [], "PASS", [], cycle_ms, is_retry, is_suspect)
                 self._gpio.set_fail_a(False)
                 self._gpio.set_fail_b(False)
             else:
                 err = MarkMissingError(miss_a, miss_b, ann)
-                self.sig_fail.emit(err, ann_path, img_id)
+                self.sig_fail.emit(err, ann_path, img_id, is_suspect)
                 self._logger.log_inspection(
                     img_id,
                     "FAIL" if miss_a else "PASS", miss_a,
                     "FAIL" if miss_b else "PASS", miss_b,
-                    cycle_ms, is_retry)
+                    cycle_ms, is_retry, is_suspect)
                 self._gpio.set_fail_a(bool(miss_a) or tmpl_error)
                 self._gpio.set_fail_b(bool(miss_b) or tmpl_error)
 
@@ -2170,10 +2197,15 @@ class ImageCard(QtWidgets.QFrame):
         self.setObjectName("image_card")
         self.setCursor(QtCore.Qt.PointingHandCursor)
 
-        if "_NG" in filename:
-            card_bg = "#FA6781"
-        elif "_G" in filename:
-            card_bg = "#478B8D"
+        _stem = os.path.splitext(filename)[0]
+        if _stem.endswith("_NGS"):
+            card_bg = "#E07820"   # orange — FAIL suspect
+        elif _stem.endswith("_GS"):
+            card_bg = "#A0B830"   # yellow-green — PASS suspect
+        elif _stem.endswith("_NG"):
+            card_bg = "#FA6781"   # red — FAIL
+        elif _stem.endswith("_G"):
+            card_bg = "#478B8D"   # teal — PASS
         else:
             card_bg = "#788BFF"
         # Scoped selector: only this QFrame, not child labels
@@ -2309,17 +2341,20 @@ class ImageBrowserPage(QtWidgets.QWidget):
         right_lay.addWidget(self._btn_annimg)
         self._grp_src.buttonClicked.connect(self._on_src_toggle)
 
-        # Filter toggle: _NG / _G / All
+        # Filter toggle: _NG / _G / Suspect / All
         right_lay.addWidget(self._section_label("Filter"))
         self._grp_flt = QtWidgets.QButtonGroup(self)
-        self._btn_flt_ng  = self._toggle_btn("_NG", checked=True)
-        self._btn_flt_g   = self._toggle_btn("_G",  checked=False)
-        self._btn_flt_all = self._toggle_btn("All", checked=False)
-        self._grp_flt.addButton(self._btn_flt_ng,  0)
-        self._grp_flt.addButton(self._btn_flt_g,   1)
-        self._grp_flt.addButton(self._btn_flt_all, 2)
+        self._btn_flt_ng      = self._toggle_btn("FAIL",    checked=True)
+        self._btn_flt_g       = self._toggle_btn("PASS",    checked=False)
+        self._btn_flt_suspect = self._toggle_btn("Suspect", checked=False)
+        self._btn_flt_all     = self._toggle_btn("All",     checked=False)
+        self._grp_flt.addButton(self._btn_flt_ng,      0)
+        self._grp_flt.addButton(self._btn_flt_g,       1)
+        self._grp_flt.addButton(self._btn_flt_suspect, 2)
+        self._grp_flt.addButton(self._btn_flt_all,     3)
         right_lay.addWidget(self._btn_flt_ng)
         right_lay.addWidget(self._btn_flt_g)
+        right_lay.addWidget(self._btn_flt_suspect)
         right_lay.addWidget(self._btn_flt_all)
         self._grp_flt.buttonClicked.connect(self._on_filter_toggle)
 
@@ -2430,11 +2465,20 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._current_base = base_path
         self._apply_filter_and_build_grid()
 
+    @staticmethod
+    def _file_matches_filter(path: str, flt: str) -> bool:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if flt == "":
+            return True
+        if flt == "_S":
+            return stem.endswith("_GS") or stem.endswith("_NGS")
+        return stem.endswith(flt)
+
     def _apply_filter_and_build_grid(self):
         """Filter self._all_paths by suffix, rebuild grid."""
         if self._suffix_filter:
             filtered = [p for p in self._all_paths
-                        if self._suffix_filter in os.path.basename(p)]
+                        if self._file_matches_filter(p, self._suffix_filter)]
             # Fall back to all if no matching suffix found (old files without suffix)
             self._paths = filtered if filtered else self._all_paths
         else:
@@ -2521,7 +2565,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _on_filter_toggle(self, btn):
         flt_id = self._grp_flt.id(btn)
-        self._suffix_filter = {0: "_NG", 1: "_G", 2: ""}[flt_id]
+        self._suffix_filter = {0: "_NG", 1: "_G", 2: "_S", 3: ""}[flt_id]
         self._apply_filter_and_build_grid()
 
 
@@ -3194,7 +3238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._lbl_yield.setText("—")
 
-    def _on_result(self, ia_pass: bool, ib_pass: bool):
+    def _on_result(self, ia_pass: bool, ib_pass: bool, is_suspect: bool):
         self._update_badge(self._badge_a, ia_pass)
         self._update_badge(self._badge_b, ib_pass)
         self._stats_pass  += 1
@@ -3202,7 +3246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_pass.setText(str(self._stats_pass))
         self._update_yield()
 
-    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str):
+    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str, is_suspect: bool):
         ic_a_pass = len(err.missing_a) == 0
         ic_b_pass = len(err.missing_b) == 0
         self._update_badge(self._badge_a, ic_a_pass)

@@ -15,14 +15,41 @@ Sections (in order)
   Detector            OpenVINO 2-class classifier (Text / NoText)
   TemplateManager     Load/save IC bounding-box template
   Inspector           12-cell ROI crop-then-classify logic
-  Logger              Daily-rotating JSON-lines log
+  Logger              Daily-rotating CSV log
   STYLE               Qt stylesheet
   FailDialog          Modal FAIL popup
   ImageView           Zoomable image widget with overlays
-  SetupPanel          Floating auto-detect confirm panel
   RunWorker           QThread inspection loop
-  MainWindow          Single-page PyQt5 UI
+  MainWindow          Two-tab PyQt5 UI (Inspection + Image Browser)
   main / __main__     Entry point
+
+Changes vs main (branch: Sauvola_binary)
+-----------------------------------------
+### Template matching — _contour_template
+- Reverted to Gaussian blur (7×7) + Otsu-driven Canny + dilate (3×3, 1 iter).
+- Removed bilateral filter and all TMPL_BILATERAL_* config keys.
+- `_contour_template` now takes no parameters; callers simplified accordingly.
+- `TemplateMatcher.locate_ic` applies preprocessing on the ±search_margin ROI
+  only (ROI-first) for speed — full-frame fallback kept if ROI too small.
+- Template patch geometry: pin area only (IC bottom → IC bottom + 50% IC height).
+  strip_h stored in template.json is negative (= −IC_height).
+
+### Image counter
+- Added `_reset_image_counter()` — resets `_img_counter` to 0 under lock.
+- Called at: start of each `RunWorker.run()`, `_handle_lot_end()`,
+  and both directory-mode DONE-signal lot-reset points.
+- Result: each lot's image IDs restart from _001.
+
+### Directory-mode retry fix
+- Retry on `MarkMissingError` now guarded by `if cam_mode == "camera"`.
+- In directory mode the retry grab consumed the next file (wrong IC) and caused
+  RealImg/ and Image/ to contain different frames under the same filename.
+- Directory mode now uses the first-attempt result directly (no second grab).
+
+### NG save crash fix
+- `e1.annotated or img_bgr` raised ValueError when annotated is an ndarray.
+- Replaced with `e1.annotated if e1.annotated is not None else img_bgr`
+  in all three affected catch clauses.
 """
 
 import sys

@@ -980,13 +980,14 @@ class TemplateMatcher:
         roi_bgr  = image_bgr[ry1:ry2, rx1:rx2]
 
         if roi_bgr.size == 0 or roi_bgr.shape[0] < ph or roi_bgr.shape[1] < pw:
-            # ROI too small — fall back to full-frame search
+            # ROI empty or too small — fall back to full-frame search
             full = _contour_template(image_bgr)
             res = cv2.matchTemplate(full, self._patch, cv2.TM_CCOEFF_NORMED)
             _, score, _, loc = cv2.minMaxLoc(res)
             ic_y = loc[1] + self._strip_h
             return QtCore.QRect(loc[0], ic_y, self._ic_w, self._ic_h), float(score)
 
+        filtered = _contour_template(roi_bgr)
         res = cv2.matchTemplate(filtered, self._patch, cv2.TM_CCOEFF_NORMED)
         _, score, _, loc = cv2.minMaxLoc(res)
         abs_x = loc[0] + rx1

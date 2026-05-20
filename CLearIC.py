@@ -56,7 +56,6 @@ import os
 import csv
 import json
 import glob
-import math
 import time
 import threading
 from enum import Enum
@@ -91,7 +90,10 @@ class ConfigLoader:
         "CAMERA_WARMUP_FRAMES": 5,
         "CAMERA_RETRY_DELAY":   0.2,
         "CAMERA_RETRIES":       2,
+        "RECONNECT_ATTEMPTS":   3,
+        "RECONNECT_DELAY_S":    5.0,
         "RETRY_DELAY_MS":       250,
+        "DISK_WARN_MB":         200,
         "GPIO_START_PIN":       17,
         "GPIO_DONE_PIN":        27,
         "GPIO_BUSY_PIN":        23,
@@ -408,6 +410,21 @@ class Camera:
                 pass
             self._camera = None
         print("[Camera] Closed.")
+
+    def reconnect(self, attempts: int = 1, delay_s: float = 0.0) -> bool:
+        """Close and re-open the Basler camera. Returns True on success."""
+        for _ in range(max(1, attempts)):
+            self.close()
+            if delay_s > 0:
+                time.sleep(delay_s)
+            try:
+                self._open_basler()
+                self.warmup(1)
+                print("[Camera] Reconnected.")
+                return True
+            except CameraError as e:
+                print(f"[Camera] Reconnect attempt failed: {e}")
+        return False
 
     def is_open(self) -> bool:
         if self._mode == "camera":
@@ -805,8 +822,10 @@ class TemplateManager:
             "match_threshold": match_threshold,
             "strip_h":         strip_h,
         }
-        with open(_TEMPLATE_FILE, "w") as f:
+        _tmp = _TEMPLATE_FILE + ".tmp"
+        with open(_tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(_tmp, _TEMPLATE_FILE)
 
     @staticmethod
     def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
@@ -837,7 +856,9 @@ class TemplateManager:
     def save_patches(full_patch: np.ndarray):
         """Save combined (top strip + IC body + bot strip) patch as tmpl_full.npy."""
         os.makedirs("templates", exist_ok=True)
-        np.save(_TEMPLATE_FULL, full_patch)
+        _tmp = _TEMPLATE_FULL.replace(".npy", "_tmp.npy")
+        np.save(_tmp, full_patch)
+        os.replace(_tmp, _TEMPLATE_FULL)
 
     @staticmethod
     def load_patches():
@@ -915,7 +936,9 @@ class TemplateManager:
         roi[edge_mask] = roi[edge_mask] * 0.3 + teal * 0.7
         preview[patch_y1:patch_y2, ax:patch_x2] = roi.clip(0, 255).astype(np.uint8)
 
-        cv2.imwrite(_TEMPLATE_PREVIEW, preview)
+        _tmp = _TEMPLATE_PREVIEW + ".tmp.png"
+        cv2.imwrite(_tmp, preview)
+        os.replace(_tmp, _TEMPLATE_PREVIEW)
 
     @staticmethod
     def compute_rois(template: dict, grid_cfg: dict | None = None) -> tuple:
@@ -1299,6 +1322,7 @@ class Logger:
                 w.writerow(["TOTAL",       total])
                 w.writerow(["PASS",        pass_ct])
                 w.writerow(["FAIL",        fail_ct])
+                w.writerow(["ERRORS",      err_ct])
                 w.writerow(["YIELD_PCT",   yield_])
                 w.writerow(["END_TIME",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 w.writerow(["DURATION_S",  round(elapsed_s, 1)])
@@ -1713,8 +1737,10 @@ class RunWorker(QtCore.QThread):
         self.sig_session_reset.emit(self._lot_number)
 
     def run(self):
-        cam_mode = self._cfg.get("CAMERA", "directory")
-        debug    = self._cfg.get("DEBUG", True)
+        cam_mode          = self._cfg.get("CAMERA", "directory")
+        debug             = self._cfg.get("DEBUG", True)
+        reconnect_attempts = int(self._cfg.get("RECONNECT_ATTEMPTS", 3))
+        reconnect_delay   = float(self._cfg.get("RECONNECT_DELAY_S", 5.0))
 
         # Camera preflight — verify camera is reachable before entering the loop.
         if cam_mode == "camera":
@@ -1775,8 +1801,21 @@ class RunWorker(QtCore.QThread):
             except CameraError as e:
                 self._logger.log_error("CAMERA_ERROR", str(e),
                                        (time.perf_counter() - t0) * 1000)
+                if cam_mode == "directory":
+                    self.sig_status.emit(f"Skipping unreadable image: {e}")
+                    continue
+                # Camera mode: attempt reconnect before giving up
+                reconnected = False
+                for attempt in range(reconnect_attempts):
+                    self.sig_status.emit(
+                        f"Camera lost — reconnecting {attempt + 1}/{reconnect_attempts}…")
+                    if self._camera.reconnect(1, reconnect_delay):
+                        reconnected = True
+                        break
+                if reconnected:
+                    continue   # retry this cycle
                 self.sig_error.emit(f"Camera error: {e}")
-                self.sig_status.emit("ERROR — machine blocked, restart required.")
+                self.sig_status.emit("ERROR — camera lost, restart required.")
                 break
 
             img_id = _next_image_id()
@@ -1802,12 +1841,15 @@ class RunWorker(QtCore.QThread):
             except TemplateError as te:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("TEMPLATE_ERROR", str(te), cycle_ms)
-                self.sig_error.emit(f"Template error: {te}")
-                self.sig_status.emit("ERROR — template invalid, restart required.")
                 try:
                     os.remove(tmp_real)
                 except OSError:
                     pass
+                if cam_mode == "directory":
+                    self.sig_status.emit(f"Skipping {img_id}: {te}")
+                    continue
+                self.sig_error.emit(f"Template error: {te}")
+                self.sig_status.emit("ERROR — template invalid, restart required.")
                 break
 
             except MarkMissingError as e1:
@@ -2140,9 +2182,10 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._paths: list    = []      # filtered paths shown in grid
         self._cur_idx        = 0
         self._subfolder      = "RealImg"    # "RealImg" or "Image"
-        self._suffix_filter  = "_NG"        # "_NG", "_G", or "" (all)
+        self._suffix_filter  = "FAIL"
         self._cards: list    = []
         self._current_base: str = ""
+        self._img_ratio: float = 3 / 4   # h/w; updated from first image on each folder load
         self._thumb_worker: ThumbnailWorker | None = None
         self._scan_worker:  FolderScanWorker | None = None
 
@@ -2174,7 +2217,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         grid_lay.setContentsMargins(0, 0, 0, 0)
         self._scroll = QtWidgets.QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self._scroll.setStyleSheet("QScrollArea{border:none;background:transparent}")
         self._grid_area = QtWidgets.QWidget()
@@ -2269,31 +2312,21 @@ class ImageBrowserPage(QtWidgets.QWidget):
         if self._paths and e.size() != e.oldSize():
             QtCore.QTimer.singleShot(150, self._rebuild_grid)
 
-    def _card_size(self, n_images: int):
-        """Calculate card/thumbnail dimensions so all rows fit in the viewport."""
+    def _card_size(self):
+        """Calculate card/thumbnail dimensions from viewport width and image aspect ratio."""
         vp_w = self._scroll.viewport().width()
-        vp_h = self._scroll.viewport().height()
-        if vp_w < 4 or vp_h < 4:    # not yet laid out — return safe defaults
+        if vp_w < 4:
             return 100, 96, 96, 72
 
-        n_rows = max(1, math.ceil(n_images / self._COLS))
-        sp     = self._grid_layout.horizontalSpacing()
-        sp_v   = self._grid_layout.verticalSpacing()
-
-        # Width: 4 cards fill viewport width
+        sp      = self._grid_layout.horizontalSpacing()
         w_avail = max(1, vp_w - sp * (self._COLS - 1) - 4)
         card_w  = max(60, w_avail // self._COLS)
 
-        # Height: all rows fit in viewport height
-        h_avail = max(1, vp_h - sp_v * (n_rows - 1) - 4)
-        card_h  = max(50, h_avail // n_rows)
+        thumb_w = max(1, card_w - 4)
+        thumb_h = max(1, int(thumb_w * self._img_ratio))
+        card_h  = thumb_h + 24   # 24 px for filename label + margins
 
-        # Thumbnail area fills card minus 2px margin and 22px filename label
-        thumb_w = card_w - 4
-        thumb_h = max(1, card_h - 22)
-        # card_h already set above — no ratio cap; Qt scales the image within the box
-
-        return card_w, card_h, max(1, thumb_w), max(1, thumb_h)
+        return card_w, card_h, thumb_w, thumb_h
 
     # helpers
 
@@ -2354,22 +2387,22 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     @staticmethod
     def _file_matches_filter(path: str, flt: str) -> bool:
-        stem = os.path.splitext(os.path.basename(path))[0]
         if flt == "":
             return True
-        if flt == "_S":
-            return stem.endswith("_GS") or stem.endswith("_NGS")
-        return stem.endswith(flt)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        sfx  = stem.rsplit("_", 1)[-1] if "_" in stem else ""
+        if flt == "FAIL":
+            return sfx in ("NG", "NGS")
+        if flt == "PASS":
+            return sfx in ("G", "GS")
+        if flt == "SUSPECT":
+            return sfx in ("GS", "NGS")
+        return False
 
     def _apply_filter_and_build_grid(self):
         """Filter self._all_paths by suffix, rebuild grid."""
-        if self._suffix_filter:
-            filtered = [p for p in self._all_paths
-                        if self._file_matches_filter(p, self._suffix_filter)]
-            # Fall back to all if no matching suffix found (old files without suffix)
-            self._paths = filtered if filtered else self._all_paths
-        else:
-            self._paths = list(self._all_paths)
+        self._paths = [p for p in self._all_paths
+                       if self._file_matches_filter(p, self._suffix_filter)]
 
         self._lbl_count.setText(f"{len(self._paths)} images")
         self._rebuild_grid()
@@ -2395,7 +2428,13 @@ class ImageBrowserPage(QtWidgets.QWidget):
         if not self._paths:
             return
 
-        card_w, card_h, thumb_w, thumb_h = self._card_size(len(self._paths))
+        # Peek first image to get its aspect ratio for correct card proportions
+        _peek = cv2.imread(self._paths[0], cv2.IMREAD_REDUCED_GRAYSCALE_2)
+        if _peek is not None and _peek.shape[1] > 0:
+            self._img_ratio = _peek.shape[0] / _peek.shape[1]
+        del _peek
+
+        card_w, card_h, thumb_w, thumb_h = self._card_size()
 
         for idx, path in enumerate(self._paths):
             fname = os.path.basename(path)
@@ -2452,7 +2491,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _on_filter_toggle(self, btn):
         flt_id = self._grp_flt.id(btn)
-        self._suffix_filter = {0: "_NG", 1: "_G", 2: "_S", 3: ""}[flt_id]
+        self._suffix_filter = {0: "FAIL", 1: "PASS", 2: "SUSPECT", 3: ""}[flt_id]
         self._apply_filter_and_build_grid()
 
 
@@ -2965,6 +3004,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._session_start_time = time.monotonic()
 
+        # Disk space soft check
+        out_dir = self._cfg.get("OUT_DIR", "Output/")
+        warn_mb = int(self._cfg.get("DISK_WARN_MB", 200))
+        try:
+            import shutil as _shutil
+            free_mb = _shutil.disk_usage(out_dir).free >> 20
+            if free_mb < warn_mb:
+                self._show_error(
+                    f"Low disk: {free_mb} MB free (threshold {warn_mb} MB) — run continues")
+        except OSError:
+            pass
+
+        # Purge orphaned temp files from today's output dir (leftover from crashes)
+        _VALID_SFX = ("_G.jpg", "_NG.jpg", "_GS.jpg", "_NGS.jpg")
+        today_dir  = os.path.join(out_dir, datetime.now().strftime("%Y%m%d"))
+        if os.path.isdir(today_dir):
+            for _root, _, _files in os.walk(today_dir):
+                for _f in _files:
+                    if _f.endswith(".jpg") and not any(_f.endswith(s) for s in _VALID_SFX):
+                        try:
+                            os.remove(os.path.join(_root, _f))
+                        except OSError:
+                            pass
+
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
         self._logger.start_lot(self._lot_number, self._package_name, mode)
 
@@ -3123,10 +3186,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lbl_fail.setText(str(self._stats_fail))
         self._update_yield()
 
-    def _on_result(self, ia_pass: bool, ib_pass: bool, is_suspect: bool):
+    def _on_result(self, ia_pass: bool, ib_pass: bool, _is_suspect: bool):
         self._update_ui_after_cycle(ia_pass, ib_pass, passed=True)
 
-    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str, is_suspect: bool):
+    def _on_fail(self, err: MarkMissingError, _ann_path: str, _img_id: str, _is_suspect: bool):
         self._update_ui_after_cycle(
             len(err.missing_a) == 0, len(err.missing_b) == 0, passed=False)
 

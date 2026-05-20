@@ -74,9 +74,8 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 # CONFIG LOADER
 # =========================================================
 class ConfigLoader:
-    CONFIG_FILE = "Config.json"
+    CONFIG_FILE = "Config.toml"
     DEFAULT_CONFIG = {
-        # Camera / detection
         "CAMERA":               "directory",
         "CONF_THR":             0.5,
         "TEXT_MIN_CONF":        0.80,
@@ -85,7 +84,6 @@ class ConfigLoader:
         "NMS_IOU_THR":          0.45,
         "CAMERA_SERIAL":        "",
         "EXPOSURE_US":          8000,
-        # Dev flags
         "DEBUG":                True,
         "IO":                   False,
         "MODE":                 "DEBUG",
@@ -94,12 +92,10 @@ class ConfigLoader:
         "OUT_DIR":              "Output/",
         "MODEL_PATH":           "Text_cls-2/best_openvino_model/best.xml",
         "TEMPLATE_MODEL_PATH":  "IC_Search_openvino_model/IC_Search.xml",
-        # Camera tuning
         "CAMERA_WARMUP_FRAMES": 5,
         "CAMERA_RETRY_DELAY":   0.2,
         "CAMERA_RETRIES":       2,
         "RETRY_DELAY_MS":       250,
-        # GPIO pins
         "GPIO_START_PIN":       17,
         "GPIO_DONE_PIN":        27,
         "GPIO_BUSY_PIN":        23,
@@ -109,19 +105,15 @@ class ConfigLoader:
         "MOCK_START_DELAY_MS":  200,
         "MOCK_DONE_DELAY_MS":   100,
         "TRIGGER_SETTLE_MS":    50,
-        # Cell grid geometry
         "CELL_SHRINK":          0.95,
         "CELL_EXPAND":          1.2,
         "COL_GAP_PCT":          40.0,
         "GRID_MARGIN_TOP":      0.0,
         "GRID_MARGIN_BOT":      15.0,
-        # Dataset collection
         "DATA_DIR":             "Dataset",
         "DATA_SPLIT":           "train",
-        # Logging
         "LOG_DIR":              "logs",
         "LOG_RETENTION":        365,
-        # Annotation settings (non-color)
         "ANN_BORDER_PX":        1,
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
@@ -130,13 +122,14 @@ class ConfigLoader:
 
     @classmethod
     def load(cls) -> dict:
+        import tomlkit
         if not os.path.exists(cls.CONFIG_FILE):
-            raise ConfigError("Config.json not found — create it before running.")
+            raise ConfigError("Config.toml not found — create it before running.")
         try:
-            with open(cls.CONFIG_FILE, "r") as f:
-                data = json.load(f)
+            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = tomlkit.load(f)
         except Exception as e:
-            raise ConfigError(f"Config.json unreadable: {e}")
+            raise ConfigError(f"Config.toml unreadable: {e}")
         cfg = dict(cls.DEFAULT_CONFIG)
         for k in cls.DEFAULT_CONFIG:
             if k in data:
@@ -166,19 +159,34 @@ class ConfigLoader:
         return cfg
 
     @classmethod
-    def save(cls, data: dict):
-        with open(cls.CONFIG_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+    def save(cls, updates: dict):
+        import tomlkit
+        try:
+            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+                doc = tomlkit.load(f)
+        except Exception:
+            doc = tomlkit.document()
+        for k, v in updates.items():
+            if k in cls.DEFAULT_CONFIG:
+                doc[k] = v
+        with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(tomlkit.dumps(doc))
 
     @classmethod
     def update(cls, updates: dict):
         """Merge partial updates into saved config. Only known keys are accepted."""
-        cfg = cls.load()
+        import tomlkit
+        try:
+            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+                doc = tomlkit.load(f)
+        except Exception:
+            doc = tomlkit.document()
         for k, v in updates.items():
             if k in cls.DEFAULT_CONFIG:
-                cfg[k] = v
-        cls.save(cfg)
-        return cfg
+                doc[k] = v
+        with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(tomlkit.dumps(doc))
+        return cls.load()
 
 # =========================================================
 # STAGE & ERROR FLAGS

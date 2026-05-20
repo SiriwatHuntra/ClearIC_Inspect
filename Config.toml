@@ -1,0 +1,137 @@
+# ─── System ──────────────────────────────────────────────────────────────────
+# Image source — "camera" uses live Basler camera, "directory" reads from Input/
+CAMERA = "directory"
+
+# Print extra debug logs and save annotated image every cycle
+DEBUG = true
+
+# Set to true to drive real GPIO pins; false = log-only, safe without hardware
+IO = false
+
+# Label written into log records (e.g. "DEBUG", "PRODUCTION")
+MODE = "DEBUG"
+
+# Save cropped cells to Dataset/ for model retraining
+COLLECT_DATASET = false
+
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+# Folder containing images when CAMERA = "directory"
+DIR_INPUT = "Input/"
+
+# Root output folder for raw and annotated results
+OUT_DIR = "Output/"
+
+# Folder where daily CSV log files are written
+LOG_DIR = "logs"
+
+# Folder where collected dataset crops are saved
+DATA_DIR = "Dataset"
+
+# Dataset subfolder used when COLLECT_DATASET = true
+DATA_SPLIT = "train"
+
+# OpenVINO cell classifier model (.xml)
+MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
+
+# Unused IC search model — kept for reference only
+TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"
+
+
+# ─── Classifier / Inspection ─────────────────────────────────────────────────
+# Minimum overall classifier confidence to accept any prediction
+CONF_THR = 0.85
+
+# Text-class probability must exceed this to call a cell PASS
+TEXT_MIN_CONF = 0.80
+
+# Missing cells below this count → PASS (suspect); at or above → FAIL (suspect)
+TEXT_NG_THRESHOLD = 2
+
+# Pixel std-dev below this forces NoText (blank cell); 0 = disabled
+BLANK_CELL_STD_THR = 0.0
+
+# Non-maximum suppression IoU threshold (detection post-processing)
+NMS_IOU_THR = 0.45
+
+
+# ─── Grid Geometry ───────────────────────────────────────────────────────────
+# Shrink IC bounding rect before splitting into cells (centred, e.g. 0.95 = 5% trim)
+CELL_SHRINK = 0.95
+
+# Expand each individual cell crop after splitting (centred overlap)
+CELL_EXPAND = 1.00
+
+# Gap between left and right IC columns, as % of IC width
+COL_GAP_PCT = 40.0
+
+# Dead-band at top of IC before row 1, as % of IC height
+GRID_MARGIN_TOP = 5.0
+
+# Dead-band at bottom of IC after row 3, as % of IC height
+GRID_MARGIN_BOT = 10.0
+
+
+# ─── Camera ──────────────────────────────────────────────────────────────────
+# Basler camera serial number filter; leave blank to use first camera found
+CAMERA_SERIAL = ""
+
+# Camera exposure time in microseconds
+EXPOSURE_US = 8000
+
+# Frames grabbed and discarded on startup to let camera exposure stabilise
+CAMERA_WARMUP_FRAMES = 5
+
+# Seconds to wait between camera grab retries
+CAMERA_RETRY_DELAY = 0.2
+
+# Maximum grab retries before raising a camera error
+CAMERA_RETRIES = 2
+
+# Milliseconds to wait before the second inspection attempt when the first fails
+RETRY_DELAY_MS = 250
+
+# Classifier warm-up passes on startup (separate from camera warm-up)
+WARMUP_FRAMES = 5
+
+
+# ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────
+# Input — active LOW: triggers a new inspection cycle
+GPIO_START_PIN = 17
+
+# Input — active LOW: PLC signals that it received the inspection result
+GPIO_DONE_PIN = 27
+
+# Output — HIGH while inspection is running
+GPIO_BUSY_PIN = 23
+
+# Input — active LOW: advances the lot number counter
+GPIO_LOT_END_PIN = 18
+
+# Output — HIGH when IC_A has failed
+GPIO_FAIL_A_PIN = 24
+
+# Output — HIGH when IC_B has failed
+GPIO_FAIL_B_PIN = 25
+
+
+# ─── GPIO Timing ─────────────────────────────────────────────────────────────
+# Fake START pulse delay when IO = false (test/debug use only)
+MOCK_START_DELAY_MS = 200
+
+# Fake DONE pulse delay when IO = false (test/debug use only)
+MOCK_DONE_DELAY_MS = 100
+
+# Wait after GPIO trigger before reading pins (pin debounce settle time)
+TRIGGER_SETTLE_MS = 50
+
+
+# ─── Logging & Annotation ────────────────────────────────────────────────────
+# Maximum number of log files kept per pattern (oldest deleted automatically)
+LOG_RETENTION = 365
+
+# Cell overlay border thickness in pixels on annotated images
+ANN_BORDER_PX = 1
+
+# Show "R1C1" grid labels on cell overlays in annotated images
+ANN_SHOW_LABELS = true

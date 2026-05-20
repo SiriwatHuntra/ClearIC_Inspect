@@ -32,10 +32,10 @@
   "TRIGGER_SETTLE_MS": 50,
 
   "CELL_SHRINK": 0.95,
-  "CELL_EXPAND": 1.2,
+  "CELL_EXPAND": 1.00,
   "COL_GAP_PCT": 40.0,
-  "GRID_MARGIN_TOP": 0.0,
-  "GRID_MARGIN_BOT": 15.0,
+  "GRID_MARGIN_TOP": 5.0,
+  "GRID_MARGIN_BOT": 10.0,
 
   "DATA_DIR": "Dataset",
   "DATA_SPLIT": "train",

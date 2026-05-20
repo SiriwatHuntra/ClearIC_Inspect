@@ -115,6 +115,7 @@ class ConfigLoader:
         "ANN_BORDER_PX":        1,
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
+        "SKIP_DONE_WAIT":       False,
     }
     _VALID_CAMERA = {"camera", "directory"}
 
@@ -532,6 +533,11 @@ class RaspberryIO:
 
     def clear_outputs(self):
         self._out(self._busy_pin,   False, "BUSY_PIN")
+        self._out(self._fail_a_pin, False, "FAIL_A_PIN")
+        self._out(self._fail_b_pin, False, "FAIL_B_PIN")
+
+    def clear_fail_outputs(self):
+        """Clear only fail pins — BUSY unchanged. Used by SKIP_DONE_WAIT machines."""
         self._out(self._fail_a_pin, False, "FAIL_A_PIN")
         self._out(self._fail_b_pin, False, "FAIL_B_PIN")
 
@@ -1773,7 +1779,9 @@ class RunWorker(QtCore.QThread):
                 if self._stop:
                     break
 
-                # Tray settled — assert BUSY before grab
+                # Tray settled — clear previous result, assert BUSY before grab
+                if self._cfg.get("SKIP_DONE_WAIT", False):
+                    self._gpio.clear_fail_outputs()
                 self._gpio.set_busy(True)
 
                 settle_ms = self._cfg.get("TRIGGER_SETTLE_MS", 0)
@@ -1963,10 +1971,13 @@ class RunWorker(QtCore.QThread):
 
             # End-of-cycle handshake
             if cam_mode == "camera":
-                # Production: hold outputs until machine signals DONE
-                self.sig_status.emit("Holding — waiting for DONE signal…")
-                self._gpio.wait_for_done(lambda: self._stop)
-                self._gpio.clear_outputs()
+                if self._cfg.get("SKIP_DONE_WAIT", False):
+                    pass  # FAIL pins stay set; PLC reads after BUSY LOW; cleared at next START
+                else:
+                    # Production: hold outputs until machine signals DONE
+                    self.sig_status.emit("Holding — waiting for DONE signal…")
+                    self._gpio.wait_for_done(lambda: self._stop)
+                    self._gpio.clear_outputs()
             else:
                 if not self._camera.has_more():
                     self._camera.reset()

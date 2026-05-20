@@ -17,7 +17,6 @@ Sections (in order)
   Inspector           12-cell ROI crop-then-classify logic
   Logger              Daily-rotating CSV log
   STYLE               Qt stylesheet
-  FailDialog          Modal FAIL popup
   ImageView           Zoomable image widget with overlays
   RunWorker           QThread inspection loop
   MainWindow          Two-tab PyQt5 UI (Inspection + Image Browser)
@@ -70,9 +69,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 
-# =========================================================
 # CONFIG LOADER
-# =========================================================
 class ConfigLoader:
     CONFIG_FILE = "Config.toml"
     DEFAULT_CONFIG = {
@@ -91,7 +88,6 @@ class ConfigLoader:
         "DIR_INPUT":            "Input/",
         "OUT_DIR":              "Output/",
         "MODEL_PATH":           "Text_cls-2/best_openvino_model/best.xml",
-        "TEMPLATE_MODEL_PATH":  "IC_Search_openvino_model/IC_Search.xml",
         "CAMERA_WARMUP_FRAMES": 5,
         "CAMERA_RETRY_DELAY":   0.2,
         "CAMERA_RETRIES":       2,
@@ -188,9 +184,7 @@ class ConfigLoader:
             f.write(tomlkit.dumps(doc))
         return cls.load()
 
-# =========================================================
 # STAGE & ERROR FLAGS
-# =========================================================
 class Stage(Enum):
     STANDBY  = "STANDBY"
     BUSY     = "BUSY"
@@ -204,9 +198,7 @@ class ErrorFlag(Enum):
     GPIO     = "GPIO"
     TEMPLATE = "TEMPLATE"
 
-# =========================================================
 # EXCEPTIONS
-# =========================================================
 class InspectionError(Exception):
     pass
 
@@ -244,9 +236,7 @@ class GPIOError(_SystemError):
 class ConfigError(InspectionError):
     pass
 
-# =========================================================
 # IMAGE DATACLASS + ID GENERATOR
-# =========================================================
 _img_counter  = 0
 _counter_lock = threading.Lock()
 
@@ -267,9 +257,7 @@ class Image:
     raw:       np.ndarray
     annotated: np.ndarray = field(default=None)
 
-# =========================================================
 # CAMERA
-# =========================================================
 class Camera:
     """
     Unified camera source.
@@ -304,7 +292,7 @@ class Camera:
             except ImportError:
                 raise CameraError("pypylon not installed — cannot use CAMERA='camera'")
 
-    # ---- open ----
+    # open
     def open(self):
         if self._mode == "camera":
             self._open_basler()
@@ -349,7 +337,7 @@ class Camera:
         self._idx   = 0
         print(f"[Camera] Directory mode — {len(files)} image(s) in '{self._input_dir}/'")
 
-    # ---- grab ----
+    # grab
     def grab(self) -> np.ndarray:
         """Return BGR ndarray or raise CameraError."""
         for attempt in range(self._retries + 1):
@@ -393,13 +381,7 @@ class Camera:
             raise CameraError(f"Cannot read image: {path}")
         return img
 
-    def peek_filename(self) -> str:
-        """Return the filename that the next grab() will read (directory mode only)."""
-        if self._mode != "directory" or not self._files:
-            return ""
-        return os.path.basename(self._files[self._idx % len(self._files)])
-
-    # ---- misc ----
+    # misc
     def warmup(self):
         if self._mode == "camera":
             for _ in range(self._warmup_frames):
@@ -451,9 +433,7 @@ class Camera:
             self.reset()
         return img
 
-# =========================================================
 # RASPBERRY IO
-# =========================================================
 class RaspberryIO:
     """
     BCM-mode GPIO handler with serial lighting controller.
@@ -605,11 +585,9 @@ class RaspberryIO:
             except Exception:
                 pass
 
-# =========================================================
 # DETECTOR  (OpenVINO Classifier — 2-class)
-# =========================================================
 _CLS_INPUT_SIZE = 224   # YOLO-cls default input size
-SHRINK_SCALE   = 1    # fraction to shrink detected IC boxes before slicing cells
+_TOTAL_CELLS    = 12    # 6 cells × 2 ICs
 
 class Detector:
     """
@@ -688,10 +666,6 @@ class Detector:
             print(f"[Detector] Classify error: {e}")
             return 0, 0.0
 
-    def detect_all(self, _: np.ndarray) -> list:
-        """Stub — classifier cannot detect IC positions. Draw IC areas in Setup to create template."""
-        return []
-
 # Dataset collection run counter
 _data_run_counter = 0
 _dataset_lock     = threading.Lock()
@@ -699,9 +673,7 @@ _dataset_lock     = threading.Lock()
 # CLAHE preprocessor applied to each cell crop before classification
 _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-# =========================================================
 # VISUAL CONSTANTS  (fixed — not configurable at runtime)
-# =========================================================
 _ann_color_ok = "#00C800"   # hex — Text  / PASS cell border
 _ann_color_ng = "#DD0000"   # hex — NoText / FAIL cell border
 _tmpl_color_a = "#FFD700"   # hex — IC_A overlay in setup view
@@ -712,11 +684,6 @@ def _hex_to_bgr(h: str) -> tuple:
     h = h.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return (b, g, r)
-
-def _valid_hex(s: str) -> bool:
-    s = s.strip().lstrip("#")
-    return len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s)
-
 
 def _build_cells(x: int, y: int, w: int, h: int,
                  cell_shrink: float = 0.95, cell_expand: float = 1.2,
@@ -782,12 +749,9 @@ def _save_cell_crops(image_bgr: np.ndarray, cells: list,
             fname = f"{run_num:06d}_IC{ic_label}_{idx:02d}.png"
             cv2.imwrite(os.path.join(folder, fname), crop)
 
-# =========================================================
 # TEMPLATE MANAGER
-# =========================================================
 _TEMPLATE_FILE    = "templates/template.json"
-_TEMPLATE_FULL    = "templates/tmpl_full.npy"   # combined patch (top strip + IC + bot strip)
-_TEMPLATE_BOT     = "templates/tmpl_bot.npy"    # deprecated — kept for backward-compat load
+_TEMPLATE_FULL    = "templates/tmpl_full.npy"
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
 def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
@@ -877,26 +841,14 @@ class TemplateManager:
 
     @staticmethod
     def load_patches():
-        """
-        Load combined template patch (tmpl_full.npy).
-        Falls back to deprecated tmpl_bot.npy if full patch not found.
-        Returns ndarray or None if absent/corrupt.
-        """
-        if os.path.exists(_TEMPLATE_FULL):
-            try:
-                return np.load(_TEMPLATE_FULL)
-            except Exception as e:
-                print(f"[TemplateManager] Patch load failed: {e}")
-                return None
-        # Backward compat: old split files — use bot strip only for matching
-        if os.path.exists(_TEMPLATE_BOT):
-            try:
-                print("[TemplateManager] tmpl_full.npy not found, using deprecated "
-                      "tmpl_bot.npy — re-save template to upgrade.")
-                return np.load(_TEMPLATE_BOT)
-            except Exception as e:
-                print(f"[TemplateManager] Deprecated patch load failed: {e}")
-        return None
+        """Load template patch (tmpl_full.npy). Returns ndarray or None if absent/corrupt."""
+        if not os.path.exists(_TEMPLATE_FULL):
+            return None
+        try:
+            return np.load(_TEMPLATE_FULL)
+        except Exception as e:
+            print(f"[TemplateManager] Patch load failed: {e}")
+            return None
 
     @staticmethod
     def save_preview(image_bgr: np.ndarray,
@@ -913,7 +865,7 @@ class TemplateManager:
         img_h, img_w = image_bgr.shape[:2]
         preview = image_bgr.copy()
 
-        # ── IC boxes, cell grids, centre crosses ────────────────────────────
+        # IC boxes, cell grids, centre crosses
         for rect, color, label in [
             (ic_a, (0, 255, 255), "IC_A"),
             (ic_b, (255, 215, 0), "IC_B"),
@@ -936,7 +888,7 @@ class TemplateManager:
             cv2.line(preview, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2)
             cv2.circle(preview, (cx, cy), 3, (255, 255, 255), -1)
 
-        # ── Template patch region (IC_A only) ───────────────────────────────
+        # Template patch region (IC_A only)
         # Geometry must match extract_patches exactly: IC body + 50% strip below
         # Pin area: [X1, Y2] → [X2, Y3], matches extract_patches geometry exactly
         ax, ay = ic_a.x(), ic_a.y()
@@ -954,7 +906,7 @@ class TemplateManager:
                     (ax + 2, patch_y2 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
 
-        # ── Contour edge overlay (teal) inside pin patch only ───────────────
+        # Contour edge overlay (teal) inside pin patch only
         contour_full = _contour_template(image_bgr)
         patch_edges  = contour_full[patch_y1:patch_y2, ax:patch_x2]
         edge_mask    = patch_edges > 0
@@ -980,9 +932,7 @@ class TemplateManager:
             )
         return _cells(template["ic_a"]), _cells(template["ic_b"])
 
-# =========================================================
 # TEMPLATE MATCHER
-# =========================================================
 class TemplateMatcher:
     """
     Locates IC_A in a new image using a single adaptive-binary combined patch
@@ -1088,9 +1038,7 @@ def _find_second_ic(image_bgr: np.ndarray,
         return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
     return None, float(score)
 
-# =========================================================
 # INSPECTOR
-# =========================================================
 class Inspector:
     """
     Crops each ROI cell from the image and classifies it as Text / NoText.
@@ -1217,11 +1165,10 @@ class Inspector:
             text_confs.append(text_conf)
             if debug:
                 lbl = "Text" if present else "NoText"
-                _dbg_g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
                       f"cls={lbl} conf={conf:.3f} text_conf={text_conf:.3f}  "
-                      f"raw_std={_dbg_g.std():.1f}")
+                      f"raw_std={gray.std():.1f}")
             color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),
@@ -1239,9 +1186,7 @@ class Inspector:
                 missing.append([row, col])
         return missing, hits_flags, text_confs
 
-# =========================================================
 # LOGGER
-# =========================================================
 class Logger:
     """
     Dual-CSV logging system.
@@ -1259,7 +1204,7 @@ class Logger:
 
     _OP_HEADER   = ["timestamp", "event", "lot_number", "detail", "cycle_ms"]
     _RES_HEADER  = ["timestamp", "image_id", "ic_a_result",
-                    "ic_b_result", "cycle_ms", "is_retry"]
+                    "ic_b_result", "cycle_ms", "is_retry", "is_suspect"]
 
     def __init__(self, log_dir: str = "logs", log_retention: int = 365):
         self._dir        = log_dir
@@ -1273,7 +1218,7 @@ class Logger:
         os.makedirs(log_dir, exist_ok=True)
         self._rotate()
 
-    # ── internal helpers ────────────────────────────────────────
+    # internal helpers
 
     def _op_path(self) -> str:
         return os.path.join(self._dir, f"op_{datetime.now():%Y%m%d}.csv")
@@ -1348,7 +1293,7 @@ class Logger:
         except Exception as e:
             print(f"[Logger] result footer write failed: {e}", file=sys.stderr)
 
-    # ── public interface ────────────────────────────────────────
+    # public interface
 
     def start_lot(self, lot_number: str, package: str, mode: str):
         self._rotate()
@@ -1415,12 +1360,8 @@ class Logger:
     def log_resume(self):
         self._op_append("RESUME")
 
-    def log_io_mock(self, pin_name: str, state: str):
-        print(f"[IO MOCK] {pin_name} → {state}")
 
-# =========================================================
 # STYLESHEET
-# =========================================================
 STYLE = """
 QMainWindow, QWidget#root {
     background: #5465FF;
@@ -1532,60 +1473,11 @@ QCheckBox::indicator:disabled {
 }
 """
 
-# =========================================================
-# FAIL DIALOG
-# =========================================================
-def _fmt_missing(cells: list) -> str:
-    return ", ".join(f"[R{r}C{c}]" for r, c in cells)
-
-class FailDialog(QtWidgets.QDialog):
-
-    def __init__(self, missing_a: list, missing_b: list, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Inspection Failed")
-        self.setModal(True)
-        self.setStyleSheet(
-            "QDialog { background: #5465FF; border-radius: 10px; }"
-            "QLabel  { color: #FFFFFF; }"
-            "QPushButton { background:#FFFFFF; color:#5465FF; font-weight:bold;"
-            "  border-radius:6px; padding:6px 24px; }"
-        )
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setSpacing(10)
-        lay.setContentsMargins(20, 20, 20, 20)
-
-        title = QtWidgets.QLabel("Inspection Failed")
-        title.setStyleSheet("font-size:16px;font-weight:bold;color:#FFFFFF")
-        title.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(title)
-
-        if missing_a:
-            lbl = QtWidgets.QLabel(f"IC_A — missing: {_fmt_missing(missing_a)}")
-            lbl.setStyleSheet("color:#EF5350;font-weight:bold")
-            lbl.setWordWrap(True)
-            lay.addWidget(lbl)
-
-        if missing_b:
-            lbl = QtWidgets.QLabel(f"IC_B — missing: {_fmt_missing(missing_b)}")
-            lbl.setStyleSheet("color:#EF5350;font-weight:bold")
-            lbl.setWordWrap(True)
-            lay.addWidget(lbl)
-
-        btn = QtWidgets.QPushButton("Acknowledge")
-        btn.clicked.connect(self.accept)
-        lay.addWidget(btn, alignment=QtCore.Qt.AlignCenter)
-
-        self.adjustSize()
-
-# =========================================================
-# IMAGE VIEW
-# =========================================================
 class ImageView(QtWidgets.QLabel):
     """
     Zoomable image display with overlay support, stamp mode, and rubber-band drawing.
     """
-    anchor_clicked = QtCore.pyqtSignal(QtCore.QPoint)   # unused but kept for future
-    rect_drawn     = QtCore.pyqtSignal(QtCore.QRect)    # emitted on rubber-band release (image coords)
+    rect_drawn = QtCore.pyqtSignal(QtCore.QRect)    # emitted on rubber-band release (image coords)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1595,9 +1487,6 @@ class ImageView(QtWidgets.QLabel):
         self._scale       = 1.0
         self._offset      = QtCore.QPoint(0, 0)
         self._overlays    = []    # (QRect, QColor, label)
-        self._stamp_mode  = False
-        self._stamp_w     = 100
-        self._stamp_h     = 60
         self._rb_mode     = False
         self._rb_start    = None  # QPoint in image coords
         self._rb_cur      = None  # QPoint in image coords (current drag position)
@@ -1605,7 +1494,7 @@ class ImageView(QtWidgets.QLabel):
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Expanding)
 
-    # ---- image ----
+    # image
     def set_image(self, img: np.ndarray):
         if img is None:
             return
@@ -1646,7 +1535,7 @@ class ImageView(QtWidgets.QLabel):
         if e.size() != e.oldSize():
             QtCore.QTimer.singleShot(0, self._refresh)
 
-    # ---- coordinate helper ----
+    # coordinate helper
     def _to_img(self, pt: QtCore.QPoint) -> QtCore.QPoint:
         if self.pixmap() is None or self._orig is None:
             return pt
@@ -1662,7 +1551,7 @@ class ImageView(QtWidgets.QLabel):
         h = int(rect.height() * self._scale)
         return QtCore.QRect(x, y, w, h)
 
-    # ---- overlays ----
+    # overlays
     def add_overlay(self, rect: QtCore.QRect, color: QtGui.QColor, label: str = ""):
         self._overlays.append((rect, color, label))
         self.update()
@@ -1671,15 +1560,7 @@ class ImageView(QtWidgets.QLabel):
         self._overlays.clear()
         self.update()
 
-    # ---- stamp mode ----
-    def set_stamp_mode(self, on: bool, w: int = 100, h: int = 60):
-        self._stamp_mode = on
-        self._stamp_w    = w
-        self._stamp_h    = h
-        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
-        self.update()
-
-    # ---- rubber-band mode ----
+    # rubber-band mode
     def set_rubberband_mode(self, on: bool):
         self._rb_mode  = on
         self._rb_start = None
@@ -1687,11 +1568,11 @@ class ImageView(QtWidgets.QLabel):
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
-    # ---- paint ----
+    # paint
     def paintEvent(self, e):
         super().paintEvent(e)
         has_rb = self._rb_mode and self._rb_start and self._rb_cur
-        if not self._overlays and not self._stamp_mode and not has_rb:
+        if not self._overlays and not has_rb:
             return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -1718,21 +1599,12 @@ class ImageView(QtWidgets.QLabel):
         painter.end()
 
     def mouseMoveEvent(self, e):
-        if self._stamp_mode:
-            self.update()
-        elif self._rb_mode and self._rb_start:
+        if self._rb_mode and self._rb_start:
             self._rb_cur = self._to_img(e.pos())
             self.update()
 
     def mousePressEvent(self, e):
-        if e.button() == QtCore.Qt.LeftButton and self._stamp_mode:
-            img_pt = self._to_img(e.pos())
-            w2, h2 = self._stamp_w // 2, self._stamp_h // 2
-            rect   = QtCore.QRect(img_pt.x() - w2, img_pt.y() - h2,
-                                  self._stamp_w, self._stamp_h)
-            self.anchor_clicked.emit(img_pt)
-            self.add_overlay(rect, QtGui.QColor("#FFD700"), "")
-        elif e.button() == QtCore.Qt.LeftButton and self._rb_mode:
+        if e.button() == QtCore.Qt.LeftButton and self._rb_mode:
             self._rb_start = self._to_img(e.pos())
             self._rb_cur   = self._rb_start
 
@@ -1746,9 +1618,7 @@ class ImageView(QtWidgets.QLabel):
             if rect.width() > 5 and rect.height() > 5:
                 self.rect_drawn.emit(rect)
 
-# =========================================================
 # RUN WORKER
-# =========================================================
 def _output_dirs(out_dir: str, lot_number: str) -> tuple:
     """
     Returns (real_dir, ann_dir) for today + lot_number, creating dirs.
@@ -1832,7 +1702,6 @@ class RunWorker(QtCore.QThread):
 
     def run(self):
         cam_mode = self._cfg.get("CAMERA", "directory")
-        io_mock  = not self._cfg.get("IO", False)
         debug    = self._cfg.get("DEBUG", True)
 
         # Camera preflight — verify camera is reachable before entering the loop.
@@ -1850,7 +1719,7 @@ class RunWorker(QtCore.QThread):
 
         while not self._stop:
 
-            # ── Wait for next cycle trigger ──────────────────────────
+            # Wait for next cycle trigger
             if cam_mode == "camera":
                 # Check lot-end pin before waiting for start
                 if self._gpio.is_lot_end_signaled():
@@ -1885,7 +1754,7 @@ class RunWorker(QtCore.QThread):
                     self.sig_session_reset.emit(new_lot)
                     continue
 
-            # ── Capture guard ────────────────────────────────────────
+            # Capture guard
             if self._stop:
                 break
             t0 = time.perf_counter()
@@ -1908,7 +1777,7 @@ class RunWorker(QtCore.QThread):
 
             self.sig_status.emit("Inspecting…")
 
-            # ── Inspect (with one retry on fail) ────────────────────
+            # Inspect (with one retry on fail)
             is_retry    = False
             miss_a      = []
             miss_b      = []
@@ -1969,13 +1838,10 @@ class RunWorker(QtCore.QThread):
                     pass
                 break
 
-            # ── Finalize paths and save ──────────────────────────────
-            pass_a   = not miss_a
-            pass_b   = not miss_b
+            # Finalize paths and save
             cycle_ms = (time.perf_counter() - t0) * 1000
 
             # Suspect threshold logic
-            _TOTAL_CELLS   = 12  # 6 cells × 2 ICs
             _ng_threshold  = int(self._cfg.get("TEXT_NG_THRESHOLD", 2))
             n_missing      = len(miss_a) + len(miss_b)
 
@@ -2005,7 +1871,7 @@ class RunWorker(QtCore.QThread):
 
             cv2.imwrite(ann_path, ann)
 
-            # ── Emit signals and log ─────────────────────────────────
+            # Emit signals and log
             self.sig_image.emit(img_bgr)
             self.sig_cycle_ms.emit(cycle_ms)
 
@@ -2037,7 +1903,7 @@ class RunWorker(QtCore.QThread):
             if _cycle % 100 == 0:
                 gc.collect()
 
-            # ── End-of-cycle handshake ───────────────────────────────
+            # End-of-cycle handshake
             if cam_mode == "camera":
                 # Production: hold outputs until machine signals DONE
                 self.sig_status.emit("Holding — waiting for DONE signal…")
@@ -2054,7 +1920,7 @@ class RunWorker(QtCore.QThread):
                     self._lot_number = new_lot
                     self.sig_session_reset.emit(new_lot)   # IO signal → new batch
 
-            # ── Pause checkpoint ─────────────────────────────────────
+            # Pause checkpoint
             # Sits after DONE handshake + clear_outputs so the machine
             # always receives ACK before the loop suspends.
             if not self._running.is_set():
@@ -2072,9 +1938,7 @@ class RunWorker(QtCore.QThread):
             self.sig_done.emit()
         self.sig_status.emit("Standby.")
 
-# =========================================================
 # LOT START DIALOG
-# =========================================================
 class LotStartDialog(QtWidgets.QDialog):
     """
     Shown before a run starts. Operator enters a lot number.
@@ -2117,9 +1981,7 @@ class LotStartDialog(QtWidgets.QDialog):
         self._edit.returnPressed.connect(self.accept)
 
 
-# =========================================================
 # IMAGE BROWSER — worker threads + widgets
-# =========================================================
 
 class FolderScanWorker(QtCore.QThread):
     """Scans Output/ directory tree; emits flat list of (label, leaf_dir_path)."""
@@ -2275,7 +2137,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # ── Left: folder list ────────────────────────────────
+        # Left: folder list
         self._folder_list = QtWidgets.QListWidget()
         self._folder_list.setFixedWidth(200)
         self._folder_list.setStyleSheet(
@@ -2285,7 +2147,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._folder_list.itemClicked.connect(self._on_folder_selected)
         root.addWidget(self._folder_list)
 
-        # ── Centre: stacked (grid / image) ──────────────────
+        # Centre: stacked (grid / image)
         self._stack = QtWidgets.QStackedWidget()
         root.addWidget(self._stack, stretch=1)
 
@@ -2330,7 +2192,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         img_lay.addLayout(nav)
         self._stack.addWidget(img_page)   # index 1
 
-        # ── Right: controls ──────────────────────────────────
+        # Right: controls
         right = QtWidgets.QFrame()
         right.setObjectName("panel_right")
         right.setFixedWidth(160)
@@ -2383,7 +2245,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         root.addWidget(right)
 
-    # ── resize ───────────────────────────────────────────────
+    # resize
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -2416,7 +2278,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         return card_w, card_h, max(1, thumb_w), max(1, thumb_h)
 
-    # ── helpers ─────────────────────────────────────────────
+    # helpers
 
     def _section_label(self, text: str) -> QtWidgets.QLabel:
         lbl = QtWidgets.QLabel(text)
@@ -2434,7 +2296,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         )
         return btn
 
-    # ── folder refresh ───────────────────────────────────────
+    # folder refresh
 
     def refresh(self):
         """Called when the Image Browser tab is activated."""
@@ -2456,7 +2318,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         path = item.data(QtCore.Qt.UserRole)
         self._load_folder(path)
 
-    # ── image loading ────────────────────────────────────────
+    # image loading
 
     def _load_folder(self, base_path: str):
         """Collect files from base_path/subfolder, apply filter, rebuild grid."""
@@ -2535,7 +2397,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         if idx < len(self._cards):
             self._cards[idx].set_thumbnail(pixmap)
 
-    # ── image view ───────────────────────────────────────────
+    # image view
 
     def _on_card_clicked(self, idx: int):
         self._cur_idx = idx
@@ -2562,7 +2424,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._stack.setCurrentIndex(0)
         self._btn_back.hide()
 
-    # ── toggle handlers ──────────────────────────────────────
+    # toggle handlers
 
     def _on_src_toggle(self, btn):
         self._subfolder = "RealImg" if self._grp_src.id(btn) == 0 else "Image"
@@ -2577,9 +2439,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._apply_filter_and_build_grid()
 
 
-# =========================================================
 # MAIN WINDOW
-# =========================================================
 class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, cfg: dict):
@@ -2618,11 +2478,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._init_system()
 
-    # ----------------------------------------------------------
     # UI construction
-    # ----------------------------------------------------------
     def _build_ui(self):
-        # ── Tab wrapper ──────────────────────────────────────
+        # Tab wrapper
         tabs = QtWidgets.QTabWidget()
         tabs.setObjectName("root")
         self.setCentralWidget(tabs)
@@ -2642,7 +2500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # ── Left panel ───────────────────────────────────────
+        # Left panel
         left_frame = QtWidgets.QFrame()
         left_frame.setObjectName("main_view")
         left_lay = QtWidgets.QVBoxLayout(left_frame)
@@ -2678,7 +2536,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         root.addWidget(left_frame, stretch=1)
 
-        # ── Right panel ──────────────────────────────────────
+        # Right panel
         right_frame = QtWidgets.QFrame()
         right_frame.setObjectName("panel_right")
         right_frame.setFixedWidth(280)
@@ -2850,9 +2708,7 @@ class MainWindow(QtWidgets.QMainWindow):
         parent_lay.addLayout(row)
         return val
 
-    # ----------------------------------------------------------
     # Settings apply
-    # ----------------------------------------------------------
     def _apply_settings(self):
         try:
             wf = max(1, int(self._input_warmup.text()))
@@ -2874,9 +2730,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print(f"[Settings] border={bp}px  labels={show_labels}  warmup={wf}")
 
-    # ----------------------------------------------------------
     # System init
-    # ----------------------------------------------------------
     def _init_system(self):
         cfg = self._cfg
         try:
@@ -2937,9 +2791,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_setup_buttons()
 
 
-    # ----------------------------------------------------------
     # Rubber-band template setup flow
-    # ----------------------------------------------------------
     def _grab_setup_frame(self) -> np.ndarray | None:
         if self._camera is None:
             self._show_error("Camera not ready.")
@@ -3066,9 +2918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
 
 
-    # ----------------------------------------------------------
     # Run / Pause / Stop
-    # ----------------------------------------------------------
     def _on_action_click(self):
         if self._run_state == "standby":
             self._start_run()
@@ -3233,9 +3083,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except CameraError:
             pass
 
-    # ----------------------------------------------------------
     # Worker signal handlers
-    # ----------------------------------------------------------
     def _on_image(self, img: np.ndarray):
         self._view.set_image(img)
 
@@ -3246,23 +3094,24 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._lbl_yield.setText("—")
 
-    def _on_result(self, ia_pass: bool, ib_pass: bool, is_suspect: bool):
-        self._update_badge(self._badge_a, ia_pass)
-        self._update_badge(self._badge_b, ib_pass)
-        self._stats_pass  += 1
-        self._stats_total += 1
-        self._lbl_pass.setText(str(self._stats_pass))
-        self._update_yield()
-
-    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str, is_suspect: bool):
-        ic_a_pass = len(err.missing_a) == 0
-        ic_b_pass = len(err.missing_b) == 0
+    def _update_ui_after_cycle(self, ic_a_pass: bool, ic_b_pass: bool, passed: bool):
         self._update_badge(self._badge_a, ic_a_pass)
         self._update_badge(self._badge_b, ic_b_pass)
-        self._stats_fail  += 1
         self._stats_total += 1
-        self._lbl_fail.setText(str(self._stats_fail))
+        if passed:
+            self._stats_pass += 1
+            self._lbl_pass.setText(str(self._stats_pass))
+        else:
+            self._stats_fail += 1
+            self._lbl_fail.setText(str(self._stats_fail))
         self._update_yield()
+
+    def _on_result(self, ia_pass: bool, ib_pass: bool, is_suspect: bool):
+        self._update_ui_after_cycle(ia_pass, ib_pass, passed=True)
+
+    def _on_fail(self, err: MarkMissingError, ann_path: str, img_id: str, is_suspect: bool):
+        self._update_ui_after_cycle(
+            len(err.missing_a) == 0, len(err.missing_b) == 0, passed=False)
 
     def _on_worker_error(self, msg: str):
         self._stats_error += 1
@@ -3277,19 +3126,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
 
-    # ----------------------------------------------------------
     # Error banner
-    # ----------------------------------------------------------
     def _show_error(self, msg: str):
         self._error_lbl.setText(f"Error: {msg}")
         self._error_banner.show()
 
-    def _clear_error(self):
-        self._error_banner.hide()
-
-    # ----------------------------------------------------------
     # Close
-    # ----------------------------------------------------------
     def closeEvent(self, e):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
@@ -3300,9 +3142,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpio.cleanup()
         e.accept()
 
-# =========================================================
 # ENTRY POINT
-# =========================================================
 def main():
     try:
         cfg = ConfigLoader.load()

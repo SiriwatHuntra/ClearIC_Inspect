@@ -1079,6 +1079,16 @@ class Inspector:
         Phase 1 — locate IC_A via TemplateMatcher (preferred) or fixed template coords.
         Phase 2 — crop each ROI cell and classify as Text / NoText.
         """
+        # Guard: verify image is large enough to cover both IC regions from template
+        ic_a = self._template["ic_a"]
+        ic_b = self._template["ic_b"]
+        min_w = max(ic_a["x"] + ic_a["w"], ic_b["x"] + ic_b["w"])
+        min_h = max(ic_a["y"] + ic_a["h"], ic_b["y"] + ic_b["h"])
+        img_h, img_w = image_bgr.shape[:2]
+        if img_w < min_w or img_h < min_h:
+            raise TemplateError(
+                f"Image {img_w}×{img_h} too small — template requires at least {min_w}×{min_h}")
+
         _gcfg = {
             "CELL_SHRINK": self._cell_shrink, "CELL_EXPAND": self._cell_expand,
             "COL_GAP_PCT": self._col_gap_pct,
@@ -1784,17 +1794,21 @@ class RunWorker(QtCore.QThread):
             miss_a      = []
             miss_b      = []
             ann         = img_bgr
-            tmpl_error  = False
 
             try:
                 self._inspector.inspect(img_bgr, debug=debug)
                 # pass — img_bgr annotated in-place; miss_a/miss_b stay []
 
             except TemplateError as te:
-                tmpl_error = True
-                miss_a = miss_b = [[r, c] for r in range(1, 4) for c in range(1, 3)]
-                if debug:
-                    print(f"[RunWorker] Alignment rejected: {te}")
+                cycle_ms = (time.perf_counter() - t0) * 1000
+                self._logger.log_error("TEMPLATE_ERROR", str(te), cycle_ms)
+                self.sig_error.emit(f"Template error: {te}")
+                self.sig_status.emit("ERROR — template invalid, restart required.")
+                try:
+                    os.remove(tmp_real)
+                except OSError:
+                    pass
+                break
 
             except MarkMissingError as e1:
                 if cam_mode == "camera":
@@ -1891,8 +1905,8 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if miss_a else "PASS", miss_a,
                     "FAIL" if miss_b else "PASS", miss_b,
                     cycle_ms, is_retry, is_suspect)
-                self._gpio.set_fail_a(bool(miss_a) or tmpl_error)
-                self._gpio.set_fail_b(bool(miss_b) or tmpl_error)
+                self._gpio.set_fail_a(bool(miss_a))
+                self._gpio.set_fail_b(bool(miss_b))
 
             self._gpio.set_busy(False)
 
@@ -2141,7 +2155,8 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         # Left: folder list
         self._folder_list = QtWidgets.QListWidget()
-        self._folder_list.setFixedWidth(200)
+        self._folder_list.setMinimumWidth(150)
+        self._folder_list.setMaximumWidth(260)
         self._folder_list.setStyleSheet(
             "QListWidget{background:#788BFF;border-radius:6px;color:#FFFFFF;font-size:11px}"
             "QListWidget::item:selected{background:#5465FF;color:#FFFFFF}"
@@ -2197,7 +2212,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         # Right: controls
         right = QtWidgets.QFrame()
         right.setObjectName("panel_right")
-        right.setFixedWidth(160)
+        right.setMinimumWidth(130)
         right_lay = QtWidgets.QVBoxLayout(right)
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(10)
@@ -2541,7 +2556,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Right panel
         right_frame = QtWidgets.QFrame()
         right_frame.setObjectName("panel_right")
-        right_frame.setFixedWidth(280)
+        right_frame.setMinimumWidth(240)
         right_lay = QtWidgets.QVBoxLayout(right_frame)
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(8)

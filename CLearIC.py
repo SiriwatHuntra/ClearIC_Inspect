@@ -978,9 +978,8 @@ class TemplateMatcher:
         ry2 = min(img_h, exp_y + ph + m)
 
         roi_bgr  = image_bgr[ry1:ry2, rx1:rx2]
-        filtered = _contour_template(roi_bgr)
 
-        if filtered.shape[0] < ph or filtered.shape[1] < pw:
+        if roi_bgr.size == 0 or roi_bgr.shape[0] < ph or roi_bgr.shape[1] < pw:
             # ROI too small — fall back to full-frame search
             full = _contour_template(image_bgr)
             res = cv2.matchTemplate(full, self._patch, cv2.TM_CCOEFF_NORMED)
@@ -1155,6 +1154,7 @@ class Inspector:
             x1, y1 = max(0, cx),       max(0, cy)
             x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
             crop    = image_bgr[y1:y2, x1:x2]
+            gray    = None
             if crop.size > 0:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 crop = cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
@@ -1165,10 +1165,11 @@ class Inspector:
             text_confs.append(text_conf)
             if debug:
                 lbl = "Text" if present else "NoText"
+                std_str = f"{gray.std():.1f}" if gray is not None else "n/a"
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
                       f"cls={lbl} conf={conf:.3f} text_conf={text_conf:.3f}  "
-                      f"raw_std={gray.std():.1f}")
+                      f"raw_std={std_str}")
             color = color_ok if present else color_ng
             cv2.rectangle(annotated,
                           (max(0, cx), max(0, cy)),

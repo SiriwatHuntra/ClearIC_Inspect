@@ -93,6 +93,12 @@ CAMERA_RETRY_DELAY = 0.2
 # Maximum grab retries before raising a camera error
 CAMERA_RETRIES = 2
 
+# Reconnect attempts before giving up on a lost camera
+RECONNECT_ATTEMPTS = 3
+
+# Seconds to wait between reconnect attempts
+RECONNECT_DELAY_S = 5.0
+
 # Milliseconds to wait before the second inspection attempt when the first fails
 RETRY_DELAY_MS = 250
 

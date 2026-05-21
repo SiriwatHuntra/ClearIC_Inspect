@@ -365,6 +365,8 @@ class Camera:
             return self._grab_directory()
 
     def _grab_basler(self) -> np.ndarray:
+        if self._camera is None:
+            raise CameraError("Camera not open")
         result = self._camera.RetrieveResult(
             5000, self._pylon.TimeoutHandling_ThrowException)
         try:
@@ -415,13 +417,15 @@ class Camera:
 
     def reconnect(self, attempts: int = 1, delay_s: float = 0.0) -> bool:
         """Close and re-open the Basler camera. Returns True on success."""
+        if self._mode != "camera":
+            return False
         for _ in range(max(1, attempts)):
             self.close()
             if delay_s > 0:
                 time.sleep(delay_s)
             try:
                 self._open_basler()
-                self.warmup(1)
+                self.warmup()
                 print("[Camera] Reconnected.")
                 return True
             except CameraError as e:
@@ -432,6 +436,21 @@ class Camera:
         if self._mode == "camera":
             return self._camera is not None and self._camera.IsOpen()
         return bool(self._files)
+
+    def is_healthy(self) -> bool:
+        """Grab-based liveness check. Returns False if camera is unresponsive or closed."""
+        if self._mode != "camera":
+            return self.is_open()
+        if not self.is_open():
+            return False
+        try:
+            result = self._camera.RetrieveResult(
+                200, self._pylon.TimeoutHandling_Return)
+            ok = result.GrabSucceeded()
+            result.Release()
+            return ok
+        except Exception:
+            return False
 
     def has_more(self) -> bool:
         """Directory mode: True if there are still un-visited images this cycle."""

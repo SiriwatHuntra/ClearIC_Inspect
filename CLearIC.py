@@ -2664,6 +2664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_lay.addWidget(lbl_ctrl)
 
         self._btn_action = QtWidgets.QPushButton("Start")
+        self._btn_action.setEnabled(False)   # enabled only when OCR fields are valid
         self._btn_action.clicked.connect(self._on_action_click)
         ctrl_lay.addWidget(self._btn_action)
 
@@ -2995,7 +2996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     else "No template — create a template before running.")
             # Gate the Start button: only allow run when a template exists.
             if self._run_state == "standby":
-                self._btn_action.setEnabled(template_ok)
+                self._btn_action.setEnabled(template_ok and self._ocr_fields_valid())
         else:
             text = {
                 'draw_a':       'Draw either IC area on image.',
@@ -3061,6 +3062,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Snapshot OCR fields (read before lot dialog, values already validated by gating)
         self._ocr_operator     = self._edit_op_number.text().strip()
         self._ocr_expect_value = self._edit_ocr_expect.text().strip()
+
+        # Clear right-panel status immediately on Start click
+        self._lbl_ocr_status.setText("Verifying…")
+        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from API hook)
         lot = LotStartDialog.request(parent=self)
@@ -3356,7 +3362,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stats_error, elapsed)
         self._run_state = "standby"
         self._btn_action.setText("Start")
-        self._btn_action.setEnabled(True)
+        self._btn_action.setEnabled(self._ocr_fields_valid())
         self._btn_stop.setEnabled(False)
 
     # Error banner

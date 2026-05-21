@@ -74,7 +74,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 class ConfigLoader:
     CONFIG_FILE = "Config.toml"
     DEFAULT_CONFIG = {
-        "CAMERA":               "directory",
+        "USE_CAMERA":           False,
         "CONF_THR":             0.5,
         "TEXT_MIN_CONF":        0.80,
         "TEXT_NG_THRESHOLD":    2,
@@ -119,8 +119,6 @@ class ConfigLoader:
         "WARMUP_FRAMES":        5,
         "SKIP_DONE_WAIT":       False,
     }
-    _VALID_CAMERA = {"camera", "directory"}
-
     @classmethod
     def load(cls) -> dict:
         import tomlkit
@@ -135,8 +133,9 @@ class ConfigLoader:
         for k in cls.DEFAULT_CONFIG:
             if k in data:
                 cfg[k] = data[k]
-        if cfg["CAMERA"] not in cls._VALID_CAMERA:
-            raise ConfigError(f"CAMERA must be one of {cls._VALID_CAMERA}")
+        if not isinstance(cfg["USE_CAMERA"], bool):
+            raise ConfigError("USE_CAMERA must be true or false")
+        cfg["CAMERA"] = "camera" if cfg["USE_CAMERA"] else "directory"
         if not (0.0 < cfg["CONF_THR"] <= 1.0):
             raise ConfigError("CONF_THR must be in (0, 1]")
         if not (0.0 < cfg["TEXT_MIN_CONF"] <= 1.0):

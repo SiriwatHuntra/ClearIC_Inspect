@@ -1,22 +1,30 @@
-# ─── System ──────────────────────────────────────────────────────────────────
-# Image source — "camera" uses live Basler camera, "directory" reads from Input/
-CAMERA = "CAMERA"
-
-# Print extra debug logs and save annotated image every cycle
-DEBUG = true
+# ─── Simple Setup (true / false only) ───────────────────────────────────────
+# true = live Basler camera, false = load images from Input/ (directory mode)
+USE_CAMERA = true
 
 # Set to true to drive real GPIO pins; false = log-only, safe without hardware
 IO = false
 
-# Label written into log records (e.g. "DEBUG", "PRODUCTION")
-MODE = "PRODUCTION"
+# Print extra debug logs and save annotated image every cycle
+DEBUG = true
 
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false
 
+# Skip DONE_PIN handshake at end of cycle (set true for IFLV machines)
+SKIP_DONE_WAIT = false
+
+# Show "R1C1" grid labels on cell overlays in annotated images
+ANN_SHOW_LABELS = true
+
+
+# ─── System ──────────────────────────────────────────────────────────────────
+# Label written into log records
+MODE = "PRODUCTION"
+
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
-# Folder containing images when CAMERA = "directory"
+# Folder containing images when USE_CAMERA = false
 DIR_INPUT = "Input/"
 
 # Root output folder for raw and annotated results
@@ -33,9 +41,6 @@ DATA_SPLIT = "train"
 
 # OpenVINO cell classifier model (.xml)
 MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
-
-# Unused IC search model — kept for reference only
-TEMPLATE_MODEL_PATH = "IC_Search_openvino_model/IC_Search.xml"
 
 
 # ─── Classifier / Inspection ─────────────────────────────────────────────────
@@ -132,6 +137,3 @@ LOG_RETENTION = 365
 
 # Cell overlay border thickness in pixels on annotated images
 ANN_BORDER_PX = 1
-
-# Show "R1C1" grid labels on cell overlays in annotated images
-ANN_SHOW_LABELS = true

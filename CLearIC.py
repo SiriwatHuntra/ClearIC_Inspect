@@ -1524,7 +1524,8 @@ class ImageView(QtWidgets.QLabel):
     """
     Zoomable image display with overlay support, stamp mode, and rubber-band drawing.
     """
-    rect_drawn = QtCore.pyqtSignal(QtCore.QRect)    # emitted on rubber-band release (image coords)
+    rect_drawn    = QtCore.pyqtSignal(QtCore.QRect)  # emitted on rubber-band release (image coords)
+    right_clicked = QtCore.pyqtSignal()             # emitted on right-click (non-rubberband mode)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1654,6 +1655,8 @@ class ImageView(QtWidgets.QLabel):
         if e.button() == QtCore.Qt.LeftButton and self._rb_mode:
             self._rb_start = self._to_img(e.pos())
             self._rb_cur   = self._rb_start
+        elif e.button() == QtCore.Qt.RightButton and not self._rb_mode:
+            self.right_clicked.emit()
 
     def mouseReleaseEvent(self, e):
         if self._rb_mode and self._rb_start and e.button() == QtCore.Qt.LeftButton:
@@ -2193,6 +2196,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def __init__(self, out_dir: str = "Output/", parent=None):
         super().__init__(parent)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self._out_dir       = out_dir
         self._all_paths: list = []     # all files in selected folder/subfolder
         self._paths: list    = []      # filtered paths shown in grid
@@ -2250,6 +2254,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         img_lay.setContentsMargins(0, 0, 0, 0)
         img_lay.setSpacing(4)
         self._img_view = ImageView()
+        self._img_view.right_clicked.connect(self._back_to_grid)
         img_lay.addWidget(self._img_view, stretch=1)
         # Bottom nav
         nav = QtWidgets.QHBoxLayout()
@@ -2313,9 +2318,47 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         right_lay.addStretch()
 
+        # Keybind reference panel
+        kb_frame = QtWidgets.QFrame()
+        kb_frame.setObjectName("setup_frame")
+        kb_lay = QtWidgets.QVBoxLayout(kb_frame)
+        kb_lay.setContentsMargins(8, 6, 8, 6)
+        kb_lay.setSpacing(4)
+        right_lay.addWidget(kb_frame)
+
+        lbl_kb = QtWidgets.QLabel("Controls")
+        lbl_kb.setStyleSheet("font-size:11px;font-weight:bold;color:#E2FDFF")
+        kb_lay.addWidget(lbl_kb)
+
+        _KBD_STYLE = (
+            "QLabel{font-size:10px;color:#E2FDFF;padding:1px 0px;}")
+        _KEY_STYLE = (
+            "QLabel{font-size:10px;font-weight:bold;color:#5465FF;"
+            "background:#FFFFFF;border-radius:3px;padding:1px 5px;}")
+
+        for key_text, desc_text in [
+            ("← →",       "Prev / Next"),
+            ("R-Click",    "Back to grid"),
+        ]:
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            key_lbl = QtWidgets.QLabel(key_text)
+            key_lbl.setStyleSheet(_KEY_STYLE)
+            key_lbl.setAlignment(QtCore.Qt.AlignCenter)
+            desc_lbl = QtWidgets.QLabel(desc_text)
+            desc_lbl.setStyleSheet(_KBD_STYLE)
+            row.addWidget(key_lbl)
+            row.addWidget(desc_lbl, stretch=1)
+            kb_lay.addLayout(row)
+
         # Back button (shown in image view mode)
         self._btn_back = QtWidgets.QPushButton("← Back")
         self._btn_back.clicked.connect(self._back_to_grid)
+        self._btn_back.setStyleSheet(
+            "QPushButton{background:#FFFFFF;color:#5465FF;border-radius:6px;"
+            "padding:8px 14px;font-weight:bold;font-size:12px;}"
+            "QPushButton:hover{background:#E2FDFF;}")
         self._btn_back.hide()
         right_lay.addWidget(self._btn_back)
 
@@ -2482,6 +2525,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         # Switch to image page FIRST so _img_view has its real size when _refresh fires
         self._stack.setCurrentIndex(1)
         self._btn_back.show()
+        self.setFocus()   # capture arrow key events
         path = self._paths[self._cur_idx]
         img  = cv2.imread(path)
         if img is not None:
@@ -2491,6 +2535,17 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _step_image(self, delta: int):
         self._show_image(self._cur_idx + delta)
+
+    def keyPressEvent(self, e):
+        if self._stack.currentIndex() == 1:
+            if e.key() == QtCore.Qt.Key_Left:
+                self._step_image(-1)
+            elif e.key() == QtCore.Qt.Key_Right:
+                self._step_image(1)
+            else:
+                super().keyPressEvent(e)
+        else:
+            super().keyPressEvent(e)
 
     def _back_to_grid(self):
         self._stack.setCurrentIndex(0)

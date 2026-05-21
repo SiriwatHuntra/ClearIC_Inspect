@@ -22,6 +22,9 @@ ANN_SHOW_LABELS = true
 # Label written into log records
 MODE = "PRODUCTION"
 
+# Serial port for Cell-con lot number reader
+CELLCON_PORT = "/dev/ttyUSB0"
+
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 # Folder containing images when USE_CAMERA = false

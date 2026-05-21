@@ -118,6 +118,7 @@ class ConfigLoader:
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
         "SKIP_DONE_WAIT":       False,
+        "CELLCON_PORT":         "/dev/ttyUSB0",
     }
     @classmethod
     def load(cls) -> dict:
@@ -470,6 +471,44 @@ class Camera:
         if self._mode == "directory":
             self.reset()
         return img
+
+# CELL-CON
+class CellCon:
+    """
+    Serial interface to the Cell-con lot tracker.
+    Protocol: send 'LA\\r\\n' → receive 'LS,<lot_number>[,…]'
+    get_lot() returns lot string or '' on any error/timeout.
+    """
+    BAUD    = 38400
+    TIMEOUT = 1.0
+    RETRIES = 5
+
+    def __init__(self, port: str = "/dev/ttyUSB0"):
+        self._port = port
+
+    def get_lot(self) -> str:
+        try:
+            import serial as _serial
+            with _serial.Serial(
+                    port=self._port, baudrate=self.BAUD,
+                    parity=_serial.PARITY_NONE,
+                    stopbits=_serial.STOPBITS_ONE,
+                    bytesize=_serial.EIGHTBITS,
+                    timeout=self.TIMEOUT) as ser:
+                ser.write(b"LA\r\n")
+                for _ in range(self.RETRIES):
+                    line = ser.readline().decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    if parts[0] == "LS" and len(parts) >= 2:
+                        lot = parts[1].strip()
+                        print(f"[CellCon] Lot received: {lot}")
+                        return lot
+        except Exception as e:
+            print(f"[CellCon] Error: {e}")
+        return ""
+
 
 # RASPBERRY IO
 class RaspberryIO:
@@ -2979,6 +3018,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._setup_image = img
             except CameraError:
                 pass
+
+        # Wire Cell-con lot-number fetch into the LotStartDialog plugin hook
+        self._cellcon = CellCon(port=cfg.get("CELLCON_PORT", "/dev/ttyUSB0"))
+        LotStartDialog.get_lot_number_from_api = lambda: self._cellcon.get_lot()
 
         # Apply initial button state — disables Start if no template exists yet.
         self._update_setup_buttons()

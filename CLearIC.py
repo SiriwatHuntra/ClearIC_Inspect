@@ -3071,6 +3071,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Ask operator for lot number (or get from API hook)
         lot = LotStartDialog.request(parent=self)
         if lot is None:
+            self._lbl_ocr_status.setText("Fill both fields to enable Start.")
+            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
             return   # operator cancelled
         self._lot_number   = lot
         self._package_name = tmpl.get("package_name", "")
@@ -3197,12 +3199,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
             is_pass = 0
             if resp.status_code == 200:
-                std_mark = resp.json()[0]["mark"]
-                is_pass  = 1 if std_mark == expected_mark else 0
-                color    = "#69FF69" if is_pass else "#FF6B6B"
-                label    = "Mark OK" if is_pass else f"FAIL — DB mark: {std_mark}"
-                self._lbl_ocr_status.setText(label)
-                self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
+                data = resp.json()
+                if not data:
+                    if debug:
+                        self._lbl_ocr_status.setText("[DEBUG] ReadMark: lot not found — skipped")
+                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                        is_pass = 1
+                    else:
+                        self._lbl_ocr_status.setText("ReadMark: lot not in DB — cannot verify")
+                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                        return False
+                else:
+                    std_mark = data[0]["mark"]
+                    is_pass  = 1 if std_mark == expected_mark else 0
+                    color    = "#69FF69" if is_pass else "#FF6B6B"
+                    label    = "Mark OK" if is_pass else f"FAIL — DB mark: {std_mark}"
+                    self._lbl_ocr_status.setText(label)
+                    self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
             elif debug:
                 self._lbl_ocr_status.setText("[DEBUG] ReadMark unavailable — skipped")
                 self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
@@ -3362,6 +3375,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stats_error, elapsed)
         self._run_state = "standby"
         self._btn_action.setText("Start")
+        self._edit_op_number.setReadOnly(False)
+        self._edit_ocr_expect.setReadOnly(False)
         self._btn_action.setEnabled(self._ocr_fields_valid())
         self._btn_stop.setEnabled(False)
 

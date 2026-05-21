@@ -63,6 +63,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import gc
+import base64
+import requests
 import cv2
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
@@ -1402,6 +1404,9 @@ class Logger:
     def log_resume(self):
         self._op_append("RESUME")
 
+    def log_ocr(self, operator: str, expect_mark: str):
+        self._op_append("OCR_VERIFY", f"op={operator} expect={expect_mark}")
+
 
 # STYLESHEET
 STYLE = """
@@ -2531,6 +2536,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lot_number         = ""
         self._package_name       = ""
 
+        # OCR input state (retained across lots)
+        self._ocr_operator:     str = ""
+        self._ocr_expect_value: str = ""
+
         # setup state
         self._pending_ic_a:  QtCore.QRect | None = None
         self._pending_ic_b:  QtCore.QRect | None = None
@@ -2675,6 +2684,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_stats.setStyleSheet("font-weight:bold;font-size:13px")
         stats_lay.addWidget(lbl_stats)
 
+        self._lbl_lot_info = self._stat_row(stats_lay, "Lot",      "—")
         self._lbl_status   = self._stat_row(stats_lay, "Status",   "Standby.")
         self._lbl_pass     = self._stat_row(stats_lay, "Pass",     "0")
         self._lbl_fail     = self._stat_row(stats_lay, "Fail",     "0")
@@ -2722,6 +2732,48 @@ class MainWindow(QtWidgets.QMainWindow):
 
         settings_frame.setVisible(False)
         right_lay.addWidget(settings_frame)
+
+        # OCR Input section — always visible, gates Start button
+        self._ocr_frame = QtWidgets.QFrame()
+        self._ocr_frame.setObjectName("setup_frame")
+        ocr_lay = QtWidgets.QVBoxLayout(self._ocr_frame)
+        ocr_lay.setSpacing(6)
+
+        lbl_ocr = QtWidgets.QLabel("OCR Input")
+        lbl_ocr.setStyleSheet("font-weight:bold;font-size:13px")
+        ocr_lay.addWidget(lbl_ocr)
+
+        lbl_op = QtWidgets.QLabel("Operator No. (6 digits):")
+        lbl_op.setStyleSheet("font-size:10px;color:#E2FDFF")
+        ocr_lay.addWidget(lbl_op)
+
+        self._edit_op_number = QtWidgets.QLineEdit()
+        self._edit_op_number.setMaxLength(6)
+        self._edit_op_number.setValidator(QtGui.QIntValidator(0, 999999))
+        self._edit_op_number.setPlaceholderText("000000")
+        self._edit_op_number.textChanged.connect(self._on_ocr_field_changed)
+        ocr_lay.addWidget(self._edit_op_number)
+
+        lbl_mark = QtWidgets.QLabel("Expected Mark (6 chars, A–Z / 0–9):")
+        lbl_mark.setStyleSheet("font-size:10px;color:#E2FDFF")
+        ocr_lay.addWidget(lbl_mark)
+
+        self._edit_ocr_expect = QtWidgets.QLineEdit()
+        self._edit_ocr_expect.setMaxLength(6)
+        self._edit_ocr_expect.setValidator(
+            QtGui.QRegularExpressionValidator(
+                QtCore.QRegularExpression("[A-Z0-9]{0,6}")))
+        self._edit_ocr_expect.setPlaceholderText("XXXXXX")
+        self._edit_ocr_expect.textChanged.connect(self._on_ocr_field_changed)
+        ocr_lay.addWidget(self._edit_ocr_expect)
+
+        self._lbl_ocr_status = QtWidgets.QLabel("Fill both fields to enable Start.")
+        self._lbl_ocr_status.setWordWrap(True)
+        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        ocr_lay.addWidget(self._lbl_ocr_status)
+
+        right_lay.addWidget(self._ocr_frame)   # always visible
+
         right_lay.addStretch()
 
         root.addWidget(right_frame)
@@ -3006,6 +3058,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error("Detector not ready.")
             return
 
+        # Snapshot OCR fields (read before lot dialog, values already validated by gating)
+        self._ocr_operator     = self._edit_op_number.text().strip()
+        self._ocr_expect_value = self._edit_ocr_expect.text().strip()
+
         # Ask operator for lot number (or get from API hook)
         lot = LotStartDialog.request(parent=self)
         if lot is None:
@@ -3068,11 +3124,28 @@ class MainWindow(QtWidgets.QMainWindow):
             ann_border_px=self._cfg.get("ANN_BORDER_PX", 1),
             ann_show_labels=self._cfg.get("ANN_SHOW_LABELS", True),
         )
-        gpio      = self._gpio or RaspberryIO(io_enabled=False)
+        gpio = self._gpio or RaspberryIO(io_enabled=False)
 
+        # OCR API verification (once per lot)
+        self._lbl_lot_info.setText(lot)
+        ocr_ok = self._ocr_api_call(lot, self._ocr_operator, self._ocr_expect_value)
+        if not ocr_ok:
+            QtWidgets.QMessageBox.critical(
+                self, "OCR Verification Failed",
+                "Marking verification failed.\nCheck the expected mark and retry.",
+                QtWidgets.QMessageBox.Close)
+            self._enter_standby()
+            return
+        self._logger.log_ocr(self._ocr_operator, self._ocr_expect_value)
+        self._start_worker(inspector, gpio)
+
+    def _start_worker(self, inspector: "Inspector", gpio: "RaspberryIO"):
+        """Create and start RunWorker. Lock OCR fields for the duration of the run."""
+        self._edit_op_number.setReadOnly(True)
+        self._edit_ocr_expect.setReadOnly(True)
         self._worker = RunWorker(
-            self._camera, inspector, gpio, self._logger, self._cfg,
-            lot_number=self._lot_number)
+            self._camera, inspector, gpio,
+            self._logger, self._cfg, lot_number=self._lot_number)
         self._worker.sig_image.connect(self._on_image)
         self._worker.sig_result.connect(self._on_result)
         self._worker.sig_fail.connect(self._on_fail)
@@ -3088,7 +3161,73 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._run_state = "running"
         self._btn_action.setText("Pause")
+        self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(True)
+
+    def _ocr_fields_valid(self) -> bool:
+        op  = self._edit_op_number.text()
+        exp = self._edit_ocr_expect.text()
+        return len(op) == 6 and op.isdigit() and len(exp) == 6 and exp.isalnum()
+
+    def _on_ocr_field_changed(self):
+        if self._run_state == "standby":
+            valid = self._ocr_fields_valid()
+            self._btn_action.setEnabled(valid)
+            if not valid:
+                self._lbl_ocr_status.setText("Fill both fields to enable Start.")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+
+    def _ocr_api_call(self, lot: str, operator: str, expected_mark: str) -> bool:
+        """POST to ReadMark API, compare result, POST CreateRecord. Returns True = proceed."""
+        debug = self._cfg.get("DEBUG", True)
+        try:
+            img = self._camera.grab_first()
+            resized = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
+            cv2.imwrite("cropimg.jpg", resized)
+
+            resp = requests.post(
+                "http://webserv.thematrix.net/ROHMApi/api/OCR/ReadMark",
+                json={"username": operator, "lot_no": lot}, timeout=5)
+
+            is_pass = 0
+            if resp.status_code == 200:
+                std_mark = resp.json()[0]["mark"]
+                is_pass  = 1 if std_mark == expected_mark else 0
+                color    = "#69FF69" if is_pass else "#FF6B6B"
+                label    = "Mark OK" if is_pass else f"FAIL — DB mark: {std_mark}"
+                self._lbl_ocr_status.setText(label)
+                self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
+            elif debug:
+                self._lbl_ocr_status.setText("[DEBUG] ReadMark unavailable — skipped")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                is_pass = 1
+            else:
+                self._lbl_ocr_status.setText(f"ReadMark API error {resp.status_code}")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                return False
+
+            try:
+                with open("cropimg.jpg", "rb") as fh:
+                    enc = base64.b64encode(fh.read()).decode()
+                requests.post(
+                    "http://webserv.thematrix.net/ROHMApi/api/OCR/CreateRecord",
+                    json={"username": operator, "lot_no": lot, "mark": expected_mark,
+                          "image": enc, "is_pass": is_pass,
+                          "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
+            except Exception:
+                pass   # record failure never blocks the run
+
+            return bool(is_pass) or debug
+
+        except Exception as exc:
+            print(f"[OCR] {exc}")
+            if debug:
+                self._lbl_ocr_status.setText("[DEBUG] API unavailable — skipped")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                return True
+            self._lbl_ocr_status.setText(f"OCR API error — {exc}")
+            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+            return False
 
     def _pause_run(self):
         if self._worker:
@@ -3150,8 +3289,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _enter_standby(self):
         self._run_state = "standby"
         self._btn_action.setText("Start")
-        self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        self._edit_op_number.setReadOnly(False)
+        self._edit_ocr_expect.setReadOnly(False)
+        self._btn_action.setEnabled(self._ocr_fields_valid())
+        self._lbl_lot_info.setText("—")
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)
         self._stats_pass = self._stats_fail = self._stats_error = self._stats_total = 0

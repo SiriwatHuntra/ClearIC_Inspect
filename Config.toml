@@ -1,6 +1,6 @@
 # ─── System ──────────────────────────────────────────────────────────────────
 # Image source — "camera" uses live Basler camera, "directory" reads from Input/
-CAMERA = "directory"
+CAMERA = "CAMERA"
 
 # Print extra debug logs and save annotated image every cycle
 DEBUG = true
@@ -9,7 +9,7 @@ DEBUG = true
 IO = false
 
 # Label written into log records (e.g. "DEBUG", "PRODUCTION")
-MODE = "DEBUG"
+MODE = "PRODUCTION"
 
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false

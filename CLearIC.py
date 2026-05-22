@@ -2079,14 +2079,22 @@ class RunWorker(QtCore.QThread):
                 is_suspect = True
                 suffix     = "_GS"
 
+            save_image = suffix != "_G"  # skip saving clean-pass images
+
             final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
             ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")
-            try:
-                os.rename(tmp_real, final_real)
-            except OSError:
-                final_real = tmp_real   # rename failed, keep original name
-
-            cv2.imwrite(ann_path, ann)
+            if save_image:
+                try:
+                    os.rename(tmp_real, final_real)
+                except OSError:
+                    final_real = tmp_real
+                cv2.imwrite(ann_path, ann)
+            else:
+                try:
+                    os.remove(tmp_real)
+                except OSError:
+                    pass
+                ann_path = ""
 
             # Emit signals and log
             self.sig_image.emit(img_bgr)

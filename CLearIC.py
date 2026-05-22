@@ -121,6 +121,7 @@ class ConfigLoader:
         "CELLCON_PORT":         "/dev/ttyUSB0",
         "IMAGE_W":              640,
         "IMAGE_H":              480,
+        "CAMERA_FPS":           10,
     }
     @classmethod
     def load(cls) -> dict:
@@ -276,7 +277,8 @@ class Camera:
                  exposure_us: int = 8000, input_dir: str = "Input",
                  retry_delay: float = 0.2, retries: int = 2,
                  warmup_frames: int = 5,
-                 image_w: int = 0, image_h: int = 0):
+                 image_w: int = 0, image_h: int = 0,
+                 fps: float = 0):
         self._mode        = mode
         self._serial      = serial
         self._exposure_us = exposure_us
@@ -286,6 +288,7 @@ class Camera:
         self._warmup_frames = warmup_frames
         self._image_w     = image_w
         self._image_h     = image_h
+        self._fps         = fps
 
         self._camera      = None
         self._pylon       = None
@@ -329,6 +332,15 @@ class Camera:
                 self._camera.ExposureTimeAbs.SetValue(float(self._exposure_us))
             except Exception:
                 self._camera.ExposureTime.SetValue(float(self._exposure_us))
+            if self._fps > 0:
+                try:
+                    self._camera.AcquisitionFrameRateEnable.SetValue(True)
+                    try:
+                        self._camera.AcquisitionFrameRate.SetValue(float(self._fps))
+                    except Exception:
+                        self._camera.AcquisitionFrameRateAbs.SetValue(float(self._fps))
+                except Exception:
+                    print("[Camera] Frame rate limit not supported on this camera.")
             self._camera.PixelFormat.SetValue("Mono8")
             self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
             print(f"[Camera] Opened. Exposure={self._exposure_us} µs")
@@ -3014,6 +3026,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
                 image_w=cfg.get("IMAGE_W", 0),
                 image_h=cfg.get("IMAGE_H", 0),
+                fps=cfg.get("CAMERA_FPS", 0),
             )
             self._camera.open()
         except CameraError as e:

@@ -81,6 +81,10 @@ GRID_MARGIN_BOT = 10.0
 
 
 # ─── Camera ──────────────────────────────────────────────────────────────────
+# Resize directory-mode images to this size before inspection (0 = native, no resize)
+IMAGE_W = 0
+IMAGE_H = 0
+
 # Basler camera serial number filter; leave blank to use first camera found
 CAMERA_SERIAL = "24621497"
 

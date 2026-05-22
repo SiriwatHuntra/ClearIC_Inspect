@@ -119,8 +119,8 @@ class ConfigLoader:
         "WARMUP_FRAMES":        5,
         "SKIP_DONE_WAIT":       False,
         "CELLCON_PORT":         "/dev/ttyUSB0",
-        "IMAGE_W":              640,
-        "IMAGE_H":              480,
+        "IMAGE_W":              0,
+        "IMAGE_H":              0,
         "CAMERA_FPS":           10,
     }
     @classmethod
@@ -899,7 +899,8 @@ class TemplateManager:
 
     @staticmethod
     def save(ic_a: QtCore.QRect, ic_b: QtCore.QRect, exposure_us: int = 8000,
-             match_threshold: float = 0.6, strip_h: int = 0):
+             match_threshold: float = 0.6, strip_h: int = 0,
+             img_w: int = 0, img_h: int = 0):
         os.makedirs("templates", exist_ok=True)
         data = {
             "ic_a": {"x": ic_a.x(), "y": ic_a.y(),
@@ -909,6 +910,8 @@ class TemplateManager:
             "exposure_us":     exposure_us,
             "match_threshold": match_threshold,
             "strip_h":         strip_h,
+            "img_w":           img_w,
+            "img_h":           img_h,
         }
         _tmp = _TEMPLATE_FILE + ".tmp"
         with open(_tmp, "w") as f:
@@ -1058,16 +1061,18 @@ class TemplateMatcher:
                  strip_h: int = 0,
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
-                 search_margin: int = 60):
-        self._patch     = full_patch
-        self._threshold = threshold
-        self._strip_h   = strip_h   # px from patch top to IC top edge
-        self._patch_w   = full_patch.shape[1]
-        self._ic_x      = ic_x   # expected IC_A left edge from template
-        self._ic_y      = ic_y   # expected IC_A top from template
-        self._ic_w      = ic_w
-        self._ic_h      = ic_h
-        self._margin    = search_margin   # px around expected pos to search
+                 search_margin: int = 60,
+                 template_w: int = 0):
+        self._patch       = full_patch
+        self._threshold   = threshold
+        self._strip_h     = strip_h   # px from patch top to IC top edge
+        self._patch_w     = full_patch.shape[1]
+        self._ic_x        = ic_x   # expected IC_A left edge from template
+        self._ic_y        = ic_y   # expected IC_A top from template
+        self._ic_w        = ic_w
+        self._ic_h        = ic_h
+        self._margin      = search_margin   # px around expected pos to search
+        self._template_w  = template_w      # image width when template was saved (0 = unknown)
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
@@ -1077,39 +1082,62 @@ class TemplateMatcher:
         strip_h is negative (patch starts below IC top), so:
           exp_patch_y = ic_y - strip_h = ic_y + IC_h
           ic_y        = matched_patch_y + strip_h = matched_patch_y - IC_h
+        If the current image has a different width than the template was saved at,
+        the patch and all search parameters are scaled to match.
         """
         img_h, img_w = image_bgr.shape[:2]
-        ph, pw = self._patch.shape[:2]
-        m     = self._margin
-        exp_y = self._ic_y - self._strip_h
 
-        rx1 = max(0, self._ic_x - m)
+        # Scale patch and search geometry to current image resolution
+        if self._template_w > 0 and abs(img_w / self._template_w - 1.0) > 0.01:
+            scale = img_w / self._template_w
+            ph0, pw0 = self._patch.shape[:2]
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            patch = cv2.resize(self._patch,
+                               (max(1, int(pw0 * scale)), max(1, int(ph0 * scale))),
+                               interpolation=interp)
+            ic_x = int(self._ic_x * scale)
+            ic_y_tmpl = int(self._ic_y * scale)
+            ic_w = max(1, int(self._ic_w * scale))
+            ic_h = max(1, int(self._ic_h * scale))
+            strip_h = int(self._strip_h * scale)
+            m = int(self._margin * scale)
+        else:
+            patch = self._patch
+            ic_x, ic_y_tmpl = self._ic_x, self._ic_y
+            ic_w, ic_h = self._ic_w, self._ic_h
+            strip_h = self._strip_h
+            m = self._margin
+
+        ph, pw = patch.shape[:2]
+        exp_y = ic_y_tmpl - strip_h
+
+        rx1 = max(0, ic_x - m)
         ry1 = max(0, exp_y - m)
-        rx2 = min(img_w, self._ic_x + pw + m)
+        rx2 = min(img_w, ic_x + pw + m)
         ry2 = min(img_h, exp_y + ph + m)
 
-        roi_bgr  = image_bgr[ry1:ry2, rx1:rx2]
+        roi_bgr = image_bgr[ry1:ry2, rx1:rx2]
 
         if roi_bgr.size == 0 or roi_bgr.shape[0] < ph or roi_bgr.shape[1] < pw:
             # ROI empty or too small — fall back to full-frame search
             full = _contour_template(image_bgr)
-            res = cv2.matchTemplate(full, self._patch, cv2.TM_CCOEFF_NORMED)
+            res = cv2.matchTemplate(full, patch, cv2.TM_CCOEFF_NORMED)
             _, score, _, loc = cv2.minMaxLoc(res)
-            ic_y = loc[1] + self._strip_h
-            return QtCore.QRect(loc[0], ic_y, self._ic_w, self._ic_h), float(score)
+            found_ic_y = loc[1] + strip_h
+            return QtCore.QRect(loc[0], found_ic_y, ic_w, ic_h), float(score)
 
         filtered = _contour_template(roi_bgr)
-        res = cv2.matchTemplate(filtered, self._patch, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(filtered, patch, cv2.TM_CCOEFF_NORMED)
         _, score, _, loc = cv2.minMaxLoc(res)
         abs_x = loc[0] + rx1
         abs_y = loc[1] + ry1
-        ic_y  = abs_y + self._strip_h
+        found_ic_y = abs_y + strip_h
 
         if score < self._threshold:
             print(f"[TemplateMatcher] Low match score {score:.3f} < {self._threshold:.3f} — "
                   "using best-match position anyway")
 
-        return QtCore.QRect(abs_x, ic_y, self._ic_w, self._ic_h), float(score)
+        return QtCore.QRect(abs_x, found_ic_y, ic_w, ic_h), float(score)
 
 def _find_second_ic(image_bgr: np.ndarray,
                     ref_rect: QtCore.QRect,
@@ -1167,8 +1195,10 @@ class Inspector:
         self._detector         = detector
         self._template         = template
         self._template_matcher = template_matcher
-        self._ic_b_dx = template["ic_b"]["x"] - template["ic_a"]["x"]
-        self._ic_b_dy = template["ic_b"]["y"] - template["ic_a"]["y"]
+        self._ic_b_dx_tmpl = template["ic_b"]["x"] - template["ic_a"]["x"]
+        self._ic_b_dy_tmpl = template["ic_b"]["y"] - template["ic_a"]["y"]
+        self._template_w   = int(template.get("img_w", 0))
+        self._template_h   = int(template.get("img_h", 0))
         self._cell_shrink     = cell_shrink
         self._cell_expand     = cell_expand
         self._col_gap_pct     = col_gap_pct
@@ -1190,46 +1220,64 @@ class Inspector:
         Phase 1 — locate IC_A via TemplateMatcher (preferred) or fixed template coords.
         Phase 2 — crop each ROI cell and classify as Text / NoText.
         """
-        # Guard: verify image is large enough to cover both IC regions from template
-        ic_a = self._template["ic_a"]
-        ic_b = self._template["ic_b"]
-        min_w = max(ic_a["x"] + ic_a["w"], ic_b["x"] + ic_b["w"])
-        min_h = max(ic_a["y"] + ic_a["h"], ic_b["y"] + ic_b["h"])
         img_h, img_w = image_bgr.shape[:2]
+
+        # Scale factor: template coords → current image space.
+        # Legacy templates (no img_w/img_h) use 1:1 — no change in behaviour.
+        if self._template_w > 0 and self._template_h > 0:
+            sx = img_w / self._template_w
+            sy = img_h / self._template_h
+        else:
+            sx, sy = 1.0, 1.0
+
+        ic_b_dx = int(self._ic_b_dx_tmpl * sx)
+        ic_b_dy = int(self._ic_b_dy_tmpl * sy)
+
+        def _scale_r(r):
+            return {"x": int(r["x"] * sx), "y": int(r["y"] * sy),
+                    "w": max(1, int(r["w"] * sx)), "h": max(1, int(r["h"] * sy))}
+
+        ic_a_s = _scale_r(self._template["ic_a"])
+        ic_b_s = _scale_r(self._template["ic_b"])
+
+        # Guard: verify image is large enough to cover both scaled IC regions
+        min_w = max(ic_a_s["x"] + ic_a_s["w"], ic_b_s["x"] + ic_b_s["w"])
+        min_h = max(ic_a_s["y"] + ic_a_s["h"], ic_b_s["y"] + ic_b_s["h"])
         if img_w < min_w or img_h < min_h:
             raise TemplateError(
                 f"Image {img_w}×{img_h} too small — template requires at least {min_w}×{min_h}")
 
-        _gcfg = {
-            "CELL_SHRINK": self._cell_shrink, "CELL_EXPAND": self._cell_expand,
-            "COL_GAP_PCT": self._col_gap_pct,
-            "GRID_MARGIN_TOP": self._grid_margin_top,
-            "GRID_MARGIN_BOT": self._grid_margin_bot,
-        }
-        tmpl_a_cells, tmpl_b_cells = TemplateManager.compute_rois(self._template, _gcfg)
         annotated = image_bgr  # draw in-place; caller saves raw before calling inspect()
 
         # Phase 1: locate ICs
         if self._template_matcher is not None:
             rt_a, score = self._template_matcher.locate_ic(image_bgr)
             rt_b = QtCore.QRect(
-                rt_a.x() + self._ic_b_dx, rt_a.y() + self._ic_b_dy,
-                self._template["ic_b"]["w"], self._template["ic_b"]["h"],
+                rt_a.x() + ic_b_dx, rt_a.y() + ic_b_dy,
+                ic_b_s["w"], ic_b_s["h"],
             )
             ic_a_cells = self._rect_to_cells(rt_a)
             ic_b_cells = self._rect_to_cells(rt_b)
             if debug:
-                print(f"[Inspector] TemplateMatcher score={score:.3f}")
+                print(f"[Inspector] scale=({sx:.3f},{sy:.3f}) "
+                      f"TemplateMatcher score={score:.3f}")
                 print(f"[Inspector] IC_A matched: "
                       f"x={rt_a.x()} y={rt_a.y()} w={rt_a.width()} h={rt_a.height()}")
                 print(f"[Inspector] IC_B by offset: "
                       f"x={rt_b.x()} y={rt_b.y()} w={rt_b.width()} h={rt_b.height()}")
         else:
-            # Fixed template coordinates — no runtime IC localization
-            ic_a_cells = tmpl_a_cells
-            ic_b_cells = tmpl_b_cells
+            # Fixed scaled coords — no runtime IC localization
+            ic_a_cells = _build_cells(
+                ic_a_s["x"], ic_a_s["y"], ic_a_s["w"], ic_a_s["h"],
+                self._cell_shrink, self._cell_expand,
+                self._col_gap_pct, self._grid_margin_top, self._grid_margin_bot)
+            ic_b_cells = _build_cells(
+                ic_b_s["x"], ic_b_s["y"], ic_b_s["w"], ic_b_s["h"],
+                self._cell_shrink, self._cell_expand,
+                self._col_gap_pct, self._grid_margin_top, self._grid_margin_bot)
             if debug:
-                print("[Inspector] No TemplateMatcher — using fixed template coordinates")
+                print(f"[Inspector] scale=({sx:.3f},{sy:.3f}) "
+                      "No TemplateMatcher — using scaled fixed template coordinates")
 
         # Phase 2: crop each cell and classify as Text / NoText
         missing_a, hits_a, confs_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
@@ -3172,7 +3220,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not save template patches: {e}\n"
                     "Inspection will use fixed template coordinates.")
 
-        TemplateManager.save(ic_a, ic_b, exposure, strip_h=strip_h_val)
+        img_h_tmpl, img_w_tmpl = (self._setup_image.shape[:2]
+                                   if self._setup_image is not None else (0, 0))
+        TemplateManager.save(ic_a, ic_b, exposure, strip_h=strip_h_val,
+                             img_w=img_w_tmpl, img_h=img_h_tmpl)
 
         if self._setup_image is not None:
             try:
@@ -3266,6 +3317,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 strip_h=tmpl.get("strip_h", 0),
                 ic_x=ic_a["x"], ic_y=ic_a["y"],
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
+                template_w=tmpl.get("img_w", 0),
             )
 
         inspector = Inspector(
@@ -3350,7 +3402,9 @@ class MainWindow(QtWidgets.QMainWindow):
         debug = self._cfg.get("DEBUG", True)
         try:
             img = self._camera.grab_first()
-            resized = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
+            _pw = self._cfg.get("IMAGE_W", 0) or img.shape[1]
+            _ph = self._cfg.get("IMAGE_H", 0) or img.shape[0]
+            resized = cv2.resize(img, (_pw, _ph), interpolation=cv2.INTER_AREA)
             cv2.imwrite("cropimg.jpg", resized)
 
             resp = requests.post(

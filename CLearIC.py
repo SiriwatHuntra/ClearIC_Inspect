@@ -2648,6 +2648,7 @@ class MainWindow(QtWidgets.QMainWindow):
             log_dir=cfg.get("LOG_DIR", "logs"),
             log_retention=int(cfg.get("LOG_RETENTION", 365)))
         self._worker:           RunWorker | None        = None
+        self._preview_timer:    QtCore.QTimer | None    = None
 
         self._stats_pass  = 0
         self._stats_fail  = 0
@@ -3032,6 +3033,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except CameraError:
                 pass
 
+        if self._camera and cfg.get("CAMERA") == "camera":
+            self._preview_timer = QtCore.QTimer(self)
+            self._preview_timer.setInterval(100)
+            self._preview_timer.timeout.connect(self._on_preview_tick)
+            self._preview_timer.start()
+
         # Wire Cell-con lot-number fetch into the LotStartDialog plugin hook
         self._cellcon = CellCon(port=cfg.get("CELLCON_PORT", "/dev/ttyUSB0"))
         LotStartDialog.get_lot_number_from_api = lambda: self._cellcon.get_lot()
@@ -3276,8 +3283,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._logger.log_ocr(self._ocr_operator, self._ocr_expect_value)
         self._start_worker(inspector, gpio)
 
+    def _on_preview_tick(self):
+        if self._run_state != "standby" or not self._camera:
+            return
+        try:
+            img = self._camera.grab()
+            self._view.set_image(img)
+        except CameraError:
+            pass
+
     def _start_worker(self, inspector: "Inspector", gpio: "RaspberryIO"):
         """Create and start RunWorker. Lock OCR fields for the duration of the run."""
+        if self._preview_timer:
+            self._preview_timer.stop()
         self._edit_op_number.setReadOnly(True)
         self._edit_ocr_expect.setReadOnly(True)
         self._worker = RunWorker(
@@ -3451,6 +3469,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_yield.setText("—")
         self._lbl_status.setText("Standby.")
         self._reload_default_image()
+        if self._preview_timer:
+            self._preview_timer.start()
 
     def _reload_default_image(self):
         """Display the first image (or a live grab) and rewind the index."""

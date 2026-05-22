@@ -3293,7 +3293,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.Close)
             self._enter_standby()
             return
-        self._logger.log_ocr(self._ocr_operator, self._ocr_expect_value)
+        self._logger.log_ocr(self._ocr_operator, getattr(self, "_ocr_used_mark", self._ocr_expect_value))
         self._start_worker(inspector, gpio)
 
     def _on_preview_tick(self):
@@ -3371,9 +3371,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         return False
                 else:
                     std_mark = data[0]["mark"]
-                    is_pass  = 1 if std_mark == expected_mark else 0
-                    color    = "#69FF69" if is_pass else "#FF6B6B"
-                    label    = "Mark OK" if is_pass else f"FAIL — DB mark: {std_mark}"
+                    ocr_mark = data[0].get("ocr_mark")
+                    if ocr_mark is None:
+                        ocr_mark = expected_mark if debug else None
+                    if ocr_mark is None:
+                        self._lbl_ocr_status.setText("OCR: no result from server")
+                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                        return False
+                    self._ocr_used_mark = ocr_mark
+                    is_pass = 1 if std_mark == ocr_mark else 0
+                    color   = "#69FF69" if is_pass else "#FF6B6B"
+                    label   = "Mark OK" if is_pass else f"FAIL — DB: {std_mark} | OCR: {ocr_mark}"
                     self._lbl_ocr_status.setText(label)
                     self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
             elif debug:
@@ -3390,7 +3398,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     enc = base64.b64encode(fh.read()).decode()
                 requests.post(
                     "http://webserv.thematrix.net/ROHMApi/api/OCR/CreateRecord",
-                    json={"username": operator, "lot_no": lot, "mark": expected_mark,
+                    json={"username": operator, "lot_no": lot,
+                          "mark": getattr(self, "_ocr_used_mark", expected_mark),
                           "image": enc, "is_pass": is_pass,
                           "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
             except Exception:

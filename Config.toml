@@ -53,6 +53,12 @@ CONF_THR = 0.85
 # Text-class probability must exceed this to call a cell PASS
 TEXT_MIN_CONF = 0.80
 
+# Number of inference passes per cell; averaged before applying TEXT_MIN_CONF (1 = off, 3 recommended)
+CLS_N_PASSES = 3
+
+# If averaged text_prob falls in [CLS_UNCERTAIN_THR, TEXT_MIN_CONF), a debug line is printed
+CLS_UNCERTAIN_THR = 0.50
+
 # Missing cells below this count → PASS (suspect); at or above → FAIL (suspect)
 TEXT_NG_THRESHOLD = 2
 

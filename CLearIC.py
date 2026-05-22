@@ -122,6 +122,8 @@ class ConfigLoader:
         "IMAGE_W":              0,
         "IMAGE_H":              0,
         "CAMERA_FPS":           10,
+        "CLS_N_PASSES":         3,
+        "CLS_UNCERTAIN_THR":    0.50,
     }
     @classmethod
     def load(cls) -> dict:
@@ -704,10 +706,14 @@ class Detector:
     def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80,
                  blank_cell_std_thr: float = 0.0,
                  model_path: str = "Text_cls-2/best_openvino_model/best.xml",
-                 **_):
+                 n_passes: int = 3, uncertain_thr: float = 0.50,
+                 debug: bool = False, **_):
         self._conf_thr           = conf_thr
         self._text_min_conf      = text_min_conf
         self._blank_cell_std_thr = blank_cell_std_thr
+        self._n_passes           = max(1, int(n_passes))
+        self._uncertain_thr      = float(uncertain_thr)
+        self._debug              = debug
         self._compiled = None
         self._ready    = False
         try:
@@ -759,14 +765,20 @@ class Detector:
             resized = cv2.resize(crop_bgr, (sz, sz))
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
             blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
-            result  = self._compiled(blob)
-            probs     = result[0][0]                         # [2] — softmax already applied by YOLO-cls
-            text_prob = float(probs[1])                     # P(Text)
+            text_probs = []
+            for _ in range(self._n_passes):
+                result = self._compiled(blob)
+                text_probs.append(float(result[0][0][1]))   # P(Text) each pass
+            text_prob   = sum(text_probs) / len(text_probs)
+            notext_prob = 1.0 - text_prob
             # Require Text probability to clear TEXT_MIN_CONF; anything below → NoText.
             # Asymmetric on purpose: guards unmarked products without penalising NoText.
             if text_prob >= self._text_min_conf:
                 return 1, text_prob
-            return 0, float(probs[0])
+            if self._debug and text_prob >= self._uncertain_thr:
+                print(f"[Detector] Uncertain cell: text_prob={text_prob:.3f} "
+                      f"(gate={self._text_min_conf:.2f})")
+            return 0, notext_prob
         except Exception as e:
             print(f"[Detector] Classify error: {e}")
             return 0, 0.0
@@ -1327,7 +1339,10 @@ class Inspector:
             gray    = None
             if crop.size > 0:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-                crop = cv2.cvtColor(_CLAHE.apply(gray), cv2.COLOR_GRAY2BGR)
+                _ch, _cw = gray.shape[:2]
+                _tiles = (max(1, _cw // 8), max(1, _ch // 8))
+                _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=_tiles)
+                crop = cv2.cvtColor(_clahe.apply(gray), cv2.COLOR_GRAY2BGR)
             cls_idx, conf = self._detector.classify_crop(crop)
             present   = (cls_idx == 1)   # 1 = Text (mark present)
             text_conf = conf if cls_idx == 1 else (1.0 - conf)  # Text-class probability
@@ -3044,6 +3059,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
                 model_path=cfg.get("MODEL_PATH",
                                    "Text_cls-2/best_openvino_model/best.xml"),
+                n_passes=cfg.get("CLS_N_PASSES", 3),
+                uncertain_thr=cfg.get("CLS_UNCERTAIN_THR", 0.50),
+                debug=cfg.get("DEBUG", True),
             )
         except ModelError as e:
             self._show_error(f"Classifier model load failed: {e}")

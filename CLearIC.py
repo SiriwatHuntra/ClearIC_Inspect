@@ -119,6 +119,8 @@ class ConfigLoader:
         "WARMUP_FRAMES":        5,
         "SKIP_DONE_WAIT":       False,
         "CELLCON_PORT":         "/dev/ttyUSB0",
+        "IMAGE_W":              640,
+        "IMAGE_H":              480,
     }
     @classmethod
     def load(cls) -> dict:
@@ -273,7 +275,8 @@ class Camera:
     def __init__(self, mode: str, serial: str = "",
                  exposure_us: int = 8000, input_dir: str = "Input",
                  retry_delay: float = 0.2, retries: int = 2,
-                 warmup_frames: int = 5):
+                 warmup_frames: int = 5,
+                 image_w: int = 0, image_h: int = 0):
         self._mode        = mode
         self._serial      = serial
         self._exposure_us = exposure_us
@@ -281,6 +284,8 @@ class Camera:
         self._retry_delay = retry_delay
         self._retries     = retries
         self._warmup_frames = warmup_frames
+        self._image_w     = image_w
+        self._image_h     = image_h
 
         self._camera      = None
         self._pylon       = None
@@ -320,7 +325,10 @@ class Camera:
             self._camera = pylon.InstantCamera(device)
             self._camera.Open()
             self._camera.ExposureAuto.SetValue("Off")
-            self._camera.ExposureTimeAbs.SetValue(float(self._exposure_us))
+            try:
+                self._camera.ExposureTimeAbs.SetValue(float(self._exposure_us))
+            except Exception:
+                self._camera.ExposureTime.SetValue(float(self._exposure_us))
             self._camera.PixelFormat.SetValue("Mono8")
             self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
             print(f"[Camera] Opened. Exposure={self._exposure_us} µs")
@@ -386,6 +394,9 @@ class Camera:
         img = cv2.imread(path)
         if img is None:
             raise CameraError(f"Cannot read image: {path}")
+        if self._image_w > 0 and self._image_h > 0:
+            img = cv2.resize(img, (self._image_w, self._image_h),
+                             interpolation=cv2.INTER_AREA)
         return img
 
     # misc
@@ -3000,6 +3011,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 retry_delay=cfg.get("CAMERA_RETRY_DELAY", 0.2),
                 retries=cfg.get("CAMERA_RETRIES", 2),
                 warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
+                image_w=cfg.get("IMAGE_W", 0),
+                image_h=cfg.get("IMAGE_H", 0),
             )
             self._camera.open()
         except CameraError as e:

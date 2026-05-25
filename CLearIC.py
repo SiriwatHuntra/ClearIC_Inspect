@@ -57,6 +57,8 @@ import csv
 import json
 import glob
 import time
+import signal
+import fcntl
 import threading
 from enum import Enum
 from dataclasses import dataclass, field
@@ -2745,6 +2747,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_timer:    QtCore.QTimer | None    = None
         self._cam_retry_timer:  QtCore.QTimer | None    = None
         self._camera_init_kwargs: dict                  = {}
+        self._worker_last_tick: float                   = 0.0
+        self._watchdog_timer = QtCore.QTimer(self)
+        self._watchdog_timer.setInterval(15_000)
+        self._watchdog_timer.timeout.connect(self._check_watchdog)
+        self._watchdog_timer.start()
 
         self._stats_pass  = 0
         self._stats_fail  = 0
@@ -3086,7 +3093,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 debug=cfg.get("DEBUG", True),
             )
         except ModelError as e:
-            self._show_error(f"Classifier model load failed: {e}")
+            QtWidgets.QMessageBox.critical(
+                self, "Model Error",
+                f"Cannot load classifier model:\n\n{e}\n\n"
+                "Check that the model files exist and contact your administrator.")
+            QtCore.QTimer.singleShot(0, self.close)
+            return
 
         try:
             self._gpio = RaspberryIO(
@@ -3544,6 +3556,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_fail.connect(self._on_fail)
         self._worker.sig_error.connect(self._on_worker_error)
         self._worker.sig_status.connect(self._lbl_status.setText)
+        self._worker.sig_status.connect(self._reset_watchdog)
+        self._worker.sig_image.connect(self._reset_watchdog)
         self._worker.sig_cycle_ms.connect(
             lambda ms: self._lbl_cycle_ms.setText(f"{ms:.0f}"))
         self._worker.sig_done.connect(self._on_run_done)
@@ -3551,6 +3565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_paused.connect(self._on_paused)
         self._worker.sig_resumed.connect(self._on_resumed)
         self._worker.start()
+        self._worker_last_tick = time.monotonic()
 
         self._run_state = "running"
         self._btn_action.setText("Pause")
@@ -3796,6 +3811,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_ui_after_cycle(
             len(err.missing_a) == 0, len(err.missing_b) == 0, passed=False)
 
+    def _reset_watchdog(self, *_):
+        self._worker_last_tick = time.monotonic()
+
+    def _check_watchdog(self):
+        if self._run_state != "running":
+            return
+        if time.monotonic() - self._worker_last_tick > 30.0:
+            if self._worker:
+                self._worker.stop()
+            self._on_worker_error(
+                "Worker timeout — no activity for 30 s. Camera may be frozen.")
+
     def _on_worker_error(self, msg: str):
         self._stats_error += 1
         elapsed = time.monotonic() - self._session_start_time
@@ -3825,6 +3852,15 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
+    _lockfile = open("/tmp/clearic.lock", "w")
+    try:
+        fcntl.flock(_lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        QtWidgets.QMessageBox.critical(
+            None, "Already Running",
+            "ClearIC is already running.\nClose the existing window first.")
+        sys.exit(1)
+
     try:
         cfg = ConfigLoader.load()
     except ConfigError as e:
@@ -3842,6 +3878,12 @@ def main():
         os.makedirs(os.path.join(_dd, _ds, "Text"),   exist_ok=True)
         os.makedirs(os.path.join(_dd, _ds, "NoText"), exist_ok=True)
         print(f"[Dataset] Collection ON → {_dd}/{_ds}/")
+
+    for _stale in ("cropimg.jpg",):
+        try:
+            os.remove(_stale)
+        except OSError:
+            pass
 
     app.setStyleSheet(STYLE)
 
@@ -3861,6 +3903,8 @@ def main():
 
     win = MainWindow(cfg)
     win.show()
+    signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    signal.signal(signal.SIGINT,  lambda *_: app.quit())
     sys.exit(app.exec_())
 
 

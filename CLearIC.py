@@ -63,8 +63,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import gc
-import base64
-import requests
 import cv2
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
@@ -122,7 +120,7 @@ class ConfigLoader:
         "IMAGE_W":              0,
         "IMAGE_H":              0,
         "CAMERA_FPS":           10,
-        "CLS_N_PASSES":         3,
+        "CLS_N_PASSES":         1,   # deterministic model — multi-pass gives identical results
         "CLS_UNCERTAIN_THR":    0.50,
     }
     @classmethod
@@ -531,7 +529,7 @@ class CellCon:
                         print(f"[CellCon] Lot received: {lot}")
                         return lot
         except Exception as e:
-            print(f"[CellCon] Error: {e}")
+            print(f"[CellCon] Error: {e} — check USB at {self._port}")
         return ""
 
 
@@ -786,9 +784,6 @@ class Detector:
 # Dataset collection run counter
 _data_run_counter = 0
 _dataset_lock     = threading.Lock()
-
-# CLAHE preprocessor applied to each cell crop before classification
-_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 # VISUAL CONSTANTS  (fixed — not configurable at runtime)
 _ann_color_ok = "#00C800"   # hex — Text  / PASS cell border
@@ -1221,6 +1216,7 @@ class Inspector:
         self._data_split      = data_split
         self._ann_border_px   = ann_border_px
         self._ann_show_labels = ann_show_labels
+        self._clahe_cache: dict = {}   # (tile_w, tile_h) → cv2.CLAHE; reused across cycles
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -1341,7 +1337,10 @@ class Inspector:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 _ch, _cw = gray.shape[:2]
                 _tiles = (max(1, _cw // 8), max(1, _ch // 8))
-                _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=_tiles)
+                _clahe = self._clahe_cache.get(_tiles)
+                if _clahe is None:
+                    _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=_tiles)
+                    self._clahe_cache[_tiles] = _clahe
                 crop = cv2.cvtColor(_clahe.apply(gray), cv2.COLOR_GRAY2BGR)
             cls_idx, conf = self._detector.classify_crop(crop)
             present   = (cls_idx == 1)   # 1 = Text (mark present)
@@ -2162,8 +2161,7 @@ class RunWorker(QtCore.QThread):
                 self.sig_resumed.emit()
 
         self._gpio.clear_outputs()
-        if cam_mode != "camera":
-            self.sig_done.emit()
+        self.sig_done.emit()   # always emit; _on_run_done guards against double-call
         self.sig_status.emit("Standby.")
 
 # LOT START DIALOG
@@ -2180,9 +2178,17 @@ class LotStartDialog(QtWidgets.QDialog):
         return ""   # empty = show dialog; non-empty = skip dialog
 
     @classmethod
-    def request(cls, parent=None) -> str | None:
-        """Returns lot number string, or None if operator cancelled."""
-        api_lot = cls.get_lot_number_from_api()
+    def request(cls, parent=None, api_fn=None) -> str | None:
+        """
+        Returns lot number string, or None if operator cancelled.
+        api_fn: optional callable → str; if it returns non-empty the dialog is skipped.
+        Falls back to get_lot_number_from_api() for subclass overrides.
+        """
+        if api_fn is not None:
+            lot = api_fn()
+            if lot:
+                return lot
+        api_lot = cls.get_lot_number_from_api()   # kept as subclass plugin point
         if api_lot:
             return api_lot
         dlg = cls(parent)
@@ -2724,14 +2730,17 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("ClearIC Inspect")
         self._cfg               = cfg
-        self._camera:    Camera | None  = None
-        self._detector:  Detector | None = None
+        self._camera:    Camera | None    = None
+        self._detector:  Detector | None  = None
+        self._inspector: Inspector | None = None
         self._gpio       = None
         self._logger            = Logger(
             log_dir=cfg.get("LOG_DIR", "logs"),
             log_retention=int(cfg.get("LOG_RETENTION", 365)))
         self._worker:           RunWorker | None        = None
         self._preview_timer:    QtCore.QTimer | None    = None
+        self._cam_retry_timer:  QtCore.QTimer | None    = None
+        self._camera_init_kwargs: dict                  = {}
 
         self._stats_pass  = 0
         self._stats_fail  = 0
@@ -2845,7 +2854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         setup_lay.addWidget(self._lbl_tmpl_status)
 
         self._btn_new_tmpl = QtWidgets.QPushButton("New Template")
-        self._btn_new_tmpl.clicked.connect(self._start_draw_a)
+        self._btn_new_tmpl.clicked.connect(self._on_new_tmpl_click)
         setup_lay.addWidget(self._btn_new_tmpl)
 
         self._btn_confirm_tmpl = QtWidgets.QPushButton("Confirm")
@@ -3054,6 +3063,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cfg.update({"WARMUP_FRAMES": wf, "ANN_BORDER_PX": bp,
                           "ANN_SHOW_LABELS": show_labels})
         ConfigLoader.save(self._cfg)
+        self._rebuild_inspector()
 
         print(f"[Settings] border={bp}px  labels={show_labels}  warmup={wf}")
 
@@ -3067,7 +3077,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
                 model_path=cfg.get("MODEL_PATH",
                                    "Text_cls-2/best_openvino_model/best.xml"),
-                n_passes=cfg.get("CLS_N_PASSES", 3),
+                n_passes=cfg.get("CLS_N_PASSES", 1),
                 uncertain_thr=cfg.get("CLS_UNCERTAIN_THR", 0.50),
                 debug=cfg.get("DEBUG", True),
             )
@@ -3089,30 +3099,37 @@ class MainWindow(QtWidgets.QMainWindow):
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
 
+        self._camera_init_kwargs = dict(
+            mode=cfg.get("CAMERA", "directory"),
+            serial=cfg.get("CAMERA_SERIAL", ""),
+            exposure_us=cfg.get("EXPOSURE_US", 8000),
+            input_dir=cfg.get("DIR_INPUT", "Input/"),
+            retry_delay=cfg.get("CAMERA_RETRY_DELAY", 0.2),
+            retries=cfg.get("CAMERA_RETRIES", 2),
+            warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
+            image_w=cfg.get("IMAGE_W", 0),
+            image_h=cfg.get("IMAGE_H", 0),
+            fps=cfg.get("CAMERA_FPS", 0),
+        )
         try:
-            self._camera = Camera(
-                mode=cfg.get("CAMERA", "directory"),
-                serial=cfg.get("CAMERA_SERIAL", ""),
-                exposure_us=cfg.get("EXPOSURE_US", 8000),
-                input_dir=cfg.get("DIR_INPUT", "Input/"),
-                retry_delay=cfg.get("CAMERA_RETRY_DELAY", 0.2),
-                retries=cfg.get("CAMERA_RETRIES", 2),
-                warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
-                image_w=cfg.get("IMAGE_W", 0),
-                image_h=cfg.get("IMAGE_H", 0),
-                fps=cfg.get("CAMERA_FPS", 0),
-            )
+            self._camera = Camera(**self._camera_init_kwargs)
             self._camera.open()
         except CameraError as e:
             self._show_error(f"Camera init failed: {e}")
+            if cfg.get("CAMERA") == "camera":
+                self._cam_retry_timer = QtCore.QTimer(self)
+                self._cam_retry_timer.setInterval(5000)
+                self._cam_retry_timer.timeout.connect(self._retry_camera_open)
+                self._cam_retry_timer.start()
+                self._lbl_status.setText("Camera not found — retrying in 5 s…")
 
-        if self._camera and cfg.get("CAMERA") == "camera":
+        if self._camera and self._camera.is_open() and cfg.get("CAMERA") == "camera":
             self._camera.warmup()
         if self._detector and self._detector.is_ready():
             self._detector.warmup(frames=cfg.get("WARMUP_FRAMES", 5))
 
         # Load and display first image on startup (no overlays yet)
-        if self._camera:
+        if self._camera and self._camera.is_open():
             try:
                 img = self._camera.grab_first()
                 self._view.set_image(img)
@@ -3120,19 +3137,82 @@ class MainWindow(QtWidgets.QMainWindow):
             except CameraError:
                 pass
 
-        if self._camera and cfg.get("CAMERA") == "camera":
+        if self._camera and self._camera.is_open() and cfg.get("CAMERA") == "camera":
             self._preview_timer = QtCore.QTimer(self)
             self._preview_timer.setInterval(100)
             self._preview_timer.timeout.connect(self._on_preview_tick)
             self._preview_timer.start()
 
-        # Wire Cell-con lot-number fetch into the LotStartDialog plugin hook
         self._cellcon = CellCon(port=cfg.get("CELLCON_PORT", "/dev/ttyUSB0"))
-        LotStartDialog.get_lot_number_from_api = lambda: self._cellcon.get_lot()
+
+        # Build Inspector from existing template (silent no-op if template absent)
+        self._rebuild_inspector()
 
         # Apply initial button state — disables Start if no template exists yet.
         self._update_setup_buttons()
 
+
+    def _rebuild_inspector(self):
+        """(Re)build Inspector from current template + config. Sets _inspector=None on failure."""
+        if not self._detector or not self._detector.is_ready():
+            self._inspector = None
+            return
+        try:
+            tmpl = TemplateManager.load()
+        except TemplateError:
+            self._inspector = None
+            return
+        matcher = None
+        full_patch = TemplateManager.load_patches()
+        if full_patch is not None:
+            ic_a = tmpl["ic_a"]
+            matcher = TemplateMatcher(
+                full_patch,
+                threshold=tmpl.get("match_threshold", 0.6),
+                strip_h=tmpl.get("strip_h", 0),
+                ic_x=ic_a["x"], ic_y=ic_a["y"],
+                ic_w=ic_a["w"], ic_h=ic_a["h"],
+                template_w=tmpl.get("img_w", 0),
+            )
+        self._inspector = Inspector(
+            self._detector, tmpl, template_matcher=matcher,
+            cell_shrink=self._cfg.get("CELL_SHRINK", 0.95),
+            cell_expand=self._cfg.get("CELL_EXPAND", 1.2),
+            col_gap_pct=self._cfg.get("COL_GAP_PCT", 40.0),
+            grid_margin_top=self._cfg.get("GRID_MARGIN_TOP", 0.0),
+            grid_margin_bot=self._cfg.get("GRID_MARGIN_BOT", 15.0),
+            collect_dataset=self._cfg.get("COLLECT_DATASET", False),
+            data_dir=self._cfg.get("DATA_DIR", "Dataset"),
+            data_split=self._cfg.get("DATA_SPLIT", "train"),
+            ann_border_px=self._cfg.get("ANN_BORDER_PX", 1),
+            ann_show_labels=self._cfg.get("ANN_SHOW_LABELS", True),
+        )
+
+    def _retry_camera_open(self):
+        """Called every 5 s when camera failed to open at startup (camera mode only)."""
+        try:
+            cam = Camera(**self._camera_init_kwargs)
+            cam.open()
+            self._camera = cam
+            self._camera.warmup()
+            try:
+                img = self._camera.grab_first()
+                self._view.set_image(img)
+                self._setup_image = img
+            except CameraError:
+                pass
+            if self._cam_retry_timer is not None:
+                self._cam_retry_timer.stop()
+            if self._preview_timer is None:
+                self._preview_timer = QtCore.QTimer(self)
+                self._preview_timer.setInterval(100)
+                self._preview_timer.timeout.connect(self._on_preview_tick)
+            self._preview_timer.start()
+            self._error_banner.hide()
+            self._update_setup_buttons()
+            self._lbl_status.setText("Camera reconnected.")
+        except CameraError:
+            self._lbl_status.setText("Camera not found — retrying in 5 s…")
 
     # Rubber-band template setup flow
     def _grab_setup_frame(self) -> np.ndarray | None:
@@ -3144,6 +3224,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except CameraError as e:
             self._show_error(str(e))
             return None
+
+    def _on_new_tmpl_click(self):
+        if self._setup_state == 'idle':
+            self._start_draw_a()
+        else:
+            self._reset_template_draw()
 
     def _start_draw_a(self):
         img = self._grab_setup_frame()
@@ -3210,17 +3296,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_setup_buttons(self):
         s = self._setup_state
-        self._btn_new_tmpl.setEnabled(s in ('idle', 'ready'))
+        self._btn_new_tmpl.setEnabled(True)   # always enabled — acts as Cancel during draw
+        self._btn_new_tmpl.setText("New Template" if s == 'idle' else "Cancel")
         self._btn_confirm_tmpl.setEnabled(s == 'ready')
         if s == 'idle':
             template_ok = os.path.exists(_TEMPLATE_FILE)
             text = ("Template saved."
                     if template_ok
                     else "No template — create a template before running.")
-            # Gate the Start button: only allow run when a template exists.
             if self._run_state == "standby":
                 self._btn_action.setEnabled(template_ok and self._ocr_fields_valid())
         else:
+            self._btn_action.setEnabled(False)   # no Start while drawing template
             text = {
                 'draw_a':       'Draw either IC area on image.',
                 'draw_a_retry': 'IC_B not found — draw again.',
@@ -3262,6 +3349,7 @@ class MainWindow(QtWidgets.QMainWindow):
             msg += "\nPatch file saved (tmpl_full.npy)"
         msg += "\nPreview saved to templates/template_preview.png"
         QtWidgets.QMessageBox.information(self, "Template Saved", msg)
+        self._rebuild_inspector()
 
 
     # Run / Pause / Stop
@@ -3276,13 +3364,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_run(self):
         if self._worker and self._worker.isRunning():
             return
-        try:
-            tmpl = TemplateManager.load()
-        except TemplateError as e:
-            self._show_error(str(e))
-            return
+
+        # Guards before showing any dialog
         if not self._detector or not self._detector.is_ready():
             self._show_error("Detector not ready.")
+            return
+        inspector = self._inspector
+        if inspector is None:
+            self._show_error("No inspector — create a template first.")
             return
 
         # Snapshot OCR fields (read before lot dialog, values already validated by gating)
@@ -3294,14 +3383,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
         self._lbl_lot_info.setText("—")
 
-        # Ask operator for lot number (or get from API hook)
-        lot = LotStartDialog.request(parent=self)
+        # Ask operator for lot number (or get from CellCon / subclass hook)
+        lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
         if lot is None:
             self._lbl_ocr_status.setText("Fill both fields to enable Start.")
             self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
             return   # operator cancelled
         self._lot_number   = lot
-        self._package_name = tmpl.get("package_name", "")
+        self._package_name = inspector._template.get("package_name", "")
 
         self._session_start_time = time.monotonic()
 
@@ -3332,33 +3421,6 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
         self._logger.start_lot(self._lot_number, self._package_name, mode)
 
-        # IC localization via TemplateMatcher when patch exists; else fixed template coords.
-        matcher = None
-        full_patch = TemplateManager.load_patches()
-        if full_patch is not None:
-            ic_a = tmpl["ic_a"]
-            matcher = TemplateMatcher(
-                full_patch,
-                threshold=tmpl.get("match_threshold", 0.6),
-                strip_h=tmpl.get("strip_h", 0),
-                ic_x=ic_a["x"], ic_y=ic_a["y"],
-                ic_w=ic_a["w"], ic_h=ic_a["h"],
-                template_w=tmpl.get("img_w", 0),
-            )
-
-        inspector = Inspector(
-            self._detector, tmpl, template_matcher=matcher,
-            cell_shrink=self._cfg.get("CELL_SHRINK", 0.95),
-            cell_expand=self._cfg.get("CELL_EXPAND", 1.2),
-            col_gap_pct=self._cfg.get("COL_GAP_PCT", 40.0),
-            grid_margin_top=self._cfg.get("GRID_MARGIN_TOP", 0.0),
-            grid_margin_bot=self._cfg.get("GRID_MARGIN_BOT", 15.0),
-            collect_dataset=self._cfg.get("COLLECT_DATASET", False),
-            data_dir=self._cfg.get("DATA_DIR", "Dataset"),
-            data_split=self._cfg.get("DATA_SPLIT", "train"),
-            ann_border_px=self._cfg.get("ANN_BORDER_PX", 1),
-            ann_show_labels=self._cfg.get("ANN_SHOW_LABELS", True),
-        )
         gpio = self._gpio or RaspberryIO(io_enabled=False)
 
         # OCR API verification (once per lot)
@@ -3375,7 +3437,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_worker(inspector, gpio)
 
     def _on_preview_tick(self):
-        if self._run_state != "standby" or not self._camera:
+        if self._run_state != "standby" or not self._camera or self._setup_state != 'idle':
             return
         try:
             img = self._camera.grab()
@@ -3425,15 +3487,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _ocr_api_call(self, lot: str, operator: str, expected_mark: str) -> bool:
         """POST to ReadMark API, compare result, POST CreateRecord. Returns True = proceed."""
+        import base64   # stdlib, only used here
+        try:
+            import requests as _req
+        except ImportError:
+            debug = self._cfg.get("DEBUG", True)
+            if not debug:
+                self._lbl_ocr_status.setText("OCR unavailable — 'requests' not installed")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                return False
+            return True   # debug mode: skip OCR silently
+
         debug = self._cfg.get("DEBUG", True)
+        _crop_path = "cropimg.jpg"
         try:
             img = self._camera.grab_first()
             _pw = self._cfg.get("IMAGE_W", 0) or img.shape[1]
             _ph = self._cfg.get("IMAGE_H", 0) or img.shape[0]
             resized = cv2.resize(img, (_pw, _ph), interpolation=cv2.INTER_AREA)
-            cv2.imwrite("cropimg.jpg", resized)
+            cv2.imwrite(_crop_path, resized)
 
-            resp = requests.post(
+            resp = _req.post(
                 "http://webserv.thematrix.net/ROHMApi/api/OCR/ReadMark",
                 json={"username": operator, "lot_no": lot}, timeout=5)
 
@@ -3455,7 +3529,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     if ocr_mark is None:
                         ocr_mark = expected_mark if debug else None
                     if ocr_mark is None:
-                        self._lbl_ocr_status.setText("OCR: no result from server")
+                        self._lbl_ocr_status.setText(
+                            f"OCR: server returned no mark result — retry or check lot {lot}")
                         self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
                         return False
                     self._ocr_used_mark = ocr_mark
@@ -3469,14 +3544,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
                 is_pass = 1
             else:
-                self._lbl_ocr_status.setText(f"ReadMark API error {resp.status_code}")
+                self._lbl_ocr_status.setText(
+                    f"ReadMark API error {resp.status_code} — check credentials/server")
                 self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
                 return False
 
             try:
-                with open("cropimg.jpg", "rb") as fh:
+                with open(_crop_path, "rb") as fh:
                     enc = base64.b64encode(fh.read()).decode()
-                requests.post(
+                _req.post(
                     "http://webserv.thematrix.net/ROHMApi/api/OCR/CreateRecord",
                     json={"username": operator, "lot_no": lot,
                           "mark": getattr(self, "_ocr_used_mark", expected_mark),
@@ -3484,16 +3560,25 @@ class MainWindow(QtWidgets.QMainWindow):
                           "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
             except Exception:
                 pass   # record failure never blocks the run
+            finally:
+                try:
+                    os.remove(_crop_path)
+                except OSError:
+                    pass
 
             return bool(is_pass) or debug
 
         except Exception as exc:
             print(f"[OCR] {exc}")
+            err_str = str(exc).lower()
             if debug:
                 self._lbl_ocr_status.setText("[DEBUG] API unavailable — skipped")
                 self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
                 return True
-            self._lbl_ocr_status.setText(f"OCR API error — {exc}")
+            if any(k in err_str for k in ("connection", "timeout", "unreachable")):
+                self._lbl_ocr_status.setText("ReadMark API unreachable — check network connection")
+            else:
+                self._lbl_ocr_status.setText(f"OCR API error — {exc}")
             self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
             return False
 
@@ -3547,7 +3632,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._logger.start_lot(new_lot, self._package_name, mode)
 
     def _on_run_done(self):
-        """Called when the worker loop exits (directory mode done)."""
+        """Called when the worker loop exits."""
+        if self._run_state == "standby":
+            return   # Stop already handled this via _stop_run; ignore queued sig_done
         elapsed = time.monotonic() - self._session_start_time
         self._logger.end_lot(
             "COMPLETE", self._stats_pass, self._stats_fail,
@@ -3618,18 +3705,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_worker_error(self, msg: str):
         self._stats_error += 1
-        self._lbl_error.setText(str(self._stats_error))
-        self._show_error(msg)
         elapsed = time.monotonic() - self._session_start_time
         self._logger.end_lot(
             "ERROR", self._stats_pass, self._stats_fail,
             self._stats_error, elapsed)
-        self._run_state = "standby"
-        self._btn_action.setText("Start")
-        self._edit_op_number.setReadOnly(False)
-        self._edit_ocr_expect.setReadOnly(False)
-        self._btn_action.setEnabled(self._ocr_fields_valid())
-        self._btn_stop.setEnabled(False)
+        self._enter_standby()
+        self._show_error(msg)   # after standby — _enter_standby does not clear the error banner
 
     # Error banner
     def _show_error(self, msg: str):

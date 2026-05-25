@@ -3227,6 +3227,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_new_tmpl_click(self):
         if self._setup_state == 'idle':
+            if os.path.exists(_TEMPLATE_FILE):
+                reply = QtWidgets.QMessageBox.question(
+                    self, "Replace Template",
+                    "A template is already saved.\nReplace it with a new one?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
             self._start_draw_a()
         else:
             self._reset_template_draw()
@@ -3257,6 +3264,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_setup_buttons()
             return
 
+        _MIN_IC_PX = 60
+        if rect.width() < _MIN_IC_PX or rect.height() < _MIN_IC_PX:
+            self._lbl_tmpl_status.setText(
+                f"Selection too small ({rect.width()}×{rect.height()} px) — "
+                "draw the full IC area.")
+            self._setup_state = 'draw_a_retry'
+            self._view.set_rubberband_mode(True)
+            self._update_setup_buttons()
+            return
+
         drawn_on_left = (rect.x() + rect.width() // 2) < img.shape[1] // 2
         second, _     = _find_second_ic(img, rect)
 
@@ -3281,8 +3298,72 @@ class MainWindow(QtWidgets.QMainWindow):
             self._setup_state = 'draw_a_retry'
         self._update_setup_buttons()
 
+    def _show_cell_preview(self, ic_a: QtCore.QRect, ic_b: QtCore.QRect) -> bool:
+        img = self._setup_image
+        if img is None:
+            return True
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Verify Cell Areas")
+        dlg.setModal(True)
+        outer = QtWidgets.QVBoxLayout(dlg)
+
+        info = QtWidgets.QLabel(
+            "Check that each cell covers one mark position.\n"
+            "Click Confirm to save, or Cancel to redraw.")
+        info.setWordWrap(True)
+        info.setStyleSheet("font-size:11px;color:#E2FDFF")
+        outer.addWidget(info)
+
+        panels = QtWidgets.QHBoxLayout()
+        ih, iw = img.shape[:2]
+        for ic, label_text in ((ic_a, "IC_A"), (ic_b, "IC_B")):
+            grp = QtWidgets.QGroupBox(label_text)
+            grp.setStyleSheet("color:#E2FDFF;font-weight:bold")
+            grid = QtWidgets.QGridLayout(grp)
+            grid.setSpacing(4)
+            cells = _build_cells(
+                ic.x(), ic.y(), ic.width(), ic.height(),
+                cell_shrink=self._cfg.get("CELL_SHRINK", 0.95),
+                cell_expand=self._cfg.get("CELL_EXPAND", 1.2),
+                col_gap_pct=self._cfg.get("COL_GAP_PCT", 40.0),
+                grid_margin_top=self._cfg.get("GRID_MARGIN_TOP", 0.0),
+                grid_margin_bot=self._cfg.get("GRID_MARGIN_BOT", 15.0),
+            )
+            for idx, (cx, cy, cw, ch) in enumerate(cells):
+                crop = img[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
+                if crop.size == 0:
+                    crop = np.zeros((40, 40, 3), dtype=np.uint8)
+                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                qimg = QtGui.QImage(rgb.data, w, h, w * 3, QtGui.QImage.Format_RGB888)
+                pix  = QtGui.QPixmap.fromImage(qimg).scaled(
+                    80, 80, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                row_n, col_n = divmod(idx, 2)
+                lbl_name = QtWidgets.QLabel(f"R{row_n+1}C{col_n+1}")
+                lbl_name.setStyleSheet("font-size:9px;color:#E2FDFF")
+                lbl_name.setAlignment(QtCore.Qt.AlignCenter)
+                lbl_pix = QtWidgets.QLabel()
+                lbl_pix.setPixmap(pix)
+                lbl_pix.setAlignment(QtCore.Qt.AlignCenter)
+                grid.addWidget(lbl_name, row_n * 2,     col_n)
+                grid.addWidget(lbl_pix,  row_n * 2 + 1, col_n)
+            panels.addWidget(grp)
+        outer.addLayout(panels)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.button(QtWidgets.QDialogButtonBox.Ok).setText("Confirm")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        outer.addWidget(btns)
+
+        return dlg.exec_() == QtWidgets.QDialog.Accepted
+
     def _confirm_template(self):
         if self._pending_ic_a and self._pending_ic_b:
+            if not self._show_cell_preview(self._pending_ic_a, self._pending_ic_b):
+                return   # operator chose to redraw
             self._on_detect_confirmed(self._pending_ic_a, self._pending_ic_b)
             self._reset_template_draw()
 
@@ -3500,12 +3581,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         debug = self._cfg.get("DEBUG", True)
         _crop_path = "cropimg.jpg"
+        _wrote_crop = False
         try:
             img = self._camera.grab_first()
             _pw = self._cfg.get("IMAGE_W", 0) or img.shape[1]
             _ph = self._cfg.get("IMAGE_H", 0) or img.shape[0]
             resized = cv2.resize(img, (_pw, _ph), interpolation=cv2.INTER_AREA)
             cv2.imwrite(_crop_path, resized)
+            _wrote_crop = True
 
             resp = _req.post(
                 "http://webserv.thematrix.net/ROHMApi/api/OCR/ReadMark",
@@ -3560,11 +3643,6 @@ class MainWindow(QtWidgets.QMainWindow):
                           "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
             except Exception:
                 pass   # record failure never blocks the run
-            finally:
-                try:
-                    os.remove(_crop_path)
-                except OSError:
-                    pass
 
             return bool(is_pass) or debug
 
@@ -3581,6 +3659,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._lbl_ocr_status.setText(f"OCR API error — {exc}")
             self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
             return False
+
+        finally:
+            if _wrote_crop:
+                try:
+                    os.remove(_crop_path)
+                except OSError:
+                    pass
 
     def _pause_run(self):
         if self._worker:
@@ -3647,7 +3732,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         self._edit_op_number.setReadOnly(False)
         self._edit_ocr_expect.setReadOnly(False)
-        self._btn_action.setEnabled(self._ocr_fields_valid())
+        self._edit_op_number.clear()    # force re-entry each lot; prevent ID carry-over
+        self._edit_ocr_expect.clear()   # each lot's mark must be entered fresh
+        self._lbl_ocr_status.setText("Fill both fields to enable Start.")
+        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._btn_action.setEnabled(self._ocr_fields_valid())   # False — fields now empty
         self._lbl_lot_info.setText("—")
         self._update_badge(self._badge_a, None)
         self._update_badge(self._badge_b, None)

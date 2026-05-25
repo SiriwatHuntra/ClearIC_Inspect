@@ -1960,7 +1960,11 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_error("CAMERA_ERROR", str(e),
                                        (time.perf_counter() - t0) * 1000)
                 if cam_mode == "directory":
-                    self.sig_status.emit(f"Skipping unreadable image: {e}")
+                    _emsg = str(e)
+                    if "No files" in _emsg:
+                        self.sig_error.emit("No images in Input/ folder — add images and restart.")
+                        return
+                    self.sig_status.emit(f"Skipping unreadable image: {_emsg}")
                     continue
                 # Camera mode: attempt reconnect before giving up
                 reconnected = False
@@ -3115,7 +3119,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._camera = Camera(**self._camera_init_kwargs)
             self._camera.open()
         except CameraError as e:
-            self._show_error(f"Camera init failed: {e}")
+            self._show_error(str(e))
             if cfg.get("CAMERA") == "camera":
                 self._cam_retry_timer = QtCore.QTimer(self)
                 self._cam_retry_timer.setInterval(5000)
@@ -3819,10 +3823,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
 # ENTRY POINT
 def main():
+    app = QtWidgets.QApplication(sys.argv)
+
     try:
         cfg = ConfigLoader.load()
     except ConfigError as e:
-        print(f"[Config] {e}")
+        QtWidgets.QMessageBox.critical(
+            None, "Configuration Error",
+            f"Cannot start — Config.toml problem:\n\n{e}\n\n"
+            "Contact your system administrator.")
         sys.exit(1)
 
     os.makedirs(cfg.get("LOG_DIR", "logs"), exist_ok=True)
@@ -3834,7 +3843,6 @@ def main():
         os.makedirs(os.path.join(_dd, _ds, "NoText"), exist_ok=True)
         print(f"[Dataset] Collection ON → {_dd}/{_ds}/")
 
-    app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)
 
     pal = QtGui.QPalette()

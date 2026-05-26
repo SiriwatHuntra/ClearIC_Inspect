@@ -3530,7 +3530,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.Close)
             self._enter_standby()
             return
-        self._logger.log_ocr(self._ocr_operator, getattr(self, "_ocr_used_mark", self._ocr_expect_value))
+        self._logger.log_ocr(self._ocr_operator, self._ocr_used_mark)
         self._start_worker(inspector, gpio)
 
     def _on_preview_tick(self):
@@ -3587,6 +3587,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _ocr_api_call(self, lot: str, operator: str, expected_mark: str) -> bool:
         """POST to ReadMark API, compare result, POST CreateRecord. Returns True = proceed."""
+        self._ocr_used_mark = expected_mark   # always reset — never carry stale value from prior lot
         import base64   # stdlib, only used here
         try:
             import requests as _req
@@ -3616,7 +3617,16 @@ class MainWindow(QtWidgets.QMainWindow):
             is_pass = 0
             if resp.status_code == 200:
                 data = resp.json()
-                if not data:
+                if not isinstance(data, list):
+                    if debug:
+                        self._lbl_ocr_status.setText("[DEBUG] ReadMark: unexpected response format — skipped")
+                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                        is_pass = 1
+                    else:
+                        self._lbl_ocr_status.setText("ReadMark: unexpected server response format")
+                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                        return False
+                elif not data:
                     if debug:
                         self._lbl_ocr_status.setText("[DEBUG] ReadMark: lot not found — skipped")
                         self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
@@ -3626,21 +3636,64 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
                         return False
                 else:
-                    std_mark = data[0]["mark"]
-                    ocr_mark = data[0].get("ocr_mark")
-                    if ocr_mark is None:
-                        ocr_mark = expected_mark if debug else None
-                    if ocr_mark is None:
-                        self._lbl_ocr_status.setText(
-                            f"OCR: server returned no mark result — retry or check lot {lot}")
-                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
-                        return False
-                    self._ocr_used_mark = ocr_mark
-                    is_pass = 1 if std_mark == ocr_mark else 0
-                    color   = "#69FF69" if is_pass else "#FF6B6B"
-                    label   = "Mark OK" if is_pass else f"FAIL — DB: {std_mark} | OCR: {ocr_mark}"
-                    self._lbl_ocr_status.setText(label)
-                    self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
+                    std_mark = data[0].get("mark")
+                    if std_mark is None:
+                        if debug:
+                            self._lbl_ocr_status.setText("[DEBUG] ReadMark: 'mark' field missing — skipped")
+                            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                            is_pass = 1
+                        else:
+                            self._lbl_ocr_status.setText("ReadMark: server response missing 'mark' field")
+                            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                            return False
+                    else:
+                        ocr_mark = data[0].get("ocr_mark")
+                        if ocr_mark is None and not debug:
+                            # retry once before giving up
+                            try:
+                                resp2 = _req.post(
+                                    "http://webserv.thematrix.net/ROHMApi/api/OCR/ReadMark",
+                                    json={"username": operator, "lot_no": lot}, timeout=5)
+                                if resp2.status_code == 200:
+                                    data2 = resp2.json()
+                                    if isinstance(data2, list) and data2:
+                                        ocr_mark = data2[0].get("ocr_mark")
+                            except Exception:
+                                pass
+                        if ocr_mark is None:
+                            if debug:
+                                ocr_mark = expected_mark
+                            else:
+                                self._lbl_ocr_status.setText(
+                                    f"OCR: no mark result after retry — check lot {lot}")
+                                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                                return False
+                        self._ocr_used_mark = ocr_mark
+                        is_pass = 1 if std_mark == ocr_mark else 0
+                        color   = "#69FF69" if is_pass else "#FF6B6B"
+                        label   = "Mark OK" if is_pass else f"FAIL — DB: {std_mark} | OCR: {ocr_mark}"
+                        self._lbl_ocr_status.setText(label)
+                        self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
+            elif resp.status_code in (401, 403):
+                self._lbl_ocr_status.setText(
+                    f"ReadMark: authentication failed ({resp.status_code}) — check operator credentials")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                if not debug:
+                    return False
+                is_pass = 1
+            elif resp.status_code == 404:
+                self._lbl_ocr_status.setText("ReadMark: endpoint not found (404) — check server URL")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                if not debug:
+                    return False
+                is_pass = 1
+            elif resp.status_code >= 500:
+                self._lbl_ocr_status.setText(
+                    f"ReadMark: server error ({resp.status_code}) — try again later")
+                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                if not debug:
+                    return False
+                is_pass = 1
             elif debug:
                 self._lbl_ocr_status.setText("[DEBUG] ReadMark unavailable — skipped")
                 self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
@@ -3657,7 +3710,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 _req.post(
                     "http://webserv.thematrix.net/ROHMApi/api/OCR/CreateRecord",
                     json={"username": operator, "lot_no": lot,
-                          "mark": getattr(self, "_ocr_used_mark", expected_mark),
+                          "mark": self._ocr_used_mark,
                           "image": enc, "is_pass": is_pass,
                           "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
             except Exception:

@@ -2448,15 +2448,12 @@ class ImageBrowserPage(QtWidgets.QWidget):
         right_lay.addWidget(self._section_label("Filter"))
         self._grp_flt = QtWidgets.QButtonGroup(self)
         self._btn_flt_ng      = self._toggle_btn("FAIL",    checked=True)
-        self._btn_flt_g       = self._toggle_btn("PASS",    checked=False)
         self._btn_flt_suspect = self._toggle_btn("Suspect", checked=False)
         self._btn_flt_all     = self._toggle_btn("All",     checked=False)
         self._grp_flt.addButton(self._btn_flt_ng,      0)
-        self._grp_flt.addButton(self._btn_flt_g,       1)
-        self._grp_flt.addButton(self._btn_flt_suspect, 2)
-        self._grp_flt.addButton(self._btn_flt_all,     3)
+        self._grp_flt.addButton(self._btn_flt_suspect, 1)
+        self._grp_flt.addButton(self._btn_flt_all,     2)
         right_lay.addWidget(self._btn_flt_ng)
-        right_lay.addWidget(self._btn_flt_g)
         right_lay.addWidget(self._btn_flt_suspect)
         right_lay.addWidget(self._btn_flt_all)
         self._grp_flt.buttonClicked.connect(self._on_filter_toggle)
@@ -2475,18 +2472,18 @@ class ImageBrowserPage(QtWidgets.QWidget):
         kb_frame.setObjectName("setup_frame")
         kb_lay = QtWidgets.QVBoxLayout(kb_frame)
         kb_lay.setContentsMargins(8, 6, 8, 6)
-        kb_lay.setSpacing(4)
+        kb_lay.setSpacing(6)
         right_lay.addWidget(kb_frame)
 
         lbl_kb = QtWidgets.QLabel("Controls")
-        lbl_kb.setStyleSheet("font-size:11px;font-weight:bold;color:#E2FDFF")
+        lbl_kb.setStyleSheet("font-size:14px;font-weight:bold;color:#E2FDFF")
         kb_lay.addWidget(lbl_kb)
 
         _KBD_STYLE = (
-            "QLabel{font-size:10px;color:#E2FDFF;padding:1px 0px;}")
+            "QLabel{font-size:13px;color:#E2FDFF;padding:1px 0px;}")
         _KEY_STYLE = (
-            "QLabel{font-size:10px;font-weight:bold;color:#5465FF;"
-            "background:#FFFFFF;border-radius:3px;padding:1px 5px;}")
+            "QLabel{font-size:13px;font-weight:bold;color:#5465FF;"
+            "background:#FFFFFF;border-radius:3px;padding:2px 7px;}")
 
         for key_text, desc_text in [
             ("← →",       "Prev / Next"),
@@ -2714,7 +2711,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _on_filter_toggle(self, btn):
         flt_id = self._grp_flt.id(btn)
-        self._suffix_filter = {0: "FAIL", 1: "PASS", 2: "SUSPECT", 3: ""}[flt_id]
+        self._suffix_filter = {0: "FAIL", 1: "SUSPECT", 2: ""}[flt_id]
         self._apply_filter_and_build_grid()
 
 

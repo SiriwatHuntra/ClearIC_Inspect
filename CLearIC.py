@@ -1218,7 +1218,6 @@ class Inspector:
         self._data_split      = data_split
         self._ann_border_px   = ann_border_px
         self._ann_show_labels = ann_show_labels
-        self._clahe_cache: dict = {}   # (tile_w, tile_h) → cv2.CLAHE; reused across cycles
 
     def inspect(self, image_bgr: np.ndarray,
                 debug: bool = False) -> tuple:
@@ -1333,25 +1332,15 @@ class Inspector:
             col = idx %  2 + 1
             x1, y1 = max(0, cx),       max(0, cy)
             x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
-            crop    = image_bgr[y1:y2, x1:x2]
-            gray    = None
-            if crop.size > 0:
-                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-                _ch, _cw = gray.shape[:2]
-                _tiles = (max(1, _cw // 8), max(1, _ch // 8))
-                _clahe = self._clahe_cache.get(_tiles)
-                if _clahe is None:
-                    _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=_tiles)
-                    self._clahe_cache[_tiles] = _clahe
-                crop = cv2.cvtColor(_clahe.apply(gray), cv2.COLOR_GRAY2BGR)
-            cls_idx, conf = self._detector.classify_crop(crop)
+            crop = image_bgr[y1:y2, x1:x2]
+            cls_idx, conf = self._detector.classify_crop(crop) if crop.size > 0 else (0, 0.0)
             present   = (cls_idx == 1)   # 1 = Text (mark present)
             text_conf = conf if cls_idx == 1 else (1.0 - conf)  # Text-class probability
             hits_flags.append(present)
             text_confs.append(text_conf)
             if debug:
                 lbl = "Text" if present else "NoText"
-                std_str = f"{gray.std():.1f}" if gray is not None else "n/a"
+                std_str = f"{crop.std():.1f}" if crop.size > 0 else "n/a"
                 print(f"[Cell R{row}C{col}] "
                       f"{'PRESENT' if present else 'ABSENT '} "
                       f"cls={lbl} conf={conf:.3f} text_conf={text_conf:.3f}  "

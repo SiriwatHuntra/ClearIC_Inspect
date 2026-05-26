@@ -98,7 +98,7 @@ Low match score from TemplateMatcher: prints a warning but uses the best-match p
 Converts one IC rect into 6 ROI cells (3 rows × 2 cols). Steps: shrink (centred) → apply top/bot margins → slice 3×2 grid with col gap → expand each cell. Row-major order R1C1→R3C2.
 
 ### `Inspector._check_ic(image_bgr, cells, annotated, debug) → (missing, hits_flags, text_confs)`
-Crop → CLAHE (`_CLAHE` module-level object) → `Detector.classify_crop()`. Draws borders + labels onto `annotated` in place. Returns `missing`: `[[row,col],…]` for NoText cells; `text_confs`: per-cell Text-class probability (6 floats).
+Crop each raw cell from `image_bgr` → `Detector.classify_crop()`. Draws borders + labels onto `annotated` in place. Returns `missing`: `[[row,col],…]` for NoText cells; `text_confs`: per-cell Text-class probability (6 floats).
 
 ### `Inspector.inspect(image_bgr, debug) → (pass_a, pass_b, missing_a, missing_b, annotated_bgr)`
 Locate via TemplateMatcher (or fixed coords) → cells → `_check_ic` × 2. `annotated_bgr` IS `image_bgr` (in-place, no copy). Raises `MarkMissingError` on missing cells.
@@ -213,4 +213,4 @@ Installed from `JuliusBrussee/caveman` via the Claude Code skills system:
 
 Train with `Test/trainModel.py` (Ultralytics YOLO-cls). Export to OpenVINO with `Test/Converter.py`, then update `MODEL_PATH` in `Config.json`.
 
-Classifier output: `[1, 2]` — index 0 = NoText (absent), index 1 = Text (present). CLAHE is applied to each crop before inference. `TEXT_MIN_CONF` gates the Text class asymmetrically (below threshold → NoText, regardless of raw NoText probability).
+Classifier output: `[1, 2]` — index 0 = NoText (absent), index 1 = Text (present). Training images are manually cropped raw images — no preprocessing. At inference, raw cell crops are fed directly to the model (no CLAHE). `TEXT_MIN_CONF` gates the Text class asymmetrically (below threshold → NoText, regardless of raw NoText probability).

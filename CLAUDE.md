@@ -25,35 +25,82 @@ Requires a display (physical screen or `DISPLAY`). PyQt5 is system-package only 
 
 All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoader` merges it against `DEFAULT_CONFIG` on startup.
 
+**Note:** `USE_CAMERA` is the Config.toml key. `ConfigLoader` converts it internally to `CAMERA = "camera"/"directory"` at load time — do not set `CAMERA` directly in Config.toml.
+
+### Camera & capture
+
 | Key | Default | Effect |
 |---|---|---|
-| `CAMERA` | `"directory"` | `"camera"` = live Basler · `"directory"` = load from `Input/` |
-| `CONF_THR` | `0.5` | Classifier confidence threshold |
-| `TEXT_MIN_CONF` | `0.80` | Minimum Text-class probability to call a cell PASS |
-| `BLANK_CELL_STD_THR` | `0.0` | Pixel-std below this → force NoText (0 = disabled) |
+| `USE_CAMERA` | `false` | `true` = live Basler camera · `false` = load from `Input/` |
 | `CAMERA_SERIAL` | `""` | Basler serial filter (`""` = first found) |
 | `EXPOSURE_US` | `8000` | Camera exposure µs |
-| `DEBUG` | `True` | Verbose console logs + annotated image saved every cycle |
-| `IO` | `False` | `True` = drive GPIO; `False` = mock (log only) |
-| `MODE` | `"DEBUG"` | Written into log records |
-| `COLLECT_DATASET` | `False` | Save cell crops to `Dataset/` for retraining |
+| `IMAGE_W` | `0` | Camera resolution override width (0 = camera native) |
+| `IMAGE_H` | `0` | Camera resolution override height (0 = camera native) |
+| `CAMERA_FPS` | `10` | Camera FPS limit (0 = camera default) |
+| `CAMERA_WARMUP_FRAMES` | `5` | Frames to grab and discard on camera open |
+| `CAMERA_RETRY_DELAY` | `0.2` | Seconds between grab retries on fail |
+| `CAMERA_RETRIES` | `2` | Number of grab retries before raising CameraError |
+| `RECONNECT_ATTEMPTS` | `3` | Camera reconnect attempts on disconnect |
+| `RECONNECT_DELAY_S` | `5.0` | Seconds between reconnect attempts |
+| `TRIGGER_SETTLE_MS` | `50` | Delay (ms) between START signal received and grab |
+
+### Classifier & inspection
+
+| Key | Default | Effect |
+|---|---|---|
 | `MODEL_PATH` | `"Text_cls-2/best_openvino_model/best.xml"` | OpenVINO classifier |
-| `RETRY_DELAY_MS` | `250` | Delay before retry grab on first-attempt fail |
+| `CONF_THR` | `0.5` | Classifier confidence threshold (legacy, superseded by TEXT_MIN_CONF) |
+| `TEXT_MIN_CONF` | `0.80` | Minimum Text-class probability to call a cell PASS |
+| `TEXT_NG_THRESHOLD` | `2` | Missing-cell count at or above this → NG (below → suspect-pass `_GS`) |
+| `BLANK_CELL_STD_THR` | `0.0` | Pixel-std below this → force NoText without running model (0 = disabled) |
+| `CLS_N_PASSES` | `1` | Inference passes per cell (averaged); deterministic model — 1 is sufficient |
+| `CLS_UNCERTAIN_THR` | `0.50` | Log a warning when text_prob is in this uncertain zone (debug only) |
+| `WARMUP_FRAMES` | `5` | Classifier warmup passes on startup |
+| `RETRY_DELAY_MS` | `250` | Delay (ms) before retry grab on MarkMissingError |
+
+### Grid geometry
+
+| Key | Default | Effect |
+|---|---|---|
 | `CELL_SHRINK` | `0.95` | Shrink IC rect before slicing (centred) |
 | `CELL_EXPAND` | `1.2` | Per-cell expansion after slicing (centred overlap) |
 | `COL_GAP_PCT` | `40.0` | Gap between L and R column, % of IC width |
 | `GRID_MARGIN_TOP` | `0.0` | Top dead-band before row 1, % of IC height |
 | `GRID_MARGIN_BOT` | `15.0` | Bottom dead-band after row 3, % of IC height |
+
+### I/O & GPIO
+
+| Key | Default | Effect |
+|---|---|---|
+| `IO` | `false` | `true` = drive real BCM GPIO; `false` = mock/log only |
+| `SKIP_DONE_WAIT` | `false` | Skip DONE_PIN handshake at end of cycle (IFLV machines) |
+| `MOCK_START_DELAY_MS` | `200` | Mock START pulse delay when `IO=false` |
+| `MOCK_DONE_DELAY_MS` | `100` | Mock DONE pulse delay when `IO=false` |
+| `CELLCON_PORT` | `"/dev/ttyUSB0"` | Serial port for Cell-con lot tracker |
+
+GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23), `GPIO_LOT_END_PIN` (18), `GPIO_FAIL_A_PIN` (24), `GPIO_FAIL_B_PIN` (25).
+
+### Output & logging
+
+| Key | Default | Effect |
+|---|---|---|
 | `OUT_DIR` | `"Output/"` | Root output directory |
-| `DIR_INPUT` | `"Input/"` | Source images for `CAMERA="directory"` |
+| `DIR_INPUT` | `"Input/"` | Source images for `USE_CAMERA=false` |
 | `LOG_DIR` | `"logs"` | Log file directory |
 | `LOG_RETENTION` | `365` | Max log files kept per pattern |
 | `ANN_BORDER_PX` | `1` | Cell annotation border thickness |
-| `ANN_SHOW_LABELS` | `True` | Show R1C1 labels on cell overlays |
-| `WARMUP_FRAMES` | `5` | Classifier warmup frames on startup |
-| `SKIP_DONE_WAIT` | `False` | Skip DONE_PIN handshake at end of cycle (IFLV machines with no DONE signal) |
+| `ANN_SHOW_LABELS` | `true` | Show R1C1 labels on cell overlays |
+| `COLLECT_DATASET` | `false` | Save cell crops to `Dataset/` for retraining |
+| `DATA_DIR` | `"Dataset"` | Root directory for collected crops |
+| `DATA_SPLIT` | `"train"` | Subfolder under DATA_DIR (`train` or `val`) |
+| `DISK_WARN_MB` | `200` | Warn in UI when free disk space drops below this |
 
-GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23), `GPIO_LOT_END_PIN` (18), `GPIO_FAIL_A_PIN` (24), `GPIO_FAIL_B_PIN` (25).
+### Other
+
+| Key | Default | Effect |
+|---|---|---|
+| `DEBUG` | `true` | Verbose console logs + annotated image saved every cycle |
+| `MODE` | `"DEBUG"` | String written into log records |
 
 **IFLV machine pin mapping** (BOARD→BCM from IFLRMIV101.py):
 `GPIO_START_PIN=2`, `GPIO_BUSY_PIN=3`, `GPIO_FAIL_A_PIN=4`, `GPIO_FAIL_B_PIN=4`, `GPIO_LOT_END_PIN=27`, `SKIP_DONE_WAIT=true`.
@@ -72,7 +119,7 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23)
 ## Inspection Flow
 
 ```
-LotStartDialog → operator enters lot number
+LotStartDialog → operator enters lot number (or fetched from CellCon via serial)
   → RunWorker starts
   → Camera.grab()                            → image_bgr (ndarray)
   → save raw to Output/YYYYMMDD/lot/RealImg/ (tmp name, before result known)
@@ -81,8 +128,13 @@ LotStartDialog → operator enters lot number
   → rt_b = rt_a offset by (ic_b_dx, ic_b_dy) from template
   → Inspector._check_ic(image_bgr, cells)    → (missing[], hits[], confs[])  ×2
   → on MarkMissingError: one retry grab with confidence-weighted resolution
-  → rename raw to {img_id}_G.jpg or _NG.jpg
-  → save annotated to Output/YYYYMMDD/lot/Image/{img_id}_G|NG.jpg
+  → classify result by n_missing (total missing cells across both ICs):
+      n_missing == 0                      → _G   (PASS, not saved by default)
+      0 < n_missing < TEXT_NG_THRESHOLD   → _GS  (suspect PASS — saved)
+      n_missing >= TEXT_NG_THRESHOLD      → _NGS (suspect NG — saved)
+      n_missing >= total cells (12)       → _NG  (full NG — saved)
+  → rename raw to {img_id}_{suffix}.jpg
+  → save annotated to Output/YYYYMMDD/lot/Image/ (all non-_G results)
   → GPIO: set BUSY_PIN=False, FAIL_A_PIN, FAIL_B_PIN
   → wait DONE_PIN (camera mode, SKIP_DONE_WAIT=false) → clear outputs → STANDBY
   → OR: SKIP_DONE_WAIT=true → FAIL pins stay set, loop to next START → clear_fail_outputs at START
@@ -157,12 +209,13 @@ Events: `SESSION_START`, `SESSION_END`, `PASS`, `FAIL`, `ERROR`, `PAUSE`, `RESUM
 |---|---|
 | `MainWindow` | Two-tab window: Inspection + Image Browser |
 | `ImageView` | Zoomable image widget; rubber-band draw mode for setup |
-| `LotStartDialog` | Pre-run dialog for lot number; API hook `get_lot_number_from_api()` |
+| `LotStartDialog` | Pre-run dialog for lot number; uses CellCon or `get_lot_number_from_api()` hook |
 | `FailDialog` | Modal FAIL popup (currently unused in RunWorker — no longer auto-shown) |
-| `ImageBrowserPage` | Browse `Output/` by date/lot; thumbnail grid with RealImg/Image toggle and _G/_NG filter |
-| `ImageCard` | Single thumbnail card (color-coded by _G / _NG suffix) |
+| `ImageBrowserPage` | Browse `Output/` by date/lot; thumbnail grid with RealImg/Image toggle; NG-only filter |
+| `ImageCard` | Single thumbnail card (color-coded by suffix: _G / _GS / _NGS / _NG) |
 | `ThumbnailWorker` | Background QThread that loads thumbnails one-by-one |
 | `FolderScanWorker` | Background QThread that scans the Output/ directory tree |
+| `CellCon` | Serial interface to Cell-con lot tracker (`LA\r\n` → `LS,<lot>`) on `CELLCON_PORT` |
 
 ---
 
@@ -171,7 +224,7 @@ Events: `SESSION_START`, `SESSION_END`, `PASS`, `FAIL`, `ERROR`, `PAUSE`, `RESUM
 ```
 ClearIC_Inspect/
 ├── CLearIC.py
-├── Config.json
+├── Config.toml
 ├── Text_cls-2/best_openvino_model/   # ACTIVE cell classifier (best.xml + best.bin)
 ├── IC_Search_openvino_model/         # unused — kept for reference
 ├── templates/
@@ -179,17 +232,19 @@ ClearIC_Inspect/
 │   ├── tmpl_full.npy                 # pin-area patch for TemplateMatcher
 │   └── template_preview.png          # annotated preview saved on confirm
 ├── Output/YYYYMMDD/lot_number/
-│   ├── RealImg/{img_id}_G|NG.jpg     # raw captures
-│   └── Image/{img_id}_G|NG.jpg      # annotated captures
+│   ├── RealImg/{img_id}_{suffix}.jpg # raw captures
+│   └── Image/{img_id}_{suffix}.jpg  # annotated captures (non-_G only)
 ├── logs/
 │   ├── op_YYYYMMDD.csv               # daily operation log
 │   └── result_{lot}_{ts}.csv         # per-lot result log
-├── Input/                            # source images for CAMERA="directory"
-├── Dataset/                          # cell crops (COLLECT_DATASET=True)
+├── Input/                            # source images for USE_CAMERA=false
+├── Dataset/                          # cell crops (COLLECT_DATASET=true)
 └── Test/                             # trainModel.py, Converter.py, ImagePlayGround.py
 ```
 
-`IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN` (thread-safe counter). Output filenames: `{IMAGE_ID}_G.jpg` (pass) or `{IMAGE_ID}_NG.jpg` (fail).
+`IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN` (thread-safe counter).
+
+Output suffixes: `_G` (clean pass), `_GS` (suspect pass), `_NGS` (suspect NG), `_NG` (full NG). Threshold between `_GS` and `_NGS` is `TEXT_NG_THRESHOLD`. Clean-pass `_G` images are not saved by default.
 
 ---
 

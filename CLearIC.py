@@ -2857,9 +2857,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_confirm_tmpl = QtWidgets.QPushButton("Confirm")
         self._btn_confirm_tmpl.clicked.connect(self._confirm_template)
         self._btn_confirm_tmpl.setEnabled(False)
-        self._btn_confirm_tmpl.setStyleSheet(
-            "background:#FFFFFF;color:#5465FF;border-radius:6px;"
-            "padding:6px 14px;font-weight:bold;")
         setup_lay.addWidget(self._btn_confirm_tmpl)
 
         self._view.rect_drawn.connect(self._on_rb_rect_drawn)
@@ -3229,13 +3226,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_new_tmpl_click(self):
         if self._setup_state == 'idle':
-            if os.path.exists(_TEMPLATE_FILE):
-                reply = QtWidgets.QMessageBox.question(
-                    self, "Replace Template",
-                    "A template is already saved.\nReplace it with a new one?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-                if reply != QtWidgets.QMessageBox.Yes:
-                    return
             self._start_draw_a()
         else:
             self._reset_template_draw()
@@ -3356,6 +3346,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.button(QtWidgets.QDialogButtonBox.Ok).setText("Confirm")
+        btns.button(QtWidgets.QDialogButtonBox.Cancel).setText("Re-draw")
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         outer.addWidget(btns)
@@ -3365,7 +3356,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _confirm_template(self):
         if self._pending_ic_a and self._pending_ic_b:
             if not self._show_cell_preview(self._pending_ic_a, self._pending_ic_b):
-                return   # operator chose to redraw
+                self._start_draw_a()   # cancel → back to drawing
+                return
             self._on_detect_confirmed(self._pending_ic_a, self._pending_ic_b)
             self._reset_template_draw()
 

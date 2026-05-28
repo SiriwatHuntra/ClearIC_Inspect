@@ -45,6 +45,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 # CONFIG LOADER
 class ConfigLoader:
     CONFIG_FILE = "Config.toml"
+    #This defualt config is used as a template for the Config.toml file and as fallback for missing keys. It is not used directly in the code, but serves as a reference for the expected configuration parameters and their default values.
     DEFAULT_CONFIG = {
         "USE_CAMERA":           False,
         "CONF_THR":             0.5,

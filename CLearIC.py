@@ -68,14 +68,10 @@ class ConfigLoader:
         "RECONNECT_DELAY_S":    5.0,
         "RETRY_DELAY_MS":       250,
         "DISK_WARN_MB":         200,
-        "GPIO_START_PIN":       17,
-        "GPIO_DONE_PIN":        27,
-        "GPIO_BUSY_PIN":        23,
-        "GPIO_LOT_END_PIN":     18,
-        "GPIO_FAIL_A_PIN":      24,
-        "GPIO_FAIL_B_PIN":      25,
-        "MOCK_START_DELAY_MS":  200,
-        "MOCK_DONE_DELAY_MS":   100,
+        "GPIO_START_PIN":        17,
+        "GPIO_BUSY_PIN":         23,
+        "GPIO_END_PIN":          18,
+        "GPIO_INSPEC_STAGE_PIN": 24,
         "TRIGGER_SETTLE_MS":    50,
         "CELL_SHRINK":          0.95,
         "CELL_EXPAND":          1.2,
@@ -89,7 +85,6 @@ class ConfigLoader:
         "ANN_BORDER_PX":        1,
         "ANN_SHOW_LABELS":      True,
         "WARMUP_FRAMES":        5,
-        "SKIP_DONE_WAIT":       False,
         "CELLCON_PORT":         "/dev/ttyUSB0",
         "IMAGE_W":              0,
         "IMAGE_H":              0,
@@ -130,8 +125,8 @@ class ConfigLoader:
             raise ConfigError("LOG_RETENTION must be a positive integer")
         if not isinstance(cfg["TRIGGER_SETTLE_MS"], (int, float)) or cfg["TRIGGER_SETTLE_MS"] < 0:
             raise ConfigError("TRIGGER_SETTLE_MS must be a non-negative number")
-        for pin_key in ("GPIO_START_PIN", "GPIO_DONE_PIN", "GPIO_BUSY_PIN",
-                        "GPIO_LOT_END_PIN", "GPIO_FAIL_A_PIN", "GPIO_FAIL_B_PIN"):
+        for pin_key in ("GPIO_START_PIN", "GPIO_BUSY_PIN",
+                        "GPIO_END_PIN", "GPIO_INSPEC_STAGE_PIN"):
             if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
                 raise ConfigError(f"{pin_key} must be a BCM pin number (1–27)")
         return cfg
@@ -168,8 +163,7 @@ class ConfigLoader:
 
 # STAGE & ERROR FLAGS
 class Stage(Enum):
-    STANDBY  = "STANDBY"
-    BUSY     = "BUSY"
+    BUSY     = True       # bool — True when BUSY_PIN is HIGH
     ERROR    = "ERROR"
     SHUTDOWN = "SHUTDOWN"
 
@@ -510,31 +504,36 @@ class CellCon:
 # RASPBERRY IO
 class RaspberryIO:
     """
-    BCM-mode GPIO handler with serial lighting controller.
+    BCM-mode GPIO handler.
     Falls back to mock logging when IO=False or RPi.GPIO unavailable.
-    Serial port (/dev/ttyUSB0) is opened only when io_enabled=True.
+
+    Pins
+    ----
+    START_PIN (IN, active HIGH 10 ms pulse) — machine signals ready for one shot
+    BUSY_PIN  (OUT, HIGH during full inspection + retry)
+    END_PIN   (OUT, normally HIGH; pulses LOW 40 ms after inspection done)
+    INSPEC_STAGE (OUT, normally HIGH; LOW = both ICs pass, HIGH = any fail)
+
+    Mock trigger
+    ------------
+    In mock mode wait_for_start() blocks until trigger() is called from the UI.
     """
 
     def __init__(self, io_enabled: bool = True,
-                 start_pin: int = 17, done_pin: int = 27,
-                 busy_pin: int = 23, lot_end_pin: int = 18,
-                 fail_a_pin: int = 24, fail_b_pin: int = 25,
-                 mock_start_delay_ms: int = 200, mock_done_delay_ms: int = 100):
-        self._enabled             = io_enabled
-        self._gpio_ok             = False
-        self._GPIO                = None
-        self._ser                 = None
-        self._start_pin           = start_pin
-        self._done_pin            = done_pin
-        self._busy_pin            = busy_pin
-        self._lot_end_pin         = lot_end_pin
-        self._fail_a_pin          = fail_a_pin
-        self._fail_b_pin          = fail_b_pin
-        self._mock_start_delay_ms = mock_start_delay_ms
-        self._mock_done_delay_ms  = mock_done_delay_ms
+                 start_pin: int = 17, busy_pin: int = 23,
+                 end_pin: int = 18, inspec_stage_pin: int = 24):
+        self._enabled          = io_enabled
+        self._gpio_ok          = False
+        self._GPIO             = None
+        self._ser              = None
+        self._start_pin        = start_pin
+        self._busy_pin         = busy_pin
+        self._end_pin          = end_pin
+        self._inspec_stage_pin = inspec_stage_pin
+        self._mock_trigger     = threading.Event()
 
         if not io_enabled:
-            print("[IO] IO=False — mock mode.")
+            print("[IO] IO=False — mock mode (manual trigger).")
             return
 
         try:
@@ -542,12 +541,10 @@ class RaspberryIO:
             self._GPIO = GPIO
             GPIO.setwarnings(False)
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self._start_pin,   GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
-            GPIO.setup(self._done_pin,    GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
-            GPIO.setup(self._lot_end_pin, GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # active LOW
-            GPIO.setup(self._busy_pin,    GPIO.OUT, initial=GPIO.LOW)           # idle = LOW
-            GPIO.setup(self._fail_a_pin,  GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(self._fail_b_pin,  GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._start_pin,        GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)  # active HIGH
+            GPIO.setup(self._busy_pin,         GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(self._end_pin,          GPIO.OUT, initial=GPIO.HIGH)            # idle HIGH
+            GPIO.setup(self._inspec_stage_pin, GPIO.OUT, initial=GPIO.HIGH)            # idle HIGH
             self._gpio_ok = True
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
@@ -569,91 +566,63 @@ class RaspberryIO:
         if self._gpio_ok:
             self._GPIO.output(pin, self._GPIO.HIGH if high else self._GPIO.LOW)
         else:
-            state = "HIGH" if high else "LOW"
-            print(f"[IO MOCK] {pin_name or pin} → {state}")
+            print(f"[IO MOCK] {pin_name or pin} → {'HIGH' if high else 'LOW'}")
 
-    def set_fail_a(self, v: bool):
-        self._out(self._fail_a_pin, v, "FAIL_A_PIN")
-
-    def set_fail_b(self, v: bool):
-        self._out(self._fail_b_pin, v, "FAIL_B_PIN")
+    # ── outputs ────────────────────────────────────────────────────────────────
 
     def set_busy(self, v: bool):
         self._out(self._busy_pin, v, "BUSY_PIN")
 
-    def is_lot_end_signaled(self) -> bool:
-        """Non-blocking: True if LOT_END_PIN is currently LOW. Always False in mock mode."""
-        if not self._gpio_ok:
-            return False
-        return self._GPIO.input(self._lot_end_pin) == self._GPIO.LOW
+    def set_inspec_stage(self, high: bool):
+        """HIGH = NG / idle; LOW = both ICs pass."""
+        self._out(self._inspec_stage_pin, high, "INSPEC_STAGE")
+
+    def pulse_end_pin(self):
+        """Pulse END_PIN LOW for 40 ms. Blocking — call from worker thread only."""
+        self._out(self._end_pin, False, "END_PIN")
+        time.sleep(0.040)
+        self._out(self._end_pin, True, "END_PIN")
 
     def clear_outputs(self):
-        self._out(self._busy_pin,   False, "BUSY_PIN")
-        self._out(self._fail_a_pin, False, "FAIL_A_PIN")
-        self._out(self._fail_b_pin, False, "FAIL_B_PIN")
+        """Restore all outputs to idle state."""
+        self._out(self._busy_pin,         False, "BUSY_PIN")          # LOW
+        self._out(self._inspec_stage_pin, True,  "INSPEC_STAGE")      # HIGH (idle)
+        self._out(self._end_pin,          True,  "END_PIN")            # HIGH (idle)
 
-    def clear_fail_outputs(self):
-        """Clear only fail pins — BUSY unchanged. Used by SKIP_DONE_WAIT machines."""
-        self._out(self._fail_a_pin, False, "FAIL_A_PIN")
-        self._out(self._fail_b_pin, False, "FAIL_B_PIN")
+    # ── inputs / blocking waits ─────────────────────────────────────────────────
+
+    def trigger(self):
+        """Inject a mock START pulse (mock mode only). Called from UI thread."""
+        if not self._gpio_ok:
+            self._mock_trigger.set()
 
     def wait_for_start(self, stop_flag_fn) -> bool:
-        """Block until START_PIN goes LOW (active LOW) or stop_flag_fn() returns True."""
+        """Block until START_PIN goes HIGH (active HIGH) or stop_flag_fn() returns True.
+        In mock mode, blocks until trigger() is called from the UI."""
         if not self._gpio_ok:
-            deadline = time.monotonic() + self._mock_start_delay_ms / 1000
-            while time.monotonic() < deadline:
-                if stop_flag_fn():
-                    return False
-                time.sleep(0.02)
-            if stop_flag_fn():
-                return False
-            print("[IO MOCK] START_PIN pulse")
-            return True
-        GPIO = self._GPIO
-        while not stop_flag_fn():
-            if GPIO.input(self._start_pin) == GPIO.LOW:
-                time.sleep(0.05)                        # 50ms debounce
-                if GPIO.input(self._start_pin) == GPIO.LOW:
+            while not stop_flag_fn():
+                if self._mock_trigger.wait(timeout=0.02):
+                    self._mock_trigger.clear()
+                    print("[IO MOCK] START_PIN HIGH pulse (manual trigger)")
                     return True
-            time.sleep(0.005)
-        return False
-
-    def wait_for_done(self, stop_flag_fn) -> bool:
-        """Block until DONE_PIN goes LOW (active LOW) or stop_flag_fn() returns True."""
-        if not self._gpio_ok:
-            deadline = time.monotonic() + self._mock_done_delay_ms / 1000
-            while time.monotonic() < deadline:
-                if stop_flag_fn():
-                    return False
-                time.sleep(0.02)
-            if stop_flag_fn():
-                return False
-            print("[IO MOCK] DONE_PIN pulse")
-            return True
-        GPIO = self._GPIO
-        while not stop_flag_fn():
-            if GPIO.input(self._done_pin) == GPIO.LOW:
-                time.sleep(0.05)                        # 50ms debounce
-                if GPIO.input(self._done_pin) == GPIO.LOW:
-                    return True
-            time.sleep(0.005)
-        return False
-
-    def is_done_signaled(self) -> bool:
-        """Non-blocking: True if DONE_PIN is currently LOW (active LOW). Always False in mock mode."""
-        if not self._gpio_ok:
             return False
-        return self._GPIO.input(self._done_pin) == self._GPIO.LOW
+        GPIO = self._GPIO
+        while not stop_flag_fn():
+            if GPIO.input(self._start_pin) == GPIO.HIGH:
+                return True
+            time.sleep(0.005)
+        return False
 
     def drain_start_pin(self, timeout_ms: int = 500):
-        """Wait until START_PIN returns HIGH (idle) to discard stale LOW after resume."""
+        """Discard a stale START_PIN HIGH after resume (wait until idle LOW)."""
         if not self._gpio_ok:
-            print("[IO MOCK] drain_start_pin")
+            self._mock_trigger.clear()
+            print("[IO MOCK] drain_start_pin (mock trigger cleared)")
             return
         GPIO = self._GPIO
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
-            if GPIO.input(self._start_pin) == GPIO.HIGH:
+            if GPIO.input(self._start_pin) == GPIO.LOW:
                 return
             time.sleep(0.01)
 
@@ -1849,6 +1818,10 @@ class RunWorker(QtCore.QThread):
         self._drain_needed.set()   # BUSY guard: drain stale START_PIN after resume
         self._running.set()
 
+    def trigger(self):
+        """Inject one mock START pulse (IO=False only). Called from UI thread."""
+        self._gpio.trigger()
+
     def _handle_lot_end(self):
         """Auto-advance lot on GPIO LOT_END signal and emit new lot number."""
         _reset_image_counter()
@@ -1878,40 +1851,22 @@ class RunWorker(QtCore.QThread):
 
             # Wait for next cycle trigger
             if cam_mode == "camera":
-                # Check lot-end pin before waiting for start
-                if self._gpio.is_lot_end_signaled():
-                    time.sleep(0.05)
-                    if self._gpio.is_lot_end_signaled():
-                        self.sig_status.emit("Lot end — saving NG images…")
-                        self._handle_lot_end()
-
-                # Production: wait for GPIO START_PIN active LOW
                 self.sig_status.emit("Waiting for START signal…")
                 if not self._gpio.wait_for_start(lambda: self._stop):
                     break
                 if self._stop:
                     break
 
-                # Tray settled — clear previous result, assert BUSY before grab
-                if self._cfg.get("SKIP_DONE_WAIT", False):
-                    self._gpio.clear_fail_outputs()
                 self._gpio.set_busy(True)
 
                 settle_ms = self._cfg.get("TRIGGER_SETTLE_MS", 0)
                 if settle_ms > 0:
                     time.sleep(settle_ms / 1000.0)
             else:
-                # Auto directory: brief yield, then check DONE_PIN / Stop
+                # Auto directory: brief yield then check stop
                 time.sleep(0.05)
                 if self._stop:
                     break
-                if self._gpio.is_done_signaled():
-                    self._camera.reset()
-                    _reset_image_counter()
-                    new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    self._lot_number = new_lot
-                    self.sig_session_reset.emit(new_lot)
-                    continue
 
             # Capture guard
             if self._stop:
@@ -2070,8 +2025,6 @@ class RunWorker(QtCore.QThread):
                 self.sig_result.emit(True, True, is_suspect)
                 self._logger.log_inspection(
                     img_id, "PASS", [], "PASS", [], cycle_ms, is_retry, is_suspect)
-                self._gpio.set_fail_a(False)
-                self._gpio.set_fail_b(False)
             else:
                 err = MarkMissingError(miss_a, miss_b, ann)
                 self.sig_fail.emit(err, ann_path, img_id, is_suspect)
@@ -2080,10 +2033,15 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if miss_a else "PASS", miss_a,
                     "FAIL" if miss_b else "PASS", miss_b,
                     cycle_ms, is_retry, is_suspect)
-                self._gpio.set_fail_a(bool(miss_a))
-                self._gpio.set_fail_b(bool(miss_b))
 
             self._gpio.set_busy(False)
+
+            if cam_mode == "camera":
+                is_overall_pass = not (miss_a or miss_b)
+                self._gpio.set_inspec_stage(not is_overall_pass)  # LOW=pass, HIGH=NG
+                time.sleep(0.010)
+                self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
+                self._gpio.set_inspec_stage(True)                 # restore idle HIGH
 
             try:
                 del img_bgr
@@ -2094,25 +2052,11 @@ class RunWorker(QtCore.QThread):
             if _cycle % 100 == 0:
                 gc.collect()
 
-            # End-of-cycle handshake
-            if cam_mode == "camera":
-                if self._cfg.get("SKIP_DONE_WAIT", False):
-                    pass  # FAIL pins stay set; PLC reads after BUSY LOW; cleared at next START
-                else:
-                    # Production: hold outputs until machine signals DONE
-                    self.sig_status.emit("Holding — waiting for DONE signal…")
-                    self._gpio.wait_for_done(lambda: self._stop)
-                    self._gpio.clear_outputs()
-            else:
+            # End-of-cycle: directory mode batch check
+            if cam_mode != "camera":
                 if not self._camera.has_more():
                     self._camera.reset()
                     break                           # directory done → standby
-                if self._gpio.is_done_signaled():
-                    self._camera.reset()
-                    _reset_image_counter()
-                    new_lot = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    self._lot_number = new_lot
-                    self.sig_session_reset.emit(new_lot)   # IO signal → new batch
 
             # Pause checkpoint
             # Sits after DONE handshake + clear_outputs so the machine
@@ -3059,13 +3003,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpio = RaspberryIO(
                 io_enabled=cfg.get("IO", False),
                 start_pin=cfg.get("GPIO_START_PIN", 17),
-                done_pin=cfg.get("GPIO_DONE_PIN", 27),
                 busy_pin=cfg.get("GPIO_BUSY_PIN", 23),
-                lot_end_pin=cfg.get("GPIO_LOT_END_PIN", 18),
-                fail_a_pin=cfg.get("GPIO_FAIL_A_PIN", 24),
-                fail_b_pin=cfg.get("GPIO_FAIL_B_PIN", 25),
-                mock_start_delay_ms=cfg.get("MOCK_START_DELAY_MS", 200),
-                mock_done_delay_ms=cfg.get("MOCK_DONE_DELAY_MS", 100),
+                end_pin=cfg.get("GPIO_END_PIN", 18),
+                inspec_stage_pin=cfg.get("GPIO_INSPEC_STAGE_PIN", 24),
             )
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
@@ -3399,12 +3339,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rebuild_inspector()
 
 
+    def _is_mock_trigger_mode(self) -> bool:
+        """True when IO=False + camera mode: button acts as manual START trigger."""
+        return (not self._cfg.get("IO", False)
+                and self._cfg.get("CAMERA", "directory") == "camera")
+
     # Run / Pause / Stop
     def _on_action_click(self):
         if self._run_state == "standby":
             self._start_run()
         elif self._run_state == "running":
-            self._pause_run()
+            if self._is_mock_trigger_mode():
+                self._worker.trigger()   # inject one mock START pulse
+            else:
+                self._pause_run()
         elif self._run_state == "paused":
             self._resume_run()
 
@@ -3518,7 +3466,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker_last_tick = time.monotonic()
 
         self._run_state = "running"
-        self._btn_action.setText("Pause")
+        self._btn_action.setText("Trigger" if self._is_mock_trigger_mode() else "Pause")
         self._btn_action.setEnabled(True)
         self._btn_stop.setEnabled(True)
 

@@ -72,13 +72,10 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 
 | Key | Default | Effect |
 |---|---|---|
-| `IO` | `false` | `true` = drive real BCM GPIO; `false` = mock/log only |
-| `SKIP_DONE_WAIT` | `false` | Skip DONE_PIN handshake at end of cycle (IFLV machines) |
-| `MOCK_START_DELAY_MS` | `200` | Mock START pulse delay when `IO=false` |
-| `MOCK_DONE_DELAY_MS` | `100` | Mock DONE pulse delay when `IO=false` |
+| `IO` | `false` | `true` = drive real BCM GPIO; `false` = mock/log only (manual trigger per shot) |
 | `CELLCON_PORT` | `"/dev/ttyUSB0"` | Serial port for Cell-con lot tracker |
 
-GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23), `GPIO_LOT_END_PIN` (18), `GPIO_FAIL_A_PIN` (24), `GPIO_FAIL_B_PIN` (25).
+GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_BUSY_PIN` (23), `GPIO_END_PIN` (18), `GPIO_INSPEC_STAGE_PIN` (24).
 
 ### Output & logging
 
@@ -102,16 +99,13 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_DONE_PIN` (27), `GPIO_BUSY_PIN` (23)
 | `DEBUG` | `true` | Verbose console logs + annotated image saved every cycle |
 | `MODE` | `"DEBUG"` | String written into log records |
 
-**IFLV machine pin mapping** (BOARD→BCM from IFLRMIV101.py):
-`GPIO_START_PIN=2`, `GPIO_BUSY_PIN=3`, `GPIO_FAIL_A_PIN=4`, `GPIO_FAIL_B_PIN=4`, `GPIO_LOT_END_PIN=27`, `SKIP_DONE_WAIT=true`.
-
 ---
 
 ## Stage & Error Flags *(runtime state)*
 
 | Enum | Values |
 |---|---|
-| `Stage` | `STANDBY · BUSY · ERROR · SHUTDOWN` |
+| `Stage` | `BUSY · ERROR · SHUTDOWN` |
 | `ErrorFlag` | `NONE · CAMERA · MODEL · GPIO · TEMPLATE` |
 
 ---
@@ -135,9 +129,9 @@ LotStartDialog → operator enters lot number (or fetched from CellCon via seria
       n_missing >= total cells (12)       → _NG  (full NG — saved)
   → rename raw to {img_id}_{suffix}.jpg
   → save annotated to Output/YYYYMMDD/lot/Image/ (all non-_G results)
-  → GPIO: set BUSY_PIN=False, FAIL_A_PIN, FAIL_B_PIN
-  → wait DONE_PIN (camera mode, SKIP_DONE_WAIT=false) → clear outputs → STANDBY
-  → OR: SKIP_DONE_WAIT=true → FAIL pins stay set, loop to next START → clear_fail_outputs at START
+  → GPIO: set_busy(False) → set_inspec_stage (LOW=PASS, HIGH=NG)
+  → sleep 10 ms → pulse END_PIN LOW 40 ms → set_inspec_stage(HIGH, idle)
+  → loop to next START
 ```
 
 Low match score from TemplateMatcher: prints a warning but uses the best-match position regardless (no hard rejection). `TemplateError` is only raised by the Inspector if something else fails.
@@ -162,7 +156,7 @@ Applies Canny-contour preprocessing then `cv2.matchTemplate` on the saved pin-ar
 Confidence-weighted retry: `w = 0.7 * conf_second + 0.3 * conf_first`. Cell is PASS only if `w >= 0.90`. Applied only to cells that were missing on the first attempt.
 
 ### `RunWorker.run()`
-QThread loop: wait START → grab → save raw → inspect (+ one retry) → rename/save annotated → GPIO → wait DONE.
+QThread loop: wait START → grab → save raw → inspect (+ one retry) → rename/save annotated → GPIO (INSPEC_STAGE + END_PIN pulse).
 Signals: `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_status`, `sig_cycle_ms`, `sig_done`, `sig_session_reset`, `sig_paused`, `sig_resumed`.
 
 ---
@@ -183,12 +177,10 @@ If IC_B is not found automatically, the UI prompts to draw again (`draw_a_retry`
 
 | Signal | Pin | Dir |
 |---|---|---|
-| `START_PIN` | 17 | IN (active LOW — starts cycle) |
-| `DONE_PIN` | 27 | IN (active LOW — returns to STANDBY) |
-| `LOT_END_PIN` | 18 | IN (active LOW — advances lot number) |
-| `BUSY_PIN` | 23 | OUT — HIGH while inspecting |
-| `FAIL_A_PIN` | 24 | OUT — HIGH = IC_A fail |
-| `FAIL_B_PIN` | 25 | OUT — HIGH = IC_B fail |
+| `START_PIN` | 17 | IN — active HIGH 10 ms pulse (machine signals ready for one shot) |
+| `BUSY_PIN` | 23 | OUT — HIGH during full inspection + retry |
+| `END_PIN` | 18 | OUT — normally HIGH; pulses LOW 40 ms after inspection done |
+| `INSPEC_STAGE_PIN` | 24 | OUT — normally HIGH; LOW = both ICs pass, HIGH = any fail |
 
 ---
 

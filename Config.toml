@@ -113,7 +113,7 @@ RECONNECT_ATTEMPTS = 3
 RECONNECT_DELAY_S = 5.0
 
 # Milliseconds to wait before the second inspection attempt when the first fails
-RETRY_DELAY_MS = 250
+RETRY_DELAY_MS = 10
 
 # Classifier warm-up passes on startup (separate from camera warm-up)
 WARMUP_FRAMES = 5

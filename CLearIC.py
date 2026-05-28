@@ -66,7 +66,7 @@ class ConfigLoader:
         "CAMERA_RETRIES":       2,
         "RECONNECT_ATTEMPTS":   3,
         "RECONNECT_DELAY_S":    5.0,
-        "RETRY_DELAY_MS":       250,
+        "RETRY_DELAY_MS":       10,
         "DISK_WARN_MB":         200,
         "GPIO_START_PIN":        17,
         "GPIO_BUSY_PIN":         23,

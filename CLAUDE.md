@@ -42,7 +42,6 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 | `CAMERA_RETRIES` | `2` | Number of grab retries before raising CameraError |
 | `RECONNECT_ATTEMPTS` | `3` | Camera reconnect attempts on disconnect |
 | `RECONNECT_DELAY_S` | `5.0` | Seconds between reconnect attempts |
-| `TRIGGER_SETTLE_MS` | `50` | Delay (ms) between START signal received and grab |
 
 ### Classifier & inspection
 

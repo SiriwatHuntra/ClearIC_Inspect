@@ -72,7 +72,6 @@ class ConfigLoader:
         "GPIO_BUSY_PIN":         23,
         "GPIO_END_PIN":          18,
         "GPIO_INSPEC_STAGE_PIN": 24,
-        "TRIGGER_SETTLE_MS":    50,
         "CELL_SHRINK":          0.95,
         "CELL_EXPAND":          1.2,
         "COL_GAP_PCT":          40.0,
@@ -123,8 +122,6 @@ class ConfigLoader:
             raise ConfigError("COLLECT_DATASET must be a boolean")
         if not isinstance(cfg["LOG_RETENTION"], int) or cfg["LOG_RETENTION"] < 1:
             raise ConfigError("LOG_RETENTION must be a positive integer")
-        if not isinstance(cfg["TRIGGER_SETTLE_MS"], (int, float)) or cfg["TRIGGER_SETTLE_MS"] < 0:
-            raise ConfigError("TRIGGER_SETTLE_MS must be a non-negative number")
         for pin_key in ("GPIO_START_PIN", "GPIO_BUSY_PIN",
                         "GPIO_END_PIN", "GPIO_INSPEC_STAGE_PIN"):
             if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
@@ -578,7 +575,7 @@ class RaspberryIO:
             self._mock_trigger.set()
 
     def wait_for_start(self, stop_flag_fn) -> bool:
-        """Block until START_PIN goes HIGH (active HIGH) or stop_flag_fn() returns True.
+        """Block until START_PIN RISING edge or stop_flag_fn() returns True.
         In mock mode, blocks until trigger() is called from the UI."""
         if not self._gpio_ok:
             while not stop_flag_fn():
@@ -589,9 +586,8 @@ class RaspberryIO:
             return False
         GPIO = self._GPIO
         while not stop_flag_fn():
-            if GPIO.input(self._start_pin) == GPIO.HIGH:
+            if GPIO.wait_for_edge(self._start_pin, GPIO.RISING, timeout=20) is not None:
                 return True
-            time.sleep(0.005)
         return False
 
     def drain_start_pin(self, timeout_ms: int = 500):
@@ -1828,6 +1824,9 @@ class RunWorker(QtCore.QThread):
         _reset_image_counter()
         _cycle = 0
 
+        if cam_mode == "camera":
+            self._gpio.clear_outputs()  # ensure known-idle state before first cycle
+
         while not self._stop:
 
             # Wait for next cycle trigger
@@ -1839,10 +1838,6 @@ class RunWorker(QtCore.QThread):
                     break
 
                 self._gpio.set_busy(True)
-
-                settle_ms = self._cfg.get("TRIGGER_SETTLE_MS", 0)
-                if settle_ms > 0:
-                    time.sleep(settle_ms / 1000.0)
             else:
                 # Auto directory: brief yield then check stop
                 time.sleep(0.05)
@@ -1851,6 +1846,8 @@ class RunWorker(QtCore.QThread):
 
             # Capture guard
             if self._stop:
+                if cam_mode == "camera":
+                    self._gpio.clear_outputs()
                 break
             t0 = time.perf_counter()
             try:
@@ -1877,6 +1874,7 @@ class RunWorker(QtCore.QThread):
                     continue   # retry this cycle
                 self.sig_error.emit(f"Camera error: {e}")
                 self.sig_status.emit("ERROR — camera lost, restart required.")
+                self._gpio.clear_outputs()
                 break
 
             img_id = _next_image_id()
@@ -1911,6 +1909,7 @@ class RunWorker(QtCore.QThread):
                     continue
                 self.sig_error.emit(f"Template error: {te}")
                 self.sig_status.emit("ERROR — template invalid, restart required.")
+                self._gpio.clear_outputs()
                 break
 
             except MarkMissingError as e1:
@@ -1955,6 +1954,8 @@ class RunWorker(QtCore.QThread):
                     os.remove(tmp_real)
                 except OSError:
                     pass
+                if cam_mode == "camera":
+                    self._gpio.clear_outputs()
                 break
 
             # Finalize paths and save
@@ -2050,7 +2051,8 @@ class RunWorker(QtCore.QThread):
                     self._drain_needed.clear()
                 self.sig_resumed.emit()
 
-        self._gpio.clear_outputs()
+        if cam_mode == "camera":
+            self._gpio.clear_outputs()
         self.sig_done.emit()   # always emit; _on_run_done guards against double-call
         self.sig_status.emit("Standby.")
 

@@ -146,9 +146,6 @@ MOCK_START_DELAY_MS = 200
 # Fake DONE pulse delay when IO = false (test/debug use only)
 MOCK_DONE_DELAY_MS = 100
 
-# Wait after GPIO trigger before reading pins (pin debounce settle time)
-TRIGGER_SETTLE_MS = 50
-
 
 # ─── Logging & Annotation ────────────────────────────────────────────────────
 # Maximum number of log files kept per pattern (oldest deleted automatically)

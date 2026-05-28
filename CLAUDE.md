@@ -101,11 +101,10 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_BUSY_PIN` (23), `GPIO_END_PIN` (18),
 
 ---
 
-## Stage & Error Flags *(runtime state)*
+## Error Flags *(runtime state)*
 
 | Enum | Values |
 |---|---|
-| `Stage` | `BUSY · ERROR · SHUTDOWN` |
 | `ErrorFlag` | `NONE · CAMERA · MODEL · GPIO · TEMPLATE` |
 
 ---

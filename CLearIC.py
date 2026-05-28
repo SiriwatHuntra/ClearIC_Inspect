@@ -162,11 +162,6 @@ class ConfigLoader:
         return cls.load()
 
 # STAGE & ERROR FLAGS
-class Stage(Enum):
-    BUSY     = True       # bool — True when BUSY_PIN is HIGH
-    ERROR    = "ERROR"
-    SHUTDOWN = "SHUTDOWN"
-
 class ErrorFlag(Enum):
     NONE     = "NONE"
     CAMERA   = "CAMERA"
@@ -522,10 +517,8 @@ class RaspberryIO:
     def __init__(self, io_enabled: bool = True,
                  start_pin: int = 17, busy_pin: int = 23,
                  end_pin: int = 18, inspec_stage_pin: int = 24):
-        self._enabled          = io_enabled
         self._gpio_ok          = False
         self._GPIO             = None
-        self._ser              = None
         self._start_pin        = start_pin
         self._busy_pin         = busy_pin
         self._end_pin          = end_pin
@@ -549,18 +542,6 @@ class RaspberryIO:
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
             raise GPIOError(f"GPIO init failed: {e}")
-
-        try:
-            import serial as _serial
-            self._ser = _serial.Serial(
-                port='/dev/ttyUSB0', baudrate=38400,
-                parity=_serial.PARITY_NONE,
-                stopbits=_serial.STOPBITS_ONE,
-                bytesize=_serial.EIGHTBITS, timeout=1)
-            print("[IO] Serial port OK")
-        except Exception:
-            self._ser = None
-            print("[IO] Serial device not found")
 
     def _out(self, pin: int, high: bool, pin_name: str = ""):
         if self._gpio_ok:
@@ -1777,9 +1758,9 @@ class RunWorker(QtCore.QThread):
     """
     Background inspection loop.
 
-    MANUAL=True  + CAMERA='directory': waits for trigger() call per cycle
-    MANUAL=False + CAMERA='directory': auto-loops with short delay between cycles
-    CAMERA='camera': waits for GPIO START_PIN (or trigger() if MANUAL=True)
+    Camera mode: wait_for_start() blocks on START_PIN HIGH (active HIGH);
+      IO=False: blocks until MainWindow calls trigger() per cycle.
+    Directory mode: auto-loops with 50 ms yield between cycles.
     """
     sig_image    = QtCore.pyqtSignal(object)          # annotated BGR ndarray
     sig_result   = QtCore.pyqtSignal(bool, bool, bool)       # ic_a_pass, ic_b_pass, is_suspect
@@ -2034,9 +2015,8 @@ class RunWorker(QtCore.QThread):
                     "FAIL" if miss_b else "PASS", miss_b,
                     cycle_ms, is_retry, is_suspect)
 
-            self._gpio.set_busy(False)
-
             if cam_mode == "camera":
+                self._gpio.set_busy(False)
                 is_overall_pass = not (miss_a or miss_b)
                 self._gpio.set_inspec_stage(not is_overall_pass)  # LOW=pass, HIGH=NG
                 time.sleep(0.010)
@@ -2058,9 +2038,8 @@ class RunWorker(QtCore.QThread):
                     self._camera.reset()
                     break                           # directory done → standby
 
-            # Pause checkpoint
-            # Sits after DONE handshake + clear_outputs so the machine
-            # always receives ACK before the loop suspends.
+            # Pause checkpoint — sits after GPIO outputs are restored (INSPEC_STAGE idle, BUSY LOW)
+            # so the machine always receives the full END_PIN pulse before the loop suspends.
             if not self._running.is_set():
                 self.sig_paused.emit()
                 self._running.wait()          # blocks until resume() or stop()

@@ -87,7 +87,6 @@ class ConfigLoader:
         "CELLCON_PORT":         "/dev/ttyUSB0",
         "IMAGE_W":              0,
         "IMAGE_H":              0,
-        "CAMERA_FPS":           10,
         "CLS_N_PASSES":         1,   # deterministic model — multi-pass gives identical results
         "CLS_UNCERTAIN_THR":    0.50,
     }
@@ -237,8 +236,7 @@ class Camera:
                  exposure_us: int = 8000, input_dir: str = "Input",
                  retry_delay: float = 0.2, retries: int = 2,
                  warmup_frames: int = 5,
-                 image_w: int = 0, image_h: int = 0,
-                 fps: float = 0):
+                 image_w: int = 0, image_h: int = 0):
         self._mode        = mode
         self._serial      = serial
         self._exposure_us = exposure_us
@@ -248,7 +246,6 @@ class Camera:
         self._warmup_frames = warmup_frames
         self._image_w     = image_w
         self._image_h     = image_h
-        self._fps         = fps
 
         self._camera      = None
         self._pylon       = None
@@ -292,18 +289,12 @@ class Camera:
                 self._camera.ExposureTimeAbs.SetValue(float(self._exposure_us))
             except Exception:
                 self._camera.ExposureTime.SetValue(float(self._exposure_us))
-            if self._fps > 0:
-                try:
-                    self._camera.AcquisitionFrameRateEnable.SetValue(True)
-                    try:
-                        self._camera.AcquisitionFrameRate.SetValue(float(self._fps))
-                    except Exception:
-                        self._camera.AcquisitionFrameRateAbs.SetValue(float(self._fps))
-                except Exception:
-                    print("[Camera] Frame rate limit not supported on this camera.")
             self._camera.PixelFormat.SetValue("Mono8")
-            self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-            print(f"[Camera] Opened. Exposure={self._exposure_us} µs")
+            self._camera.TriggerSelector.SetValue("FrameStart")
+            self._camera.TriggerMode.SetValue("On")
+            self._camera.TriggerSource.SetValue("Software")
+            self._camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            print(f"[Camera] Opened (software trigger). Exposure={self._exposure_us} µs")
         except CameraError:
             raise
         except Exception as e:
@@ -348,6 +339,7 @@ class Camera:
     def _grab_basler(self) -> np.ndarray:
         if self._camera is None:
             raise CameraError("Camera not open")
+        self._camera.ExecuteSoftwareTrigger()
         result = self._camera.RetrieveResult(
             5000, self._pylon.TimeoutHandling_ThrowException)
         try:
@@ -422,19 +414,8 @@ class Camera:
         return bool(self._files)
 
     def is_healthy(self) -> bool:
-        """Grab-based liveness check. Returns False if camera is unresponsive or closed."""
-        if self._mode != "camera":
-            return self.is_open()
-        if not self.is_open():
-            return False
-        try:
-            result = self._camera.RetrieveResult(
-                200, self._pylon.TimeoutHandling_Return)
-            ok = result.GrabSucceeded()
-            result.Release()
-            return ok
-        except Exception:
-            return False
+        """True if camera is open and ready to accept triggers."""
+        return self.is_open()
 
     def has_more(self) -> bool:
         """Directory mode: True if there are still un-visited images this cycle."""
@@ -597,11 +578,8 @@ class RaspberryIO:
             print("[IO MOCK] drain_start_pin (mock trigger cleared)")
             return
         GPIO = self._GPIO
-        deadline = time.monotonic() + timeout_ms / 1000
-        while time.monotonic() < deadline:
-            if GPIO.input(self._start_pin) == GPIO.LOW:
-                return
-            time.sleep(0.01)
+        if GPIO.input(self._start_pin) == GPIO.HIGH:
+            GPIO.wait_for_edge(self._start_pin, GPIO.FALLING, timeout=timeout_ms)
 
     def cleanup(self):
         if self._gpio_ok:
@@ -3001,7 +2979,6 @@ class MainWindow(QtWidgets.QMainWindow):
             warmup_frames=cfg.get("CAMERA_WARMUP_FRAMES", 5),
             image_w=cfg.get("IMAGE_W", 0),
             image_h=cfg.get("IMAGE_H", 0),
-            fps=cfg.get("CAMERA_FPS", 0),
         )
         try:
             self._camera = Camera(**self._camera_init_kwargs)

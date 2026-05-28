@@ -36,7 +36,6 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 | `EXPOSURE_US` | `8000` | Camera exposure µs |
 | `IMAGE_W` | `0` | Camera resolution override width (0 = camera native) |
 | `IMAGE_H` | `0` | Camera resolution override height (0 = camera native) |
-| `CAMERA_FPS` | `10` | Camera FPS limit (0 = camera default) |
 | `CAMERA_WARMUP_FRAMES` | `5` | Frames to grab and discard on camera open |
 | `CAMERA_RETRY_DELAY` | `0.2` | Seconds between grab retries on fail |
 | `CAMERA_RETRIES` | `2` | Number of grab retries before raising CameraError |

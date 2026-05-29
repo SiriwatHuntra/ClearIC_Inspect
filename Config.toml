@@ -11,10 +11,7 @@ DEBUG = false
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false
 
-# Skip DONE_PIN handshake at end of cycle (set true for IFLV machines)
-SKIP_DONE_WAIT = false
-
-# Show "R1C1" grid labels on cell overlays in annotated images
+# Show cell grid labels on annotated images
 RESULT_OVERLAY = true
 
 
@@ -120,31 +117,17 @@ WARMUP_FRAMES = 5
 
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────
-# Input — active LOW: triggers a new inspection cycle
+# IN — active HIGH 10 ms pulse — machine signals ready for one shot
 GPIO_START_PIN = 17
 
-# Input — active LOW: PLC signals that it received the inspection result
-GPIO_DONE_PIN = 27
-
-# Output — HIGH while inspection is running
+# OUT — HIGH during full inspection + retry
 GPIO_BUSY_PIN = 23
 
-# Input — active LOW: advances the lot number counter
-GPIO_LOT_END_PIN = 18
+# OUT — normally HIGH; pulses LOW 40 ms after inspection done
+GPIO_END_PIN = 18
 
-# Output — HIGH when IC_A has failed
-GPIO_FAIL_A_PIN = 24
-
-# Output — HIGH when IC_B has failed
-GPIO_FAIL_B_PIN = 25
-
-
-# ─── GPIO Timing ─────────────────────────────────────────────────────────────
-# Fake START pulse delay when IO = false (test/debug use only)
-MOCK_START_DELAY_MS = 200
-
-# Fake DONE pulse delay when IO = false (test/debug use only)
-MOCK_DONE_DELAY_MS = 100
+# OUT — normally HIGH (idle); LOW = both ICs pass, HIGH = any fail
+GPIO_INSPEC_STAGE_PIN = 24
 
 
 # ─── Logging & Annotation ────────────────────────────────────────────────────
@@ -153,3 +136,6 @@ LOG_RETENTION = 365
 
 # Cell overlay border thickness in pixels on annotated images
 ANN_BORDER_PX = 1
+
+# Warn in UI when free disk space drops below this (MB)
+DISK_WARN_MB = 200

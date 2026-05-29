@@ -556,9 +556,12 @@ class RaspberryIO:
         if not self._gpio_ok:
             self._mock_trigger.set()
 
-    def wait_for_start(self, stop_flag_fn) -> bool:
+    def wait_for_start(self, stop_flag_fn, timeout_s: float = 0.0) -> bool | None:
         """Block until START_PIN RISING edge or stop_flag_fn() returns True.
-        In mock mode, blocks until trigger() is called from the UI."""
+        In mock mode, blocks until trigger() is called from the UI.
+
+        Returns True=started, False=stopped, None=timed out (real GPIO only).
+        """
         if not self._gpio_ok:
             while not stop_flag_fn():
                 if self._mock_trigger.wait(timeout=0.02):
@@ -567,9 +570,12 @@ class RaspberryIO:
                     return True
             return False
         GPIO = self._GPIO
+        deadline = (time.monotonic() + timeout_s) if timeout_s > 0 else None
         while not stop_flag_fn():
             if GPIO.wait_for_edge(self._start_pin, GPIO.RISING, timeout=20) is not None:
                 return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
         return False
 
     def drain_start_pin(self, timeout_ms: int = 500):
@@ -1811,7 +1817,16 @@ class RunWorker(QtCore.QThread):
             # Wait for next cycle trigger
             if cam_mode == "camera":
                 self.sig_status.emit("Waiting for START signal…")
-                if not self._gpio.wait_for_start(lambda: self._stop):
+                _io_enabled = self._cfg.get("IO", False)
+                _wait_result = self._gpio.wait_for_start(
+                    lambda: self._stop,
+                    timeout_s=10.0 if _io_enabled else 0.0,
+                )
+                if _wait_result is None:
+                    self.sig_error.emit(
+                        "No START signal for 10 s — check machine connection.")
+                    break
+                if not _wait_result:
                     break
                 if self._stop:
                     break
@@ -3303,6 +3318,39 @@ class MainWindow(QtWidgets.QMainWindow):
         return (not self._cfg.get("IO", False)
                 and self._cfg.get("CAMERA", "directory") == "camera")
 
+    def _check_hardware_ready(self) -> bool:
+        """Verify selected IO devices are reachable before starting a run.
+
+        GPIO and camera failures are hard blocks. A missing CellCon port is a
+        soft warning — the operator may continue and enter the lot number manually.
+        """
+        cfg = self._cfg
+
+        if cfg.get("IO", False):
+            if self._gpio is None or not self._gpio._gpio_ok:
+                QtWidgets.QMessageBox.critical(
+                    self, "Hardware Error",
+                    "GPIO not ready — check RPi.GPIO and wiring.")
+                return False
+
+        if cfg.get("CAMERA") == "camera":
+            if self._camera is None or not self._camera.is_open():
+                QtWidgets.QMessageBox.critical(
+                    self, "Hardware Error",
+                    "Basler camera not connected or not open.")
+                return False
+
+        port = cfg.get("CELLCON_PORT", "/dev/ttyUSB0")
+        if not os.path.exists(port):
+            reply = QtWidgets.QMessageBox.warning(
+                self, "CellCon Not Found",
+                f"{port} not available — lot must be entered manually.\nProceed?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                return False
+
+        return True
+
     # Run / Pause / Stop
     def _on_action_click(self):
         if self._run_state == "standby":
@@ -3326,6 +3374,8 @@ class MainWindow(QtWidgets.QMainWindow):
         inspector = self._inspector
         if inspector is None:
             self._show_error("No inspector — create a template first.")
+            return
+        if not self._check_hardware_ready():
             return
 
         # Snapshot OCR fields (read before lot dialog, values already validated by gating)

@@ -15,7 +15,7 @@ COLLECT_DATASET = false
 SKIP_DONE_WAIT = false
 
 # Show "R1C1" grid labels on cell overlays in annotated images
-ANN_SHOW_LABELS = true
+RESULT_OVERLAY = true
 
 
 # ─── System ──────────────────────────────────────────────────────────────────

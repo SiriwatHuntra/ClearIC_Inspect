@@ -26,7 +26,7 @@ Unified image source — Basler camera or directory loop.
 ```
 Camera(mode, serial="", exposure_us=8000, input_dir="Input",
        retry_delay=0.2, retries=2, warmup_frames=5,
-       image_w=0, image_h=0, fps=0)
+       image_w=0, image_h=0)
 ```
 
 | Method | Returns | Description |
@@ -34,7 +34,9 @@ Camera(mode, serial="", exposure_us=8000, input_dir="Input",
 | `grab()` | `np.ndarray` (BGR uint8) | Grab one frame; raises `CameraError` on failure (retries internally) |
 | `grab_first()` | `np.ndarray` (BGR uint8) | Rewind → grab → rewind; used for setup and OCR crop |
 | `warmup()` | `None` | Discard N initial frames (Basler mode only) |
-| `is_healthy()` | `bool` | Non-blocking liveness check |
+| `reconnect(attempts=1, delay_s=0.0)` | `bool` | Close and re-open Basler camera; returns `True` on success |
+| `is_open()` | `bool` | True if camera handle is open (Basler) or image list is loaded (directory) |
+| `is_healthy()` | `bool` | Delegates to `is_open()` — non-blocking liveness check |
 | `has_more()` | `bool` | Directory mode: unvisited frames remain in this cycle? |
 | `reset()` | `None` | Rewind directory index to beginning |
 
@@ -155,8 +157,8 @@ Writes two CSV logs: daily operation log and per-lot result log.
 | Method | Signature | Writes |
 |---|---|---|
 | `start_lot(lot, package, mode)` | `(str, str, str) → None` | Result CSV header (metadata block) + column header row |
-| `end_lot()` | `() → None` | Result CSV footer: total, pass, fail, errors, yield%, end time, duration |
-| `log_inspection(img_id, ia_pass, ib_pass, cycle_ms, is_retry, is_suspect)` | `(...) → None` | One result CSV data row + op_log PASS/FAIL/PASS_SUSPECT/FAIL_SUSPECT event |
+| `end_lot(reason, pass_ct, fail_ct, err_ct, elapsed_s)` | `(str, int, int, int, float) → None` | Result CSV footer: total, pass, fail, errors, yield%, end time, duration |
+| `log_inspection(image_id, ic_a_result, ic_a_missing, ic_b_result, ic_b_missing, cycle_ms, is_retry, is_suspect)` | `(...) → None` | One result CSV data row + op_log PASS/FAIL/PASS_SUSPECT/FAIL_SUSPECT event |
 | `log_error(error_type, msg, cycle_ms)` | `(str, str, float) → None` | op_log ERROR row |
 | `log_pause()` | `() → None` | op_log PAUSE row |
 | `log_resume()` | `() → None` | op_log RESUME row |
@@ -384,7 +386,6 @@ IMAGE BROWSER TAB
  │         ▼                                               │
  │  GRAB_FRAME                                             │
  │    BUSY_PIN → HIGH                                      │
- │    sleep TRIGGER_SETTLE_MS (if >0)                      │
  │    camera.grab() → img_bgr                              │
  │    CameraError ──► [dir] skip / [cam] reconnect or exit │
  │    img_id = next_image_id()                             │

@@ -54,7 +54,7 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 | `CLS_N_PASSES` | `1` | Inference passes per cell (averaged); deterministic model — 1 is sufficient |
 | `CLS_UNCERTAIN_THR` | `0.50` | Log a warning when text_prob is in this uncertain zone (debug only) |
 | `WARMUP_FRAMES` | `5` | Classifier warmup passes on startup |
-| `RETRY_DELAY_MS` | `250` | Delay (ms) before retry grab on MarkMissingError |
+| `RETRY_DELAY_MS` | `10` | Delay (ms) before retry grab on MarkMissingError |
 
 ### Grid geometry
 
@@ -188,7 +188,7 @@ If IC_B is not found automatically, the UI prompts to draw again (`draw_a_retry`
 | `logs/op_YYYYMMDD.csv` | One row per event: `timestamp, event, lot_number, detail, cycle_ms` |
 | `logs/result_{lot}_{ts}.csv` | Header block + one row per inspection + footer summary |
 
-Events: `SESSION_START`, `SESSION_END`, `PASS`, `FAIL`, `ERROR`, `PAUSE`, `RESUME`.
+Events: `SESSION_START`, `SESSION_END`, `PASS`, `PASS_SUSPECT`, `FAIL`, `FAIL_SUSPECT`, `ERROR`, `PAUSE`, `RESUME`.
 
 ---
 

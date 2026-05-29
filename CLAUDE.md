@@ -258,3 +258,9 @@ Installed from `JuliusBrussee/caveman` via the Claude Code skills system:
 Train with `Test/trainModel.py` (Ultralytics YOLO-cls). Export to OpenVINO with `Test/Converter.py`, then update `MODEL_PATH` in `Config.json`.
 
 Classifier output: `[1, 2]` — index 0 = NoText (absent), index 1 = Text (present). Training images are manually cropped raw images — no preprocessing. At inference, raw cell crops are fed directly to the model (no CLAHE). `TEXT_MIN_CONF` gates the Text class asymmetrically (below threshold → NoText, regardless of raw NoText probability).
+
+---
+
+## Git
+
+**Never perform any git operation** (commit, merge, push, rebase, branch, reset, stash, tag, cherry-pick, etc.) automatically or proactively. The user operates git exclusively. Only run a git command if the user gives an explicit, direct instruction for that specific command in the current turn.

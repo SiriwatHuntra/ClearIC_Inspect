@@ -6,7 +6,7 @@ USE_CAMERA = false
 IO = true
 
 # Print extra debug logs and save annotated image every cycle
-DEBUG = true
+DEBUG = fasle
 
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false
@@ -15,7 +15,7 @@ COLLECT_DATASET = false
 SKIP_DONE_WAIT = false
 
 # Show "R1C1" grid labels on cell overlays in annotated images
-ANN_SHOW_LABELS = true
+RESULT_OVERLAY = true
 
 
 # ─── System ──────────────────────────────────────────────────────────────────

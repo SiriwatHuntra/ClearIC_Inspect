@@ -83,7 +83,7 @@ class ConfigLoader:
         "LOG_DIR":              "logs",
         "LOG_RETENTION":        365,
         "ANN_BORDER_PX":        1,
-        "ANN_SHOW_LABELS":      True,
+        "RESULT_OVERLAY":      True,
         "WARMUP_FRAMES":        5,
         "CELLCON_PORT":         "/dev/ttyUSB0",
         "IMAGE_W":              0,
@@ -2810,7 +2810,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _srow(settings_lay, "Border thickness (px)", self._input_border)
 
         self._chk_labels = QtWidgets.QCheckBox("Show cell labels")
-        self._chk_labels.setChecked(bool(self._cfg.get("ANN_SHOW_LABELS", True)))
+        self._chk_labels.setChecked(bool(self._cfg.get("RESULT_OVERLAY", True)))
         settings_lay.addWidget(self._chk_labels)
 
         btn_apply = QtWidgets.QPushButton("Apply")
@@ -2931,7 +2931,7 @@ class MainWindow(QtWidgets.QMainWindow):
         show_labels = self._chk_labels.isChecked()
 
         self._cfg.update({"WARMUP_FRAMES": wf, "ANN_BORDER_PX": bp,
-                          "ANN_SHOW_LABELS": show_labels})
+                          "RESULT_OVERLAY": show_labels})
         ConfigLoader.save(self._cfg)
         self._rebuild_inspector()
 
@@ -3055,7 +3055,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data_dir=self._cfg.get("DATA_DIR", "Dataset"),
             data_split=self._cfg.get("DATA_SPLIT", "train"),
             ann_border_px=self._cfg.get("ANN_BORDER_PX", 1),
-            ann_show_labels=self._cfg.get("ANN_SHOW_LABELS", True),
+            ann_show_labels=self._cfg.get("RESULT_OVERLAY", True),
         )
 
     def _retry_camera_open(self):

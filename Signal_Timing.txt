@@ -1,0 +1,114 @@
+ClearIC Inspect — GPIO Signal Timing (Camera Mode, IO = true)
+=============================================================
+One complete inspection cycle. Time flows left → right (not to scale).
+‾ = HIGH (3.3 V)   _ = LOW (0 V / GND)
+
+Key timings
+  START pulse        ~10 ms   (machine drives BCM17 HIGH for ~10 ms)
+  Capture            ~50 ms   (software-trigger grab; Basler OneByOne mode)
+  Inspect          ~150–400 ms  (OpenVINO inference × 6 cells × 2 ICs)
+  Retry delay          10 ms  (RETRY_DELAY_MS; second grab only if first fails)
+  Retry grab+insp  ~200–450 ms  (if MarkMissingError on first attempt)
+  Settle               10 ms  (time.sleep(0.010) before END pulse)
+  END pulse           40 ms   (pulse_end_pin: END_PIN LOW for 40 ms)
+
+
+             IDLE      TRIGGER  CAP   INSPECTION (AI classify ±retry)   RESULT    END PULSE      IDLE
+             │         │        │     │                                  │         │              │
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BCM 17       __________╔════╗______________________________________________________________________________
+START_PIN               │10ms│
+(IN, PUD_DOWN)          ╚════╝
+                             ↑
+                       RISING edge detected (wait_for_start)
+                       10 s timeout when IO=true; None → error
+
+BCM 23       ________________╔═══╦═══════════════════════════════════════════════════════╗_______________
+BUSY_PIN                     │   ↑ camera.grab() fires immediately here                  │
+(OUT, idle LOW)              ↑ set_busy(True)                               set_busy(False) ↑
+                                                                             (after END pulse done)
+
+BCM 24  [PASS]  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾╔════════════╗‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+INSPEC_STAGE_PIN            idle HIGH                          │ LOW (PASS) │ restore HIGH (idle)
+(OUT, idle HIGH)                                               ↑            ↑
+                                                    set_inspec_stage(LOW)  set_inspec_stage(HIGH)
+                                                    (before END pulse)     (after set_busy(False))
+
+BCM 24  [NG]    ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+INSPEC_STAGE_PIN   stays HIGH throughout (NG = idle HIGH; no transition)
+(OUT, idle HIGH)
+
+BCM 18          ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾╔═════╗╔══════════╗‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+END_PIN                                                    10ms │settle│ │  40 ms   │
+(OUT, idle HIGH)                                           wait  ╚═════╝ ╚══LOW════╝
+                                                                          ↑          ↑
+                                                                        LOW         HIGH
+                                                           ← machine reads INSPEC_STAGE during LOW window →
+                                                                               ↑ BUSY drops here (after HIGH)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step-by-step event sequence (camera mode)
+──────────────────────────────────────────
+ 0. App start       BCM17: IN PUD_DOWN  BCM23: OUT LOW  BCM24: OUT HIGH  BCM18: OUT HIGH
+ 1. clear_outputs() Confirms idle:      BUSY=LOW        INSPEC_STAGE=H   END_PIN=H
+
+ ─── loop start ──────────────────────────────────────────────────────────────────────────
+
+ 2. wait_for_start()  Block on BCM17 RISING edge.
+                      • IO=true:  polls wait_for_edge(RISING, timeout=20 ms) for up to 10 s.
+                        Returns None on timeout → RunWorker emits error and exits loop.
+                      • IO=false (mock): blocks until UI "Trigger" button pressed.
+                      Item must already be in inspection position before machine sends pulse.
+
+ 3. set_busy(True)    BCM23 → HIGH
+
+ 4. camera.grab()     ← CAPTURE HERE — fires immediately after BUSY goes HIGH.
+                        Software-trigger: ExecuteSoftwareTrigger() then RetrieveResult().
+
+ 5. Inspector.inspect()
+    • First attempt: locate ICs → classify 6 cells × 2 ICs (OpenVINO)
+    • On MarkMissingError (camera mode only):
+        - wait RETRY_DELAY_MS (10 ms)
+        - grab second frame  ← CAPTURE AGAIN (retry)
+        - classify again; _resolve_ic() merges confidence (weighted 0.7/0.3)
+          cell PASS only if weighted conf ≥ 0.90
+
+ 6. Result classified:
+      n_missing == 0                    → _G   PASS (clean)
+      0 < n_missing < TEXT_NG_THRESHOLD → _GS  PASS (suspect)
+      n_missing ≥ TEXT_NG_THRESHOLD     → _NGS NG   (suspect)
+      n_missing ≥ 12 (all cells)        → _NG  NG   (full)
+
+ 7. set_inspec_stage(not pass)
+      PASS: BCM24 → LOW
+      NG:   BCM24 stays HIGH (already idle HIGH, no change)
+
+ 8. sleep 10 ms       Settle — INSPEC_STAGE stable before END pulse.
+
+ 9. pulse_end_pin()   BCM18 → LOW (40 ms) → HIGH
+                      Machine reads BCM24 (INSPEC_STAGE) during this 40 ms window.
+
+10. set_busy(False)   BCM23 → LOW  (BUSY drops only after END pulse returns HIGH)
+
+11. set_inspec_stage(True)  BCM24 → HIGH (idle — regardless of result)
+
+12. → back to step 2 (wait for next START)
+
+ ─── on stop / error ─────────────────────────────────────────────────────────────────────
+
+    clear_outputs()   BCM23 → LOW   BCM24 → HIGH   BCM18 → HIGH
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Signal summary table
+─────────────────────
+Pin   BCM  Dir  Idle  Active                     Logic
+────  ───  ───  ────  ─────────────────────────  ────────────────────────────────────────────────
+START  17  IN   LOW   HIGH ~10 ms pulse           Machine → Pi: item in place, start inspection
+BUSY   23  OUT  LOW   HIGH during grab+inspect    Pi → machine: hold next START until BUSY=LOW
+INSPEC 24  OUT  HIGH  LOW = PASS result           Pi → machine: LOW=both ICs pass, HIGH=NG/idle
+END    18  OUT  HIGH  40 ms LOW pulse             Pi → machine: result valid on INSPEC_STAGE now

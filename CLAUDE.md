@@ -84,7 +84,7 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_BUSY_PIN` (23), `GPIO_END_PIN` (18),
 | `LOG_DIR` | `"logs"` | Log file directory |
 | `LOG_RETENTION` | `365` | Max log files kept per pattern |
 | `ANN_BORDER_PX` | `1` | Cell annotation border thickness |
-| `ANN_SHOW_LABELS` | `true` | Show R1C1 labels on cell overlays |
+| `RESULT_OVERLAY` | `true` | Show R1C1 labels on cell overlays |
 | `COLLECT_DATASET` | `false` | Save cell crops to `Dataset/` for retraining |
 | `DATA_DIR` | `"Dataset"` | Root directory for collected crops |
 | `DATA_SPLIT` | `"train"` | Subfolder under DATA_DIR (`train` or `val`) |
@@ -215,7 +215,6 @@ ClearIC_Inspect/
 ├── CLearIC.py
 ├── Config.toml
 ├── Text_cls-2/best_openvino_model/   # ACTIVE cell classifier (best.xml + best.bin)
-├── IC_Search_openvino_model/         # unused — kept for reference
 ├── templates/
 │   ├── template.json                 # ic_a/ic_b coords, match_threshold, strip_h
 │   ├── tmpl_full.npy                 # pin-area patch for TemplateMatcher

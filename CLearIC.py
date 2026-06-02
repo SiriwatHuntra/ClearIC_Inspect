@@ -2031,7 +2031,7 @@ class RunWorker(QtCore.QThread):
             if cam_mode == "camera":
                 is_overall_pass = not (miss_a or miss_b)
                 self._gpio.set_inspec_stage(not is_overall_pass)  # LOW=pass, HIGH=NG
-                time.sleep(self.GPIO_STAGE_HOLD_S)                      # hold stage for machine to read
+                time.sleep(self._GPIO_PRE_END_SEC)                      # hold stage for machine to read
                 self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH
@@ -2677,7 +2677,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_system()
 
     def _set_ocr_status(self, text: str, color: str = "#FF6B6B") -> None:
-        self._set_ocr_status(text, color)
+        self._lbl_ocr_status.setText(text)
+        self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
         
     # UI construction
     def _build_ui(self):
@@ -3576,7 +3577,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                     data2 = resp2.json()
                                     if isinstance(data2, list) and data2:
                                         ocr_mark = data2[0].get("ocr_mark")
-                            except Exception:
+                            except Exception as exc:
                                 print(f"[OCR] Retry failed: {exc}")
                         if ocr_mark is None:
                             if debug:

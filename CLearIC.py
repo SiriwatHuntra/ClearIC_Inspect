@@ -2031,7 +2031,7 @@ class RunWorker(QtCore.QThread):
             if cam_mode == "camera":
                 is_overall_pass = not (miss_a or miss_b)
                 self._gpio.set_inspec_stage(not is_overall_pass)  # LOW=pass, HIGH=NG
-                time.sleep(self._GPIO_PRE_END_SEC)                      # hold stage for machine to read
+                time.sleep(self._gpio._GPIO_PRE_END_SEC)                      # hold stage for machine to read
                 self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH

@@ -1,8 +1,8 @@
 # Weekly Report
 
-**Week:** W__ · **Period:** YYYY-MM-DD – YYYY-MM-DD
-**Prepared by:** _______________
-**Date:** YYYY-MM-DD
+**Week:** W23 · **Period:** 2026-06-02 – 2026-06-06
+**Prepared by:** Siriwat H.
+**Date:** 2026-06-02
 
 ---
 
@@ -43,15 +43,16 @@
 
 ## 4. Actions Taken This Week
 
-- 
-- 
+- Reviewed `IFWFOCR01.py` imports — identified 11 unused imports (`multiprocessing`, `PIL`, duplicate `time`, `datetime`, `argparse`, `shutil`, `socket`, `RPi.GPIO`, `glob`, `pymssql`, `getch`)
+- Confirmed `socket` import is unused (only referenced in commented-out IP-display code)
+- Created `Weekly.MD` report template
 - 
 
 ---
 
 ## 5. Planned Actions Next Week
 
-- 
+- Remove 11 unused imports from `IFWFOCR01.py` to clean up codebase
 - 
 - 
 

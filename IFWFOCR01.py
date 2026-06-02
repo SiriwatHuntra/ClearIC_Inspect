@@ -32,7 +32,6 @@ from PyQt5.QtWidgets import *
 # from settingDialog import Ui_Dialog
 # from PyQt5.uic import loadUi
 from PyQt5.uic import *
-from getch import getche, getch
 
 Ui_MainWindow, QtBaseClass = uic.loadUiType("dialog1.ui")
 # Ui_SettingWindow, QtBaseClass = uic.loadUiType('setting.ui')

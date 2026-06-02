@@ -2658,6 +2658,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._init_system()
 
+    def _set_ocr_status(self, text: str, color: str = "#FF6B6B") -> None:
+        self._set_ocr_status(text, color)
+        
     # UI construction
     def _build_ui(self):
         # Tab wrapper
@@ -3383,15 +3386,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ocr_expect_value = self._edit_ocr_expect.text().strip()
 
         # Clear right-panel status immediately on Start click
-        self._lbl_ocr_status.setText("Verifying…")
-        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._set_ocr_status("Verifying lot number…", color="#E2FDFF")    
         self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from CellCon / subclass hook)
         lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
         if lot is None:
-            self._lbl_ocr_status.setText("Fill both fields to enable Start.")
-            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+            self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
             return   # operator cancelled
         self._lot_number   = lot
         self._package_name = inspector._template.get("package_name", "")
@@ -3489,8 +3490,7 @@ class MainWindow(QtWidgets.QMainWindow):
             valid = self._ocr_fields_valid()
             self._btn_action.setEnabled(valid)
             if not valid:
-                self._lbl_ocr_status.setText("Fill both fields to enable Start.")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
 
     def _ocr_api_call(self, lot: str, operator: str, expected_mark: str) -> bool:
         """POST to ReadMark API, compare result, POST CreateRecord. Returns True = proceed."""
@@ -3501,8 +3501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except ImportError:
             debug = self._cfg.get("DEBUG", True)
             if not debug:
-                self._lbl_ocr_status.setText("OCR unavailable — 'requests' not installed")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status("OCR unavailable — 'requests' not installed")
                 return False
             return True   # debug mode: skip OCR silently
 
@@ -3526,32 +3525,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 data = resp.json()
                 if not isinstance(data, list):
                     if debug:
-                        self._lbl_ocr_status.setText("[DEBUG] ReadMark: unexpected response format — skipped")
-                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                        self._set_ocr_status("[DEBUG] ReadMark: unexpected response format — skipped", "#E2FDFF")
                         is_pass = 1
                     else:
-                        self._lbl_ocr_status.setText("ReadMark: unexpected server response format")
-                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                        self._set_ocr_status("ReadMark: unexpected server response format", "#FF6B6B")
                         return False
                 elif not data:
                     if debug:
-                        self._lbl_ocr_status.setText("[DEBUG] ReadMark: lot not found — skipped")
-                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                        self._set_ocr_status("[DEBUG] ReadMark: lot not found — skipped", "#E2FDFF")
                         is_pass = 1
                     else:
-                        self._lbl_ocr_status.setText("ReadMark: lot not in DB — cannot verify")
-                        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                        self._set_ocr_status("ReadMark: lot not in DB — cannot verify", "#FF6B6B")
                         return False
                 else:
                     std_mark = data[0].get("mark")
                     if std_mark is None:
                         if debug:
-                            self._lbl_ocr_status.setText("[DEBUG] ReadMark: 'mark' field missing — skipped")
-                            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                            self._set_ocr_status("[DEBUG] ReadMark: 'mark' field missing — skipped", "#E2FDFF")
                             is_pass = 1
                         else:
-                            self._lbl_ocr_status.setText("ReadMark: server response missing 'mark' field")
-                            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                            self._set_ocr_status("ReadMark: server response missing 'mark' field", "#FF6B6B")
                             return False
                     else:
                         ocr_mark = data[0].get("ocr_mark")
@@ -3571,44 +3564,33 @@ class MainWindow(QtWidgets.QMainWindow):
                             if debug:
                                 ocr_mark = expected_mark
                             else:
-                                self._lbl_ocr_status.setText(
-                                    f"OCR: no mark result after retry — check lot {lot}")
-                                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                                self._set_ocr_status(f"ReadMark: No mark rsult after retry > Check lot, {lot}", "#FF6B6B")
                                 return False
                         self._ocr_used_mark = ocr_mark
                         is_pass = 1 if std_mark == ocr_mark else 0
                         color   = "#69FF69" if is_pass else "#FF6B6B"
                         label   = "Mark OK" if is_pass else f"FAIL — DB: {std_mark} | OCR: {ocr_mark}"
-                        self._lbl_ocr_status.setText(label)
-                        self._lbl_ocr_status.setStyleSheet(f"font-size:11px;color:{color}")
+                        self._set_ocr_status(f"{label}", color)
             elif resp.status_code in (401, 403):
-                self._lbl_ocr_status.setText(
-                    f"ReadMark: authentication failed ({resp.status_code}) — check operator credentials")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status(f"ReadMark: authentication failed ({resp.status_code}) — check operator credentials", "#FF6B6B")
                 if not debug:
                     return False
                 is_pass = 1
             elif resp.status_code == 404:
-                self._lbl_ocr_status.setText("ReadMark: endpoint not found (404) — check server URL")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status("ReadMark: endpoint not found (404) — check server URL", "#FF6B6B")
                 if not debug:
                     return False
                 is_pass = 1
             elif resp.status_code >= 500:
-                self._lbl_ocr_status.setText(
-                    f"ReadMark: server error ({resp.status_code}) — try again later")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status(f"ReadMark: server error ({resp.status_code}) — try again later", "#FF6B6B")
                 if not debug:
                     return False
                 is_pass = 1
             elif debug:
-                self._lbl_ocr_status.setText("[DEBUG] ReadMark unavailable — skipped")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                self._set_ocr_status("[DEBUG] ReadMark unavailable — skipped", "#E2FDFF")
                 is_pass = 1
             else:
-                self._lbl_ocr_status.setText(
-                    f"ReadMark API error {resp.status_code} — check credentials/server")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status(f"ReadMark API error {resp.status_code} — check credentials/server", "#FF6B6B")
                 return False
 
             try:
@@ -3629,14 +3611,12 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[OCR] {exc}")
             err_str = str(exc).lower()
             if debug:
-                self._lbl_ocr_status.setText("[DEBUG] API unavailable — skipped")
-                self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+                self._set_ocr_status("[DEBUG] API unavailable — skipped", "#E2FDFF")
                 return True
             if any(k in err_str for k in ("connection", "timeout", "unreachable")):
                 self._lbl_ocr_status.setText("ReadMark API unreachable — check network connection")
             else:
-                self._lbl_ocr_status.setText(f"OCR API error — {exc}")
-            self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#FF6B6B")
+                self._set_ocr_status(f"OCR API error — {exc}", "#FF6B6B")
             return False
 
         finally:
@@ -3713,8 +3693,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._edit_ocr_expect.setReadOnly(False)
         self._edit_op_number.clear()    # force re-entry each lot; prevent ID carry-over
         self._edit_ocr_expect.clear()   # each lot's mark must be entered fresh
-        self._lbl_ocr_status.setText("Fill both fields to enable Start.")
-        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._set_ocr_status("Fill both fields to enable Start.", "#E2FDFF")
         self._btn_action.setEnabled(self._ocr_fields_valid())   # False — fields now empty
         self._lbl_lot_info.setText("—")
         self._update_badge(self._badge_a, None)

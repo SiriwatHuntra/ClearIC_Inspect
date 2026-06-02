@@ -813,14 +813,11 @@ def _save_cell_crops(image_bgr: np.ndarray, cells: list,
     Called only when COLLECT_DATASET = True.
     Filename: {run_num:06d}_IC{label}_{idx:02d}.png
     """
-    ih, iw = image_bgr.shape[:2]
     for idx, (cx, cy, cw, ch) in enumerate(cells):
         class_name = "Text" if cell_hits[idx] else "NoText"
         folder = os.path.join(data_dir, data_split, class_name)
         os.makedirs(folder, exist_ok=True)
-        x1, y1 = max(0, cx),       max(0, cy)
-        x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
-        crop = image_bgr[y1:y2, x1:x2]
+        crop = _safe_crop(image_bgr, cx, cy, cw, ch)
         if crop.size > 0:
             fname = f"{run_num:06d}_IC{ic_label}_{idx:02d}.png"
             cv2.imwrite(os.path.join(folder, fname), crop)
@@ -835,6 +832,11 @@ def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY, 21, 5)
+
+def _safe_crop(image: np.ndarray, cx: int, cy: int,
+               cw: int, ch: int) -> np.ndarray:
+    ih, iw = image.shape[:2]
+    return image[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
 
 def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
     """BGR → binary edge map for template matching.
@@ -1292,9 +1294,7 @@ class Inspector:
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
-            x1, y1 = max(0, cx),       max(0, cy)
-            x2, y2 = min(iw, cx + cw), min(ih, cy + ch)
-            crop = image_bgr[y1:y2, x1:x2]
+            crop = _safe_crop(image_bgr, cx, cy, cw, ch)
             cls_idx, conf = self._detector.classify_crop(crop) if crop.size > 0 else (0, 0.0)
             present   = (cls_idx == 1)   # 1 = Text (mark present)
             text_conf = conf if cls_idx == 1 else (1.0 - conf)  # Text-class probability
@@ -1370,6 +1370,9 @@ class Logger:
                 except OSError:
                     pass
 
+    def _log_error(self, operation: str, exc: Exception) -> None:
+        print(f"[Logger] {operation} failed: {exc}", file=sys.stderr)
+
     def _op_append(self, event: str, detail: str = "", cycle_ms: float = 0):
         path = self._op_path()
         write_header = not os.path.exists(path)
@@ -1386,7 +1389,7 @@ class Logger:
                     round(cycle_ms, 1),
                 ])
         except Exception as e:
-            print(f"[Logger] op write failed: {e}", file=sys.stderr)
+            self._log_error("op write", e)
 
     def _res_write(self, row: list):
         if not self._res_path:
@@ -1395,7 +1398,7 @@ class Logger:
             with open(self._res_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(row)
         except Exception as e:
-            print(f"[Logger] result write failed: {e}", file=sys.stderr)
+            self._log_error("result write", e)
 
     def _write_result_header(self, lot: str, package: str, mode: str):
         if not self._res_path:
@@ -1410,7 +1413,7 @@ class Logger:
                 w.writerow([])                       # blank separator
                 w.writerow(self._RES_HEADER)
         except Exception as e:
-            print(f"[Logger] result header write failed: {e}", file=sys.stderr)
+            self._log_error("result header write", e)
 
     def _write_result_footer(self, pass_ct: int, fail_ct: int,
                              err_ct: int, elapsed_s: float):
@@ -1430,7 +1433,7 @@ class Logger:
                 w.writerow(["END_TIME",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 w.writerow(["DURATION_S",  round(elapsed_s, 1)])
         except Exception as e:
-            print(f"[Logger] result footer write failed: {e}", file=sys.stderr)
+            self._log_error("result footer write", e)
 
     # public interface
 
@@ -2796,14 +2799,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.setSpacing(8)
 
         # Setup section
-        setup_frame = QtWidgets.QFrame()
-        setup_frame.setObjectName("setup_frame")
-        setup_lay = QtWidgets.QVBoxLayout(setup_frame)
-        setup_lay.setSpacing(6)
-
-        lbl_setup = QtWidgets.QLabel("Setup")
-        lbl_setup.setStyleSheet("font-weight:bold;font-size:13px")
-        setup_lay.addWidget(lbl_setup)
+        setup_frame, setup_lay = self._make_section_frame("Setup", spacing=6, obj_name="setup_frame")
 
         self._lbl_tmpl_status = QtWidgets.QLabel("No template saved.")
         self._lbl_tmpl_status.setStyleSheet(
@@ -2826,14 +2822,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.addWidget(setup_frame)
 
         # Controls section
-        ctrl_frame = QtWidgets.QFrame()
-        ctrl_frame.setObjectName("controls_frame")
-        ctrl_lay = QtWidgets.QVBoxLayout(ctrl_frame)
-        ctrl_lay.setSpacing(6)
-
-        lbl_ctrl = QtWidgets.QLabel("Controls")
-        lbl_ctrl.setStyleSheet("font-weight:bold;font-size:13px")
-        ctrl_lay.addWidget(lbl_ctrl)
+        ctrl_frame, ctrl_lay = self._make_section_frame("Controls", spacing=6, obj_name="controls_frame")
 
         self._btn_action = QtWidgets.QPushButton("Start")
         self._btn_action.setEnabled(False)   # enabled only when OCR fields are valid
@@ -2848,14 +2837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.addWidget(ctrl_frame)
 
         # Stats section
-        stats_frame = QtWidgets.QFrame()
-        stats_frame.setObjectName("setup_frame")
-        stats_lay = QtWidgets.QVBoxLayout(stats_frame)
-        stats_lay.setSpacing(4)
-
-        lbl_stats = QtWidgets.QLabel("Stats")
-        lbl_stats.setStyleSheet("font-weight:bold;font-size:13px")
-        stats_lay.addWidget(lbl_stats)
+        stats_frame, stats_lay = self._make_section_frame("Stats", spacing=4, obj_name="setup_frame")
 
         self._lbl_lot_info = self._stat_row(stats_lay, "Lot",      "—")
         self._lbl_status   = self._stat_row(stats_lay, "Status",   "Standby.")
@@ -2868,14 +2850,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.addWidget(stats_frame)
 
         # Settings section
-        settings_frame = QtWidgets.QFrame()
-        settings_frame.setObjectName("setup_frame")
-        settings_lay = QtWidgets.QVBoxLayout(settings_frame)
-        settings_lay.setSpacing(4)
-
-        lbl_vis = QtWidgets.QLabel("Settings")
-        lbl_vis.setStyleSheet("font-weight:bold;font-size:13px")
-        settings_lay.addWidget(lbl_vis)
+        settings_frame, settings_lay = self._make_section_frame("Settings", spacing=4, obj_name="setup_frame")
 
         def _srow(parent, label, widget):
             row = QtWidgets.QHBoxLayout()
@@ -2907,14 +2882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.addWidget(settings_frame)
 
         # OCR Input section — always visible, gates Start button
-        self._ocr_frame = QtWidgets.QFrame()
-        self._ocr_frame.setObjectName("setup_frame")
-        ocr_lay = QtWidgets.QVBoxLayout(self._ocr_frame)
-        ocr_lay.setSpacing(6)
-
-        lbl_ocr = QtWidgets.QLabel("OCR Input")
-        lbl_ocr.setStyleSheet("font-weight:bold;font-size:13px")
-        ocr_lay.addWidget(lbl_ocr)
+        self._ocr_frame, ocr_lay = self._make_section_frame("OCR Input", spacing=6, obj_name="setup_frame")
 
         lbl_op = QtWidgets.QLabel("Operator No. (6 digits):")
         lbl_op.setStyleSheet("font-size:10px;color:#E2FDFF")
@@ -2984,6 +2952,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "font-size:16px;font-weight:bold;color:#FFFFFF")
         frame.style().unpolish(frame)
         frame.style().polish(frame)
+
+    def _make_section_frame(self, title: str, spacing: int = 6,
+                            obj_name: str = "") -> tuple:
+        frame = QtWidgets.QFrame()
+        if obj_name:
+            frame.setObjectName(obj_name)
+        lay = QtWidgets.QVBoxLayout(frame)
+        lay.setSpacing(spacing)
+        lbl = QtWidgets.QLabel(title)
+        lbl.setStyleSheet("font-weight:bold;font-size:13px")
+        lay.addWidget(lbl)
+        return frame, lay
 
     def _stat_row(self, parent_lay, label: str, value: str) -> QtWidgets.QLabel:
         """One horizontal row: bold label on left, value on right."""

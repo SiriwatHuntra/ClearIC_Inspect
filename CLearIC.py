@@ -90,7 +90,11 @@ class ConfigLoader:
         "IMAGE_H":              0,
         "CLS_N_PASSES":         1,   # deterministic model — multi-pass gives identical results
         "CLS_UNCERTAIN_THR":    0.50,
+        "RETRY_W2":             0.7, # weight of Conf in retry decision (vs Text/NoText ratio) 
+        "RETRY_W1":             0.3, # weight of Conf in retry decision (vs Text/NoText ratio) 
+        "RETRY_PASS_THR":       0.90,   # weighted score threshold to call a retried cell PASS
     }
+
     @classmethod
     def load(cls) -> dict:
         import tomlkit
@@ -1718,7 +1722,12 @@ def _output_dirs(out_dir: str, lot_number: str) -> tuple:
     return real_dir, ann_dir
 
 
-def _resolve_ic(missing_first: list, confs_first: list, confs_second: list) -> list:
+def _resolve_ic(missing_first: list, 
+                confs_first: list, 
+                confs_second: list,
+                w2: float = 0.7, 
+                w1: float = 0.3,
+                pass_thr: float = 0.90,) -> list:
     """
     Confidence-weighted retry resolution for a single IC.
     Only re-evaluates cells that were MISSING on the first attempt.
@@ -1731,7 +1740,7 @@ def _resolve_ic(missing_first: list, confs_first: list, confs_second: list) -> l
         idx = (row - 1) * 2 + (col - 1)
         c1 = confs_first[idx]  if idx < len(confs_first)  else 0.0
         c2 = confs_second[idx] if idx < len(confs_second) else 0.0
-        if 0.7 * c2 + 0.3 * c1 < 0.90:
+        if w2 * c2 + w1 * c1 < pass_thr:
             still_missing.append([row, col])
     return still_missing
 
@@ -1923,9 +1932,12 @@ class RunWorker(QtCore.QThread):
                         except MarkMissingError as e2:
                             img_bgr = img_bgr2
                             ann     = e2.annotated
-                            miss_a  = (_resolve_ic(e1.missing_a, e1.confs_a, e2.confs_a)
+                            w2      = self._cfg.get("RETRY_W2", 0.7)
+                            w1      = self._cfg.get("RETRY_W1", 0.3)
+                            thr     = self._cfg.get("RETRY_PASS_THR", 0.90)
+                            miss_a  = (_resolve_ic(e1.missing_a, e1.confs_a, e2.confs_a, w2, w1, thr)
                                        if e1.missing_a else [])
-                            miss_b  = (_resolve_ic(e1.missing_b, e1.confs_b, e2.confs_b)
+                            miss_b  = (_resolve_ic(e1.missing_b, e1.confs_b, e2.confs_b, w2, w1, thr)
                                        if e1.missing_b else [])
                         except TemplateError:
                             miss_a, miss_b = e1.missing_a, e1.missing_b

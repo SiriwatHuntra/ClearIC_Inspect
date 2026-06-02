@@ -65,6 +65,14 @@ BLANK_CELL_STD_THR = 0.0
 # Non-maximum suppression IoU threshold (detection post-processing)
 NMS_IOU_THR = 0.45
 
+# weight for second-attempt confidence
+RETRY_W2       = 0.7    
+
+# weight for first-attempt confidence
+RETRY_W1       = 0.3    
+
+# weighted score threshold to call a retried cell PASS
+RETRY_PASS_THR = 0.90   
 
 # ─── Grid Geometry ───────────────────────────────────────────────────────────
 # Shrink IC bounding rect before splitting into cells (centred, e.g. 0.95 = 5% trim)

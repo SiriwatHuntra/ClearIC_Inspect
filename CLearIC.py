@@ -101,14 +101,29 @@ class ConfigLoader:
         if not os.path.exists(cls.CONFIG_FILE):
             raise ConfigError("Config.toml not found — create it before running.")
         try:
+            import re as _re
             with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = tomlkit.load(f)
+                _raw = f.read()
+            _raw = _re.sub(
+                r'(=\s*)(True|TRUE|False|FALSE)(\s*(?:#.*)?$)',
+                lambda m: m.group(1) + m.group(2).lower() + m.group(3),
+                _raw,
+                flags=_re.MULTILINE,
+            )
+            data = tomlkit.loads(_raw)
         except Exception as e:
             raise ConfigError(f"Config.toml unreadable: {e}")
         cfg = dict(cls.DEFAULT_CONFIG)
+        data_upper = {k.upper(): v for k, v in data.items()}
         for k in cls.DEFAULT_CONFIG:
-            if k in data:
-                cfg[k] = data[k]
+            if k in data_upper:
+                cfg[k] = data_upper[k]
+        for k in cls.DEFAULT_CONFIG:
+            if isinstance(cls.DEFAULT_CONFIG[k], bool) and isinstance(cfg[k], str):
+                if cfg[k].lower() in ("true", "yes", "1"):
+                    cfg[k] = True
+                elif cfg[k].lower() in ("false", "no", "0"):
+                    cfg[k] = False
         if not isinstance(cfg["USE_CAMERA"], bool):
             raise ConfigError("USE_CAMERA must be true or false")
         cfg["CAMERA"] = "camera" if cfg["USE_CAMERA"] else "directory"

@@ -375,7 +375,7 @@ class Camera:
                 try:
                     self._grab_basler()
                 except Exception:
-                    pass
+                    print(f"[Camera] Warmup failed")
             print(f"[Camera] Warmup done ({self._warmup_frames} frames).")
 
     def set_exposure(self, us: int):
@@ -528,6 +528,9 @@ class RaspberryIO:
             print("[IO] GPIO initialised (BCM mode).")
         except Exception as e:
             raise GPIOError(f"GPIO init failed: {e}")
+
+    def is_initialised(self) -> bool:
+        return self._gpio_ok
 
     def _out(self, pin: int, high: bool, pin_name: str = ""):
         if self._gpio_ok:
@@ -3345,7 +3348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._cfg
 
         if cfg.get("IO", False):
-            if self._gpio is None or not self._gpio._gpio_ok:
+            if self._gpio is None or not self._gpio.is_initialised():
                 QtWidgets.QMessageBox.critical(
                     self, "Hardware Error",
                     "GPIO not ready — check RPi.GPIO and wiring.")
@@ -3574,7 +3577,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                     if isinstance(data2, list) and data2:
                                         ocr_mark = data2[0].get("ocr_mark")
                             except Exception:
-                                pass
+                                print(f"[OCR] Retry failed: {exc}")
                         if ocr_mark is None:
                             if debug:
                                 ocr_mark = expected_mark
@@ -3617,8 +3620,9 @@ class MainWindow(QtWidgets.QMainWindow):
                           "mark": self._ocr_used_mark,
                           "image": enc, "is_pass": is_pass,
                           "recheck_count": 0, "is_logo_pass": 0}, timeout=5)
-            except Exception:
-                pass   # record failure never blocks the run
+            except Exception as exc:
+                if self._cfg.get("DEBUG", True):
+                    print(f"[OCR] Failed to create record: {exc}")
 
             return bool(is_pass) or debug
 

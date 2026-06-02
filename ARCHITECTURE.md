@@ -72,11 +72,19 @@ RaspberryIO(io_enabled=True, start_pin=17, busy_pin=23,
             end_pin=18, inspec_stage_pin=24)
 ```
 
+**Timing constants (class-level):**
+
+| Constant | Value | Description |
+|---|---|---|
+| `_END_PIN_PULSE_SEC` | `0.040` | END_PIN LOW pulse duration (40 ms) |
+| `_GPIO_PRE_END_SEC` | `0.010` | Settle delay before END_PIN pulse (10 ms) |
+
 | Method | Returns | Description |
 |---|---|---|
+| `is_initialised()` | `bool` | Returns `True` if GPIO was set up successfully |
 | `set_busy(v)` | `None` | Drive BUSY_PIN HIGH (`True`) or LOW (`False`) |
 | `set_inspec_stage(high)` | `None` | Drive INSPEC_STAGE_PIN; `False` (LOW) = both ICs pass, `True` (HIGH) = any fail / idle |
-| `pulse_end_pin()` | `None` | Pulse END_PIN LOW for 40 ms then HIGH; blocking — call from worker thread only |
+| `pulse_end_pin()` | `None` | Pulse END_PIN LOW for `_END_PIN_PULSE_SEC` (40 ms) then HIGH; blocking — call from worker thread only |
 | `trigger()` | `None` | Inject a mock START pulse (mock mode only); called from UI thread |
 | `wait_for_start(stop_flag_fn)` | `bool` | Block until START_PIN goes HIGH (active HIGH 10 ms pulse); mock mode blocks until `trigger()` is called; returns `False` if `stop_flag_fn()` fires |
 | `drain_start_pin(timeout_ms)` | `None` | Wait until START_PIN returns LOW (idle); clears mock trigger in mock mode — called on resume to discard stale pulse |
@@ -145,8 +153,8 @@ Inspector(detector, template, template_matcher=None,
 #### `_build_cells(x, y, w, h, ...)` → `list[(cx, cy, cw, ch)]`
 Converts one IC rect to 6 ROI cells. Steps: shrink (centred) → apply top/bottom margins → slice 3×2 grid with column gap → expand each cell. Row-major order: R1C1 → R1C2 → R2C1 → R2C2 → R3C1 → R3C2.
 
-#### `_resolve_ic(missing_first, confs_first, confs_second)` → `still_missing`
-Confidence-weighted retry resolution: `w = 0.7 × conf_second + 0.3 × conf_first`. Cell clears only if `w >= 0.90`. Applied only to cells that failed on the first attempt.
+#### `_resolve_ic(missing_first, confs_first, confs_second, w2=0.7, w1=0.3, pass_thr=0.90)` → `still_missing`
+Confidence-weighted retry resolution: `w = w2 × conf_second + w1 × conf_first`. Cell clears only if `w >= pass_thr`. Applied only to cells that failed on the first attempt. Weights and threshold are passed by the caller from config keys `RETRY_W2`, `RETRY_W1`, `RETRY_PASS_THR`.
 
 ---
 
@@ -287,8 +295,8 @@ INSPECTION CYCLE  (one shot per START pulse)
   │    Sleep RETRY_DELAY_MS → grab second frame → re-inspect
   │    ├─ Second pass clears all cells → use second result
   │    └─ Still missing → _resolve_ic():
-  │         w = 0.7×conf_second + 0.3×conf_first
-  │         cell clears only if w ≥ 0.90
+  │         w = RETRY_W2×conf_second + RETRY_W1×conf_first
+  │         cell clears only if w ≥ RETRY_PASS_THR
   │
   ├─ PASS/FAIL determination:
   │    missing = len(missing_a) + len(missing_b)

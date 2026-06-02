@@ -145,6 +145,40 @@ class ConfigLoader:
                         "GPIO_END_PIN", "GPIO_INSPEC_STAGE_PIN"):
             if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
                 raise ConfigError(f"{pin_key} must be a BCM pin number (1–27)")
+        if not isinstance(cfg["RESULT_OVERLAY"], bool):
+            raise ConfigError("RESULT_OVERLAY must be true or false")
+        for _k in ("NMS_IOU_THR", "RETRY_PASS_THR", "CLS_UNCERTAIN_THR"):
+            if not (0.0 < cfg[_k] <= 1.0):
+                raise ConfigError(f"{_k} must be in (0, 1]")
+        if not (0.0 < cfg["CELL_SHRINK"] <= 1.0):
+            raise ConfigError("CELL_SHRINK must be in (0, 1]")
+        if not (cfg["CELL_EXPAND"] > 0.0):
+            raise ConfigError("CELL_EXPAND must be > 0")
+        if not (0.0 <= cfg["COL_GAP_PCT"] < 100.0):
+            raise ConfigError("COL_GAP_PCT must be in [0, 100)")
+        if cfg["GRID_MARGIN_TOP"] + cfg["GRID_MARGIN_BOT"] >= 100.0:
+            raise ConfigError("GRID_MARGIN_TOP + GRID_MARGIN_BOT must be < 100")
+        for _k in ("TEXT_NG_THRESHOLD", "EXPOSURE_US", "CLS_N_PASSES",
+                   "CAMERA_WARMUP_FRAMES", "WARMUP_FRAMES"):
+            if not isinstance(cfg[_k], int) or cfg[_k] < 1:
+                raise ConfigError(f"{_k} must be a positive integer (>= 1)")
+        for _k in ("IMAGE_W", "IMAGE_H", "CAMERA_RETRIES",
+                   "RECONNECT_ATTEMPTS", "RETRY_DELAY_MS", "ANN_BORDER_PX"):
+            if not isinstance(cfg[_k], int) or cfg[_k] < 0:
+                raise ConfigError(f"{_k} must be a non-negative integer (>= 0)")
+        for _k in ("CAMERA_RETRY_DELAY", "RECONNECT_DELAY_S"):
+            if not (cfg[_k] >= 0.0):
+                raise ConfigError(f"{_k} must be >= 0")
+        if cfg["DATA_SPLIT"] not in ("train", "val"):
+            raise ConfigError("DATA_SPLIT must be 'train' or 'val'")
+        _w_sum = cfg["RETRY_W2"] + cfg["RETRY_W1"]
+        if abs(_w_sum - 1.0) > 0.001:
+            print(f"[Config] Warning: RETRY_W2 + RETRY_W1 = {_w_sum:.3f} (expected 1.0)")
+        _unknown = sorted(k for k in data_upper if k not in cls.DEFAULT_CONFIG)
+        if _unknown:
+            print(f"[Config] Unrecognised keys (possible typo): {_unknown}")
+        if not os.path.exists(cfg["MODEL_PATH"]):
+            print(f"[Config] Warning: MODEL_PATH not found: {cfg['MODEL_PATH']!r}")
         return cfg
 
     @classmethod

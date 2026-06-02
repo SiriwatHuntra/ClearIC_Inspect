@@ -497,6 +497,9 @@ class RaspberryIO:
     In mock mode wait_for_start() blocks until trigger() is called from the UI.
     """
 
+    _END_PIN_PULSE_SEC = 0.040 #ENDING SIGNAL PULSE duration (40 ms LOW)
+    _GPIO_PRE_END_SEC = 0.010  #PIN STAGE PULSE, DEBOUNCE GAPS
+
     def __init__(self, io_enabled: bool = True,
                  start_pin: int = 17, busy_pin: int = 23,
                  end_pin: int = 18, inspec_stage_pin: int = 24):
@@ -544,7 +547,7 @@ class RaspberryIO:
     def pulse_end_pin(self):
         """Pulse END_PIN LOW for 40 ms. Blocking — call from worker thread only."""
         self._out(self._end_pin, False, "END_PIN")
-        time.sleep(0.040)
+        time.sleep(self._END_PIN_PULSE_SEC)
         self._out(self._end_pin, True, "END_PIN")
 
     def clear_outputs(self):
@@ -2025,7 +2028,7 @@ class RunWorker(QtCore.QThread):
             if cam_mode == "camera":
                 is_overall_pass = not (miss_a or miss_b)
                 self._gpio.set_inspec_stage(not is_overall_pass)  # LOW=pass, HIGH=NG
-                time.sleep(0.010)
+                time.sleep(self.GPIO_STAGE_HOLD_S)                      # hold stage for machine to read
                 self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH

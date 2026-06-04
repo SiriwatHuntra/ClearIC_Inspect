@@ -25,7 +25,7 @@ CELLCON_PORT = "/dev/ttyUSB0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 # Folder containing images when USE_CAMERA = false
-DIR_INPUT = "Capture/"
+DIR_INPUT = "Input/"
 
 # Root output folder for raw and annotated results
 OUT_DIR = "Output/"

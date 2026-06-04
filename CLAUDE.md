@@ -147,8 +147,14 @@ Crop each raw cell from `image_bgr` → `Detector.classify_crop()`. Draws border
 ### `Inspector.inspect(image_bgr, debug) → (pass_a, pass_b, missing_a, missing_b, annotated_bgr)`
 Locate via TemplateMatcher (or fixed coords) → cells → `_check_ic` × 2. `annotated_bgr` IS `image_bgr` (in-place, no copy). Raises `MarkMissingError` on missing cells.
 
+### `_contour_template(image_bgr) → np.ndarray`
+**Must receive the full image.** Returns a binary bright-region map (region-based, not edge-based).
+Pipeline: `medianBlur(5)` → background-divide (`GaussianBlur σ=50`) → `Otsu` threshold → `morphOpen(9×9)` → `morphClose(5×5)`.
+Background division normalises lot-to-lot brightness variation without amplifying tape texture (unlike CLAHE). Morph open removes tape-noise blobs; morph close fills holes inside pin blobs.
+Called identically at template-save time, search time, and IC_B setup detection so all three see the same global histogram.
+
 ### `TemplateMatcher.locate_ic(image_bgr) → (QRect, score)`
-Applies Canny-contour preprocessing then `cv2.matchTemplate` on the saved pin-area patch (50% of IC height below the IC body). Searches within `±search_margin` of expected position. Always returns best-match position; logs a warning if score < threshold.
+Calls `_contour_template(image_bgr)` on the **full frame** first, then crops the `±search_margin` search window from the result. Matches the saved pin-area blob patch (50% of IC height below body) with `TM_CCOEFF_NORMED`. Always returns best-match position; logs a warning if score < threshold.
 
 ### `_resolve_ic(missing_first, confs_first, confs_second) → still_missing`
 Confidence-weighted retry: `w = 0.7 * conf_second + 0.3 * conf_first`. Cell is PASS only if `w >= 0.90`. Applied only to cells that were missing on the first attempt.
@@ -163,7 +169,7 @@ Signals: `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_warn`, `sig_st
 
 1. Click **New Template** → grabs a fresh frame from the camera (or directory).
 2. Draw a rubber-band rect around **either** IC on the image.
-3. System auto-detects the second IC (`_find_second_ic` — adaptive-binary template match on the opposite image half).
+3. System auto-detects the second IC (`_find_second_ic` — region-based template match on the opposite image half). Template region = drawn IC rect **extended downward 50%** to include pin blobs, making a tight IC body box distinctive enough to match. Uses `_contour_template` for consistency with inspection-time matching.
 4. Both IC_A (yellow) and IC_B (cyan) shown as overlays.
 5. Click **Confirm** → saves `template.json`, `tmpl_full.npy` (pin-area patch), and `template_preview.png`.
 

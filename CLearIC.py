@@ -839,18 +839,33 @@ def _safe_crop(image: np.ndarray, cx: int, cy: int,
     return image[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
 
 def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
-    """BGR → binary edge map for template matching.
-    Pipeline: Gaussian blur → Otsu-driven Canny → dilate.
-    Otsu auto-threshold adapts to image brightness; dilation widens edges
-    so matchTemplate has signal even with small positional shifts.
+    """BGR → binary bright-region map for template matching (region-based).
+    MUST receive the full image — background blur and Otsu need global pixel
+    context to produce the same result at template-save time and search time.
+    Pipeline: median denoise → background-divide → Otsu → morph open → morph close.
     """
-    gray    = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    otsu_thr, _ = cv2.threshold(blurred, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    edges  = cv2.Canny(blurred, otsu_thr * 0.5, otsu_thr)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    return cv2.dilate(edges, kernel, iterations=1)
+    gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Median: remove sensor grain, preserve pin boundary sharpness
+    denoised = cv2.medianBlur(gray, 5)
+
+    # Background divide: large-sigma blur estimates the illumination field.
+    # Dividing removes global brightness variation (dark lot vs bright lot)
+    # without amplifying local tape texture (unlike CLAHE).
+    bg   = cv2.GaussianBlur(denoised, (0, 0), 50)
+    norm = cv2.divide(denoised, bg, scale=255)
+
+    # Otsu on normalised image: pins (lighter) separate cleanly from tape (darker)
+    _, bright_mask = cv2.threshold(norm, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Open: remove small tape-noise blobs smaller than a pin
+    k_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    cleaned = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, k_open)
+
+    # Close: fill small holes inside surviving pin blobs → solid filled regions
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    return cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close)
 
 class TemplateManager:
 
@@ -1089,17 +1104,19 @@ class TemplateMatcher:
         rx2 = min(img_w, ic_x + pw + m)
         ry2 = min(img_h, exp_y + ph + m)
 
+        # Full-image preprocess first — same global histogram as template-save time
+        full_filtered = _contour_template(image_bgr)
+
         roi_bgr = image_bgr[ry1:ry2, rx1:rx2]
 
         if roi_bgr.size == 0 or roi_bgr.shape[0] < ph or roi_bgr.shape[1] < pw:
-            # ROI empty or too small — fall back to full-frame search
-            full = _contour_template(image_bgr)
-            res = cv2.matchTemplate(full, patch, cv2.TM_CCOEFF_NORMED)
+            # ROI empty or too small — search full preprocessed frame (already computed)
+            res = cv2.matchTemplate(full_filtered, patch, cv2.TM_CCOEFF_NORMED)
             _, score, _, loc = cv2.minMaxLoc(res)
             found_ic_y = loc[1] + strip_h
             return QtCore.QRect(loc[0], found_ic_y, ic_w, ic_h), float(score)
 
-        filtered = _contour_template(roi_bgr)
+        filtered = full_filtered[ry1:ry2, rx1:rx2]
         res = cv2.matchTemplate(filtered, patch, cv2.TM_CCOEFF_NORMED)
         _, score, _, loc = cv2.minMaxLoc(res)
         abs_x = loc[0] + rx1
@@ -1116,28 +1133,35 @@ def _find_second_ic(image_bgr: np.ndarray,
                     ref_rect: QtCore.QRect,
                     conf_thr: float = 0.4) -> tuple:
     """
-    Search the opposite image half for a second IC using the ref_rect crop as a
-    template.  Uses dense adaptive binary (not contour) for reliable setup-time matching.
-
-    Returns (QRect, score).  QRect is None if score < conf_thr.
+    Search the opposite image half for IC_B using IC_A's drawn rect as reference.
+    Template extends downward to include the pin area (50% of IC height below box
+    bottom) — pin blobs are geometrically stable across lots and make a tight
+    IC body crop distinctive enough to match reliably.
+    Uses _contour_template (region-based) for consistency with TemplateMatcher.
+    Returns (QRect, score). QRect is None if score < conf_thr.
     """
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
 
-    binary = _adaptive_binary(image_bgr)
+    # Full-image preprocess — same pipeline as extract_patches and locate_ic
+    full_map = _contour_template(image_bgr)
 
-    ty1, ty2 = max(0, y), min(img_h, y + h)
-    tx1, tx2 = max(0, x), min(img_w, x + w)
-    template = binary[ty1:ty2, tx1:tx2]
+    # Extend template downward to include pin area (same geometry as extract_patches)
+    h1  = max(1, int(h * 0.5))
+    ty1 = max(0, y)
+    ty2 = min(img_h, y + h + h1)   # IC body + pin area below
+    tx1 = max(0, x)
+    tx2 = min(img_w, x + w)
+    template = full_map[ty1:ty2, tx1:tx2]
     if template.size == 0:
         return None, 0.0
 
     mid = img_w // 2
     if (x + w // 2) < mid:   # ref is on left → search right half
-        search   = binary[:, mid:]
+        search   = full_map[:, mid:]
         x_offset = mid
     else:                     # ref is on right → search left half
-        search   = binary[:, :mid]
+        search   = full_map[:, :mid]
         x_offset = 0
 
     if search.shape[1] < template.shape[1] or search.shape[0] < template.shape[0]:
@@ -1147,6 +1171,7 @@ def _find_second_ic(image_bgr: np.ndarray,
     _, score, _, loc = cv2.minMaxLoc(result)
 
     if score >= conf_thr:
+        # loc[1] = IC body top (template extends downward only → top is unchanged)
         return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
     return None, float(score)
 

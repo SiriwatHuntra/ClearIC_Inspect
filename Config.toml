@@ -72,7 +72,12 @@ RETRY_W2       = 0.7
 RETRY_W1       = 0.3    
 
 # weighted score threshold to call a retried cell PASS
-RETRY_PASS_THR = 0.90   
+RETRY_PASS_THR = 0.90
+
+# Minimum blob area ratio for template binary map (0.0 = off).
+# Blobs smaller than BLOB_MIN_RATIO × largest_blob_area are removed.
+# Set to 0.2 to eliminate IC-corner reflections from the pin-patch template.
+BLOB_MIN_RATIO = 0.0
 
 # ─── Grid Geometry ───────────────────────────────────────────────────────────
 # Shrink IC bounding rect before splitting into cells (centred, e.g. 0.95 = 5% trim)

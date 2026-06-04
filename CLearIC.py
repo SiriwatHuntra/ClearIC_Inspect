@@ -93,6 +93,7 @@ class ConfigLoader:
         "RETRY_W2":             0.7, # weight of Conf in retry decision (vs Text/NoText ratio) 
         "RETRY_W1":             0.3, # weight of Conf in retry decision (vs Text/NoText ratio) 
         "RETRY_PASS_THR":       0.90,   # weighted score threshold to call a retried cell PASS
+        "BLOB_MIN_RATIO":       0.0,    # 0.0 = disabled; 0.2 removes small non-pin blobs from binary map
     }
 
     @classmethod
@@ -171,6 +172,8 @@ class ConfigLoader:
                 raise ConfigError(f"{_k} must be >= 0")
         if cfg["DATA_SPLIT"] not in ("train", "val"):
             raise ConfigError("DATA_SPLIT must be 'train' or 'val'")
+        if not (0.0 <= cfg["BLOB_MIN_RATIO"] <= 1.0):
+            raise ConfigError("BLOB_MIN_RATIO must be 0.0–1.0")
         _w_sum = cfg["RETRY_W2"] + cfg["RETRY_W1"]
         if abs(_w_sum - 1.0) > 0.001:
             print(f"[Config] Warning: RETRY_W2 + RETRY_W1 = {_w_sum:.3f} (expected 1.0)")
@@ -838,11 +841,13 @@ def _safe_crop(image: np.ndarray, cx: int, cy: int,
     ih, iw = image.shape[:2]
     return image[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
 
-def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
+def _contour_template(image_bgr: np.ndarray, min_blob_ratio: float = 0.0) -> np.ndarray:
     """BGR → binary bright-region map for template matching (region-based).
     MUST receive the full image — background blur and Otsu need global pixel
     context to produce the same result at template-save time and search time.
-    Pipeline: median denoise → background-divide → Otsu → morph open → morph close.
+    Pipeline: median denoise → background-divide → Otsu → morph open → morph close
+             → optional connected-component blob filter (min_blob_ratio > 0).
+    min_blob_ratio: drop any blob whose area < ratio × largest_blob_area (0.0 = disabled).
     """
     gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -865,7 +870,20 @@ def _contour_template(image_bgr: np.ndarray) -> np.ndarray:
 
     # Close: fill small holes inside surviving pin blobs → solid filled regions
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    return cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close)
+    result  = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close)
+
+    # Connected-component blob filter: remove blobs smaller than ratio × largest blob.
+    # Eliminates IC-corner reflections and other non-pin artifacts that survive morphology.
+    if min_blob_ratio > 0.0:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(result, connectivity=8)
+        if n > 1:  # label 0 = background; need at least one foreground blob
+            areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
+            min_area = max(areas) * min_blob_ratio
+            for i in range(1, n):
+                if stats[i, cv2.CC_STAT_AREA] < min_area:
+                    result[labels == i] = 0
+
+    return result
 
 class TemplateManager:
 
@@ -907,7 +925,8 @@ class TemplateManager:
         os.replace(_tmp, _TEMPLATE_FILE)
 
     @staticmethod
-    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect) -> tuple:
+    def extract_patches(image_bgr: np.ndarray, ic_rect: QtCore.QRect,
+                        min_blob_ratio: float = 0.0) -> tuple:
         """
         Extract the pin-area patch ONLY (below the IC body):
           patch spans [X1, Y2] → [X2, Y3]
@@ -926,7 +945,7 @@ class TemplateManager:
         y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area
         x_end   = min(x + w, img_w)
 
-        full_bin = _contour_template(image_bgr)[y_start:y_end, x:x_end]
+        full_bin = _contour_template(image_bgr, min_blob_ratio)[y_start:y_end, x:x_end]
         strip_h  = y - y_start  # = -h  (patch is below IC top by IC height)
 
         return full_bin, strip_h
@@ -1050,17 +1069,19 @@ class TemplateMatcher:
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
                  search_margin: int = 60,
-                 template_w: int = 0):
-        self._patch       = full_patch
-        self._threshold   = threshold
-        self._strip_h     = strip_h   # px from patch top to IC top edge
-        self._patch_w     = full_patch.shape[1]
-        self._ic_x        = ic_x   # expected IC_A left edge from template
-        self._ic_y        = ic_y   # expected IC_A top from template
-        self._ic_w        = ic_w
-        self._ic_h        = ic_h
-        self._margin      = search_margin   # px around expected pos to search
-        self._template_w  = template_w      # image width when template was saved (0 = unknown)
+                 template_w: int = 0,
+                 min_blob_ratio: float = 0.0):
+        self._patch          = full_patch
+        self._threshold      = threshold
+        self._strip_h        = strip_h   # px from patch top to IC top edge
+        self._patch_w        = full_patch.shape[1]
+        self._ic_x           = ic_x   # expected IC_A left edge from template
+        self._ic_y           = ic_y   # expected IC_A top from template
+        self._ic_w           = ic_w
+        self._ic_h           = ic_h
+        self._margin         = search_margin   # px around expected pos to search
+        self._template_w     = template_w      # image width when template was saved (0 = unknown)
+        self._min_blob_ratio = min_blob_ratio  # passed to _contour_template at search time
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
@@ -1105,7 +1126,7 @@ class TemplateMatcher:
         ry2 = min(img_h, exp_y + ph + m)
 
         # Full-image preprocess first — same global histogram as template-save time
-        full_filtered = _contour_template(image_bgr)
+        full_filtered = _contour_template(image_bgr, self._min_blob_ratio)
 
         roi_bgr = image_bgr[ry1:ry2, rx1:rx2]
 
@@ -1131,7 +1152,8 @@ class TemplateMatcher:
 
 def _find_second_ic(image_bgr: np.ndarray,
                     ref_rect: QtCore.QRect,
-                    conf_thr: float = 0.4) -> tuple:
+                    conf_thr: float = 0.4,
+                    min_blob_ratio: float = 0.0) -> tuple:
     """
     Search the opposite image half for IC_B using IC_A's drawn rect as reference.
     Template extends downward to include the pin area (50% of IC height below box
@@ -1144,7 +1166,7 @@ def _find_second_ic(image_bgr: np.ndarray,
     img_h, img_w = image_bgr.shape[:2]
 
     # Full-image preprocess — same pipeline as extract_patches and locate_ic
-    full_map = _contour_template(image_bgr)
+    full_map = _contour_template(image_bgr, min_blob_ratio)
 
     # Extend template downward to include pin area (same geometry as extract_patches)
     h1  = max(1, int(h * 0.5))
@@ -3136,6 +3158,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ic_x=ic_a["x"], ic_y=ic_a["y"],
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
                 template_w=tmpl.get("img_w", 0),
+                min_blob_ratio=self._cfg.get("BLOB_MIN_RATIO", 0.0),
             )
         self._inspector = Inspector(
             self._detector, tmpl, template_matcher=matcher,
@@ -3231,7 +3254,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         drawn_on_left = (rect.x() + rect.width() // 2) < img.shape[1] // 2
-        second, _     = _find_second_ic(img, rect)
+        second, _     = _find_second_ic(img, rect,
+                                        min_blob_ratio=self._cfg.get("BLOB_MIN_RATIO", 0.0))
 
         if drawn_on_left:
             ic_a, ic_b = rect, second
@@ -3363,7 +3387,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._setup_image is not None:
             try:
                 full_patch, strip_h_val = \
-                    TemplateManager.extract_patches(self._setup_image, ic_a)
+                    TemplateManager.extract_patches(self._setup_image, ic_a,
+                                                   self._cfg.get("BLOB_MIN_RATIO", 0.0))
                 TemplateManager.save_patches(full_patch)
                 patch_saved = True
             except Exception as e:

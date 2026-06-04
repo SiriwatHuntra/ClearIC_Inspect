@@ -228,5 +228,6 @@ True machine cycle ≈ `cycle_ms` + ~51 ms GPIO tail.
 | `match_threshold` | `template.json` | Minimum match score (below → warning only) |
 | `DISK_WARN_MB` | Config.toml | Free-space warning threshold |
 | `LOG_RETENTION` | Config.toml | Days to retain log files (default 730 = 2 years) |
+| `BLOB_MIN_RATIO` | Config.toml | Drop blobs < ratio × largest from binary map; 0.0 = off; 0.2 removes IC-corner reflections |
 | `_contour_template` open kernel | hardcoded `9×9` | Increase if tape-noise blobs survive |
 | `_contour_template` bg sigma | hardcoded `50` | Increase if illumination gradient is steep |

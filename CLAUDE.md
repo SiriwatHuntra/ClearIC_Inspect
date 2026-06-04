@@ -82,7 +82,7 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_BUSY_PIN` (23), `GPIO_END_PIN` (18),
 | `OUT_DIR` | `"Output/"` | Root output directory |
 | `DIR_INPUT` | `"Input/"` | Source images for `USE_CAMERA=false` |
 | `LOG_DIR` | `"logs"` | Log file directory |
-| `LOG_RETENTION` | `365` | Max log files kept per pattern |
+| `LOG_RETENTION` | `730` | Days to retain log files (date-based rotation; 2-year default) |
 | `ANN_BORDER_PX` | `1` | Cell annotation border thickness |
 | `RESULT_OVERLAY` | `true` | Show R1C1 labels on cell overlays |
 | `COLLECT_DATASET` | `false` | Save cell crops to `Dataset/` for retraining |
@@ -113,21 +113,22 @@ GPIO pin keys: `GPIO_START_PIN` (17), `GPIO_BUSY_PIN` (23), `GPIO_END_PIN` (18),
 LotStartDialog → operator enters lot number (or fetched from CellCon via serial)
   → RunWorker starts
   → Camera.grab()                            → image_bgr (ndarray)
-  → save raw to Output/YYYYMMDD/lot/RealImg/ (tmp name, before result known)
+  → raw_bgr = img_bgr.copy()                (preserve unannotated frame; inspect() annotates in-place)
   → TemplateMatcher.locate_ic(image_bgr)     → (QRect rt_a, score)
     (if no patch file → fixed template coords used instead)
   → rt_b = rt_a offset by (ic_b_dx, ic_b_dy) from template
   → Inspector._check_ic(image_bgr, cells)    → (missing[], hits[], confs[])  ×2
   → on MarkMissingError: one retry grab with confidence-weighted resolution
   → classify result by n_missing (total missing cells across both ICs):
-      n_missing == 0                      → _G   (PASS, not saved by default)
+      n_missing == 0                      → _G   (PASS — zero disk writes)
       0 < n_missing < TEXT_NG_THRESHOLD   → _GS  (suspect PASS — saved)
       n_missing >= TEXT_NG_THRESHOLD      → _NGS (suspect NG — saved)
       n_missing >= total cells (12)       → _NG  (full NG — saved)
-  → rename raw to {img_id}_{suffix}.jpg
-  → save annotated to Output/YYYYMMDD/lot/Image/ (all non-_G results)
+  → if non-_G: write raw_bgr → RealImg/{img_id}_{suffix}.jpg
+               write annotated → Image/{img_id}_{suffix}.jpg
   → GPIO: set_busy(False) → set_inspec_stage (LOW=PASS, HIGH=NG)
   → sleep 10 ms → pulse END_PIN LOW 40 ms → set_inspec_stage(HIGH, idle)
+  → every 500 cycles: check disk free; emit sig_warn banner if below DISK_WARN_MB
   → loop to next START
 ```
 
@@ -153,8 +154,8 @@ Applies Canny-contour preprocessing then `cv2.matchTemplate` on the saved pin-ar
 Confidence-weighted retry: `w = 0.7 * conf_second + 0.3 * conf_first`. Cell is PASS only if `w >= 0.90`. Applied only to cells that were missing on the first attempt.
 
 ### `RunWorker.run()`
-QThread loop: wait START → grab → save raw → inspect (+ one retry) → rename/save annotated → GPIO (INSPEC_STAGE + END_PIN pulse).
-Signals: `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_status`, `sig_cycle_ms`, `sig_done`, `sig_session_reset`, `sig_paused`, `sig_resumed`.
+QThread loop: wait START → grab → `raw_bgr = img_bgr.copy()` → inspect (+ one retry) → write files if non-`_G` → GPIO (INSPEC_STAGE + END_PIN pulse) → every 500 cycles emit `sig_warn` if disk low.
+Signals: `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_warn`, `sig_status`, `sig_cycle_ms`, `sig_done`, `sig_session_reset`, `sig_paused`, `sig_resumed`.
 
 ---
 
@@ -181,12 +182,16 @@ If IC_B is not found automatically, the UI prompts to draw again (`draw_a_retry`
 
 ---
 
-## Logging *(dual-CSV)*
+## Logging *(dual-CSV, daily files)*
 
 | File | Contents |
 |---|---|
 | `logs/op_YYYYMMDD.csv` | One row per event: `timestamp, event, lot_number, detail, cycle_ms` |
-| `logs/result_{lot}_{ts}.csv` | Header block + one row per inspection + footer summary |
+| `logs/result_YYYYMMDD.csv` | All lots for the day, one per day; lots separated by `# --- LOT_START ---` / `# --- LOT_END ---` blocks |
+
+Each lot block in `result_YYYYMMDD.csv`: header rows (LOT_NUMBER, PACKAGE, START_TIME, MODE) → column header → inspection rows → summary footer → blank line.
+
+Rotation: both `op_*.csv` and `result_*.csv` are deleted when their date is older than `LOG_RETENTION` days. Legacy `result_{lot}_{ts}.csv` filenames don't match the date pattern and are silently skipped (kept until manually deleted).
 
 Events: `SESSION_START`, `SESSION_END`, `PASS`, `PASS_SUSPECT`, `FAIL`, `FAIL_SUSPECT`, `ERROR`, `PAUSE`, `RESUME`.
 
@@ -224,7 +229,7 @@ ClearIC_Inspect/
 │   └── Image/{img_id}_{suffix}.jpg  # annotated captures (non-_G only)
 ├── logs/
 │   ├── op_YYYYMMDD.csv               # daily operation log
-│   └── result_{lot}_{ts}.csv         # per-lot result log
+│   └── result_YYYYMMDD.csv           # daily result log (all lots, LOT_START/LOT_END blocks)
 ├── Input/                            # source images for USE_CAMERA=false
 ├── Dataset/                          # cell crops (COLLECT_DATASET=true)
 └── Test/                             # trainModel.py, Converter.py, ImagePlayGround.py
@@ -232,7 +237,7 @@ ClearIC_Inspect/
 
 `IMAGE_ID` format: `YYYYMMDD_HHMMSS_NNN` (thread-safe counter).
 
-Output suffixes: `_G` (clean pass), `_GS` (suspect pass), `_NGS` (suspect NG), `_NG` (full NG). Threshold between `_GS` and `_NGS` is `TEXT_NG_THRESHOLD`. Clean-pass `_G` images are not saved by default.
+Output suffixes: `_G` (clean pass), `_GS` (suspect pass), `_NGS` (suspect NG), `_NG` (full NG). Threshold between `_GS` and `_NGS` is `TEXT_NG_THRESHOLD`. Clean-pass `_G` shots produce **zero disk writes** — raw frame is held in RAM and discarded.
 
 ---
 

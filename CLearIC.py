@@ -94,6 +94,8 @@ class ConfigLoader:
         "RETRY_W1":             0.3, # weight of Conf in retry decision (vs Text/NoText ratio) 
         "RETRY_PASS_THR":       0.90,   # weighted score threshold to call a retried cell PASS
         "BLOB_MIN_RATIO":       0.0,    # 0.0 = disabled; 0.2 removes small non-pin blobs from binary map
+        "TEMPLATE_MATCH_THR":   0.6,    # minimum match score for IC_A template matching
+        "TEMPLATE_FIND_CONF_THR": 0.4,  # minimum score to accept IC_B in auto-detection
     }
 
     @classmethod
@@ -174,6 +176,10 @@ class ConfigLoader:
             raise ConfigError("DATA_SPLIT must be 'train' or 'val'")
         if not (0.0 <= cfg["BLOB_MIN_RATIO"] <= 1.0):
             raise ConfigError("BLOB_MIN_RATIO must be 0.0–1.0")
+        if not (0.0 <= cfg["TEMPLATE_MATCH_THR"] <= 1.0):
+            raise ConfigError("TEMPLATE_MATCH_THR must be 0.0–1.0")
+        if not (0.0 <= cfg["TEMPLATE_FIND_CONF_THR"] <= 1.0):
+            raise ConfigError("TEMPLATE_FIND_CONF_THR must be 0.0–1.0")
         _w_sum = cfg["RETRY_W2"] + cfg["RETRY_W1"]
         if abs(_w_sum - 1.0) > 0.001:
             print(f"[Config] Warning: RETRY_W2 + RETRY_W1 = {_w_sum:.3f} (expected 1.0)")
@@ -3255,6 +3261,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         drawn_on_left = (rect.x() + rect.width() // 2) < img.shape[1] // 2
         second, _     = _find_second_ic(img, rect,
+                                        conf_thr=self._cfg.get("TEMPLATE_FIND_CONF_THR", 0.4),
                                         min_blob_ratio=self._cfg.get("BLOB_MIN_RATIO", 0.0))
 
         if drawn_on_left:
@@ -3399,7 +3406,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         img_h_tmpl, img_w_tmpl = (self._setup_image.shape[:2]
                                    if self._setup_image is not None else (0, 0))
-        TemplateManager.save(ic_a, ic_b, exposure, strip_h=strip_h_val,
+        TemplateManager.save(ic_a, ic_b, exposure,
+                             match_threshold=self._cfg.get("TEMPLATE_MATCH_THR", 0.6),
+                             strip_h=strip_h_val,
                              img_w=img_w_tmpl, img_h=img_h_tmpl)
 
         if self._setup_image is not None:

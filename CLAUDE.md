@@ -56,6 +56,8 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 | `WARMUP_FRAMES` | `5` | Classifier warmup passes on startup |
 | `RETRY_DELAY_MS` | `10` | Delay (ms) before retry grab on MarkMissingError |
 | `BLOB_MIN_RATIO` | `0.0` | Remove blobs < ratio × largest blob from `_contour_template` output; `0.0` = disabled; `0.2` removes IC-corner reflections |
+| `TEMPLATE_MATCH_THR` | `0.6` | Minimum match score for IC_A locate; below this logs a warning |
+| `TEMPLATE_FIND_CONF_THR` | `0.4` | Minimum match score to accept IC_B during auto-detection at setup |
 
 ### Grid geometry
 

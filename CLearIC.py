@@ -34,7 +34,7 @@ import fcntl
 import threading
 from enum import Enum
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import gc
 import cv2
@@ -81,7 +81,7 @@ class ConfigLoader:
         "DATA_DIR":             "Dataset",
         "DATA_SPLIT":           "train",
         "LOG_DIR":              "logs",
-        "LOG_RETENTION":        365,
+        "LOG_RETENTION":        730,   # days to keep log files (2 years)
         "ANN_BORDER_PX":        1,
         "RESULT_OVERLAY":      True,
         "WARMUP_FRAMES":        5,
@@ -140,7 +140,7 @@ class ConfigLoader:
         if not isinstance(cfg["COLLECT_DATASET"], bool):
             raise ConfigError("COLLECT_DATASET must be a boolean")
         if not isinstance(cfg["LOG_RETENTION"], int) or cfg["LOG_RETENTION"] < 1:
-            raise ConfigError("LOG_RETENTION must be a positive integer")
+            raise ConfigError("LOG_RETENTION must be a positive integer (days)")
         for pin_key in ("GPIO_START_PIN", "GPIO_BUSY_PIN",
                         "GPIO_END_PIN", "GPIO_INSPEC_STAGE_PIN"):
             if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
@@ -1333,11 +1333,13 @@ class Logger:
       File: logs/op_YYYYMMDD.csv
       Columns: timestamp, event, lot_number, detail, cycle_ms
 
-    Result log — one file per lot run, written incrementally.
-      File: logs/result_{lot}_{YYYYMMDD_HHMMSS}.csv
-      Header block: lot metadata rows.
-      Data rows: one per inspection.
-      Footer block: summary appended at lot end.
+    Result log — one file per calendar day, multiple lots appended.
+      File: logs/result_YYYYMMDD.csv
+      Each lot is bracketed by # --- LOT_START --- / # --- LOT_END --- markers.
+      Header block: lot metadata rows. Data rows: one per inspection.
+      Footer block: summary appended at lot end. Blank line between lots.
+
+    Both files rotate by age: files older than LOG_RETENTION days are deleted.
     """
 
     _OP_HEADER   = ["timestamp", "event", "lot_number", "detail", "cycle_ms"]
@@ -1362,13 +1364,17 @@ class Logger:
         return os.path.join(self._dir, f"op_{datetime.now():%Y%m%d}.csv")
 
     def _rotate(self):
-        for pattern in ("op_*.csv", "result_*.csv"):
-            logs = sorted(glob.glob(os.path.join(self._dir, pattern)))
-            while len(logs) > self._retention:
+        cutoff = datetime.now() - timedelta(days=self._retention)
+        for pattern, fmt in [
+            ("op_*.csv",     "op_%Y%m%d.csv"),
+            ("result_*.csv", "result_%Y%m%d.csv"),
+        ]:
+            for path in glob.glob(os.path.join(self._dir, pattern)):
                 try:
-                    os.remove(logs.pop(0))
-                except OSError:
-                    pass
+                    if datetime.strptime(os.path.basename(path), fmt) < cutoff:
+                        os.remove(path)
+                except (ValueError, OSError):
+                    pass  # skip legacy filenames or permission errors
 
     def _log_error(self, operation: str, exc: Exception) -> None:
         print(f"[Logger] {operation} failed: {exc}", file=sys.stderr)
@@ -1404,8 +1410,9 @@ class Logger:
         if not self._res_path:
             return
         try:
-            with open(self._res_path, "w", newline="", encoding="utf-8") as f:
+            with open(self._res_path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
+                w.writerow(["# --- LOT_START ---"])
                 w.writerow(["LOT_NUMBER", lot])
                 w.writerow(["PACKAGE",    package])
                 w.writerow(["START_TIME", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
@@ -1432,6 +1439,8 @@ class Logger:
                 w.writerow(["YIELD_PCT",   yield_])
                 w.writerow(["END_TIME",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 w.writerow(["DURATION_S",  round(elapsed_s, 1)])
+                w.writerow(["# --- LOT_END ---"])
+                w.writerow([])   # blank line between lots
         except Exception as e:
             self._log_error("result footer write", e)
 
@@ -1442,9 +1451,8 @@ class Logger:
         self._lot     = lot_number
         self._package = package
         self._pass_ct = self._fail_ct = self._err_ct = 0
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_lot = "".join(c if c.isalnum() or c in "-_" else "_" for c in lot_number)
-        self._res_path = os.path.join(self._dir, f"result_{safe_lot}_{ts}.csv")
+        self._res_path = os.path.join(
+            self._dir, f"result_{datetime.now():%Y%m%d}.csv")
         self._write_result_header(lot_number, package, mode)
         self._op_append("SESSION_START", f"mode={mode}")
 
@@ -1820,6 +1828,7 @@ class RunWorker(QtCore.QThread):
     sig_session_reset = QtCore.pyqtSignal(str) # batch complete → new lot_number
     sig_paused        = QtCore.pyqtSignal()
     sig_resumed       = QtCore.pyqtSignal()
+    sig_warn          = QtCore.pyqtSignal(str) # soft warning — run continues
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
@@ -1940,11 +1949,8 @@ class RunWorker(QtCore.QThread):
 
             img_id = _next_image_id()
 
-            # Save raw with temp name before result is known
             out_dir  = self._cfg.get("OUT_DIR", "Output/")
             real_dir, ann_dir = _output_dirs(out_dir, self._lot_number)
-            tmp_real = os.path.join(real_dir, f"{img_id}.jpg")
-            cv2.imwrite(tmp_real, img_bgr)
 
             self.sig_status.emit("Inspecting…")
 
@@ -1953,6 +1959,7 @@ class RunWorker(QtCore.QThread):
             miss_a      = []
             miss_b      = []
             ann         = img_bgr
+            raw_bgr     = img_bgr.copy()   # preserve unannotated frame; inspect() annotates in-place
 
             try:
                 self._inspector.inspect(img_bgr, debug=debug)
@@ -1961,10 +1968,6 @@ class RunWorker(QtCore.QThread):
             except TemplateError as te:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("TEMPLATE_ERROR", str(te), cycle_ms)
-                try:
-                    os.remove(tmp_real)
-                except OSError:
-                    pass
                 if cam_mode == "directory":
                     self.sig_status.emit(f"Skipping {img_id}: {te}")
                     continue
@@ -2014,10 +2017,6 @@ class RunWorker(QtCore.QThread):
                 self._logger.log_error("RUNTIME_ERROR", str(e), cycle_ms)
                 self.sig_error.emit(f"Unexpected error: {e}")
                 self.sig_status.emit("ERROR — machine blocked, restart required.")
-                try:
-                    os.remove(tmp_real)
-                except OSError:
-                    pass
                 if cam_mode == "camera":
                     self._gpio.clear_outputs()
                 break
@@ -2051,16 +2050,9 @@ class RunWorker(QtCore.QThread):
             final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
             ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")
             if save_image:
-                try:
-                    os.rename(tmp_real, final_real)
-                except OSError:
-                    final_real = tmp_real
+                cv2.imwrite(final_real, raw_bgr)
                 cv2.imwrite(ann_path, ann)
             else:
-                try:
-                    os.remove(tmp_real)
-                except OSError:
-                    pass
                 ann_path = ""
 
             # Emit signals and log
@@ -2096,6 +2088,16 @@ class RunWorker(QtCore.QThread):
             _cycle += 1
             if _cycle % 100 == 0:
                 gc.collect()
+
+            if _cycle % 500 == 0:
+                import shutil as _shutil
+                try:
+                    free_mb = _shutil.disk_usage(out_dir).free >> 20
+                    if free_mb < int(self._cfg.get("DISK_WARN_MB", 200)):
+                        self.sig_warn.emit(
+                            f"Low disk: {free_mb} MB free — free space or images may not save")
+                except OSError:
+                    pass
 
             # End-of-cycle: directory mode batch check
             if cam_mode != "camera":
@@ -3520,6 +3522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_session_reset.connect(self._on_session_reset)
         self._worker.sig_paused.connect(self._on_paused)
         self._worker.sig_resumed.connect(self._on_resumed)
+        self._worker.sig_warn.connect(self._show_error)
         self._worker.start()
         self._worker_last_tick = time.monotonic()
 

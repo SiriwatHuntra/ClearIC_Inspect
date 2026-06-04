@@ -830,12 +830,6 @@ _TEMPLATE_FILE    = "templates/template.json"
 _TEMPLATE_FULL    = "templates/tmpl_full.npy"
 _TEMPLATE_PREVIEW = "templates/template_preview.png"
 
-def _adaptive_binary(image_bgr: np.ndarray) -> np.ndarray:
-    """BGR → dense adaptive-threshold binary. Used for setup-time IC auto-detection."""
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 21, 5)
-
 def _safe_crop(image: np.ndarray, cx: int, cy: int,
                cw: int, ch: int) -> np.ndarray:
     ih, iw = image.shape[:2]

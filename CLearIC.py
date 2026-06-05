@@ -3209,7 +3209,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(
                 self, "Model Error",
                 f"Cannot load classifier model:\n\n{e}\n\n"
-                "Check that the model files exist and contact your administrator.")
+                "Check that the model files exist and contact System D&D.")
             QtCore.QTimer.singleShot(0, self.close)
             return
 

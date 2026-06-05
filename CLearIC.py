@@ -96,6 +96,10 @@ class ConfigLoader:
         "BLOB_MIN_RATIO":       0.0,    # 0.0 = disabled; 0.2 removes small non-pin blobs from binary map
         "TEMPLATE_MATCH_THR":   0.6,    # minimum match score for IC_A template matching
         "TEMPLATE_FIND_CONF_THR": 0.4,  # minimum score to accept IC_B in auto-detection
+        "LIGHTING_ENABLE":      False,
+        "LIGHTING_USB_ID":      "Prolific_Technology_Inc._USB-Serial_Controller",
+        "LIGHTING_PORT":        "/dev/ttyUSB1",
+        "LIGHTING_VALUE":       100,
     }
 
     @classmethod
@@ -535,6 +539,125 @@ class CellCon:
         except Exception as e:
             print(f"[CellCon] Error: {e} — check USB at {self._port}")
         return ""
+
+
+# PORT DETECTION
+def _detect_ports(usb_id_hint: str = "") -> dict:
+    """
+    Returns {"lighting": path|None, "cellcon": path|None}.
+    Lighting: resolved from /dev/serial/by-id/ by matching usb_id_hint.
+    CellCon:  LA\\r\\n probe on remaining ttyUSB ports (3 retries, 0.5 s each).
+    """
+    result = {"lighting": None, "cellcon": None}
+
+    # Lighting: claimed first by hardware identity
+    if usb_id_hint:
+        for link in glob.glob("/dev/serial/by-id/*"):
+            if usb_id_hint in os.path.basename(link):
+                result["lighting"] = os.path.realpath(link)
+                break
+
+    # CellCon: probe remaining ports
+    candidates = sorted(p for p in glob.glob("/dev/ttyUSB*")
+                        if p != result["lighting"])
+    for port in candidates:
+        try:
+            import serial as _serial
+            with _serial.Serial(port, 38400,
+                                parity=_serial.PARITY_NONE,
+                                stopbits=_serial.STOPBITS_ONE,
+                                bytesize=_serial.EIGHTBITS,
+                                timeout=0.5) as s:
+                s.write(b"LA\r\n")
+                for _ in range(3):
+                    line = s.readline().decode("utf-8", errors="ignore").strip()
+                    if line.startswith("LS"):
+                        result["cellcon"] = port
+                        break
+        except Exception:
+            pass
+        if result["cellcon"]:
+            break
+
+    light_str = result["lighting"] or "NOT FOUND"
+    cell_str  = result["cellcon"]  or "NOT FOUND"
+    print(f"[Ports] Lighting → {light_str}")
+    print(f"[Ports] CellCon  → {cell_str}")
+    return result
+
+
+# LIGHTING CONTROLLER
+class LightingController:
+    """Serial ring-light controller (RS232 over USB-Prolific, IFWFOCR01 protocol)."""
+    BAUD = 38400
+
+    def __init__(self, enabled: bool, port: str, value: int = 100):
+        self._enabled = enabled
+        self._ser     = None
+        self._busy    = False
+        self._kill    = False
+        if not enabled:
+            print("[Lighting] Disabled.")
+            return
+        try:
+            import serial as _serial
+            self._ser = _serial.Serial(
+                port=port, baudrate=self.BAUD,
+                parity=_serial.PARITY_NONE,
+                stopbits=_serial.STOPBITS_ONE,
+                bytesize=_serial.EIGHTBITS,
+                timeout=1)
+            threading.Thread(target=self._read_thread, daemon=True).start()
+            print(f"[Lighting] Port {port} OK.")
+        except Exception as e:
+            print(f"[Lighting] Port error: {e}")
+            self._enabled = False
+
+    def _read_thread(self):
+        while not self._kill:
+            try:
+                if self._ser and self._ser.readline():
+                    self._busy = False
+            except Exception:
+                pass
+
+    def _wait(self, timeout: float = 3.0):
+        t0 = time.time()
+        while self._busy:
+            if time.time() - t0 > timeout:
+                break
+            time.sleep(0.01)
+
+    def _send(self, data: bytes):
+        if not self._enabled or self._ser is None:
+            return
+        self._wait()
+        self._ser.write(data)
+        self._busy = True
+
+    @staticmethod
+    def _brightness_cmd(value: int) -> bytes:
+        value = max(0, min(255, value))
+        body  = f"@00F{value:03}00"
+        chk   = sum(body.encode("ascii")) & 0xFF
+        return (body + f"{chk:02X}\r\n").encode("ascii")
+
+    def set_brightness(self, value: int):
+        self._send(self._brightness_cmd(value))
+
+    def on(self):
+        self._send(b"@00L1007D\r\n")
+
+    def off(self):
+        self._send(b"@00L0007C\r\n")
+
+    def close(self):
+        self._kill = True
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
 
 
 # RASPBERRY IO
@@ -1453,7 +1576,7 @@ class Logger:
         except Exception as e:
             self._log_error("result write", e)
 
-    def _write_result_header(self, lot: str, package: str, mode: str):
+    def _write_result_header(self, lot: str, package: str, mode: str, hw_info: str = ""):
         if not self._res_path:
             return
         try:
@@ -1464,6 +1587,8 @@ class Logger:
                 w.writerow(["PACKAGE",    package])
                 w.writerow(["START_TIME", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 w.writerow(["MODE",       mode])
+                if hw_info:
+                    w.writerow(["HW_PORTS",  hw_info])
                 w.writerow([])                       # blank separator
                 w.writerow(self._RES_HEADER)
         except Exception as e:
@@ -1493,15 +1618,18 @@ class Logger:
 
     # public interface
 
-    def start_lot(self, lot_number: str, package: str, mode: str):
+    def start_lot(self, lot_number: str, package: str, mode: str, hw_info: str = ""):
         self._rotate()
         self._lot     = lot_number
         self._package = package
         self._pass_ct = self._fail_ct = self._err_ct = 0
         self._res_path = os.path.join(
             self._dir, f"result_{datetime.now():%Y%m%d}.csv")
-        self._write_result_header(lot_number, package, mode)
-        self._op_append("SESSION_START", f"mode={mode}")
+        self._write_result_header(lot_number, package, mode, hw_info)
+        detail = f"mode={mode}"
+        if hw_info:
+            detail += f" {hw_info}"
+        self._op_append("SESSION_START", detail)
 
     def end_lot(self, reason: str,
                 pass_ct: int, fail_ct: int, err_ct: int, elapsed_s: float):
@@ -2736,6 +2864,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detector:  Detector | None  = None
         self._inspector: Inspector | None = None
         self._gpio       = None
+        self._lighting:  LightingController | None = None
+        self._detected_ports: dict                 = {"lighting": None, "cellcon": None}
         self._logger            = Logger(
             log_dir=cfg.get("LOG_DIR", "logs"),
             log_retention=int(cfg.get("LOG_RETENTION", 365)))
@@ -2867,6 +2997,15 @@ class MainWindow(QtWidgets.QMainWindow):
         setup_lay.addWidget(self._btn_confirm_tmpl)
 
         self._view.rect_drawn.connect(self._on_rb_rect_drawn)
+
+        self._btn_redetect = QtWidgets.QPushButton("Re-detect Hardware")
+        self._btn_redetect.clicked.connect(self._on_redetect_click)
+        setup_lay.addWidget(self._btn_redetect)
+
+        self._lbl_hw_toast = QtWidgets.QLabel("")
+        self._lbl_hw_toast.setWordWrap(True)
+        self._lbl_hw_toast.setStyleSheet("font-size:10px; color:#FFD580")
+        setup_lay.addWidget(self._lbl_hw_toast)
 
         right_lay.addWidget(setup_frame)
 
@@ -3074,6 +3213,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self.close)
             return
 
+        self._lbl_status.setText("GPIO warmup…")
+        QtWidgets.QApplication.processEvents()
         try:
             self._gpio = RaspberryIO(
                 io_enabled=cfg.get("IO", False),
@@ -3128,7 +3269,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self._preview_timer.timeout.connect(self._on_preview_tick)
             self._preview_timer.start()
 
-        self._cellcon = CellCon(port=cfg.get("CELLCON_PORT", "/dev/ttyUSB0"))
+        # Port detection with visible feedback
+        self._lbl_status.setText("Detecting hardware…")
+        QtWidgets.QApplication.processEvents()
+        self._detected_ports = _detect_ports(cfg.get("LIGHTING_USB_ID", ""))
+
+        # Override CellCon port if auto-detect found one
+        cellcon_port = self._detected_ports["cellcon"] or cfg.get("CELLCON_PORT", "/dev/ttyUSB0")
+        if self._detected_ports["cellcon"]:
+            self._cfg["CELLCON_PORT"] = cellcon_port
+        self._cellcon = CellCon(port=cellcon_port)
+
+        # Lighting init
+        lighting_enabled = cfg.get("LIGHTING_ENABLE", False)
+        lighting_port    = self._detected_ports["lighting"] or cfg.get("LIGHTING_PORT", "/dev/ttyUSB1")
+        self._lighting   = LightingController(
+            enabled=lighting_enabled,
+            port=lighting_port,
+            value=cfg.get("LIGHTING_VALUE", 100),
+        )
+        if lighting_enabled:
+            self._lighting.set_brightness(cfg.get("LIGHTING_VALUE", 100))
+
+        # Hardware toast
+        parts = []
+        if lighting_enabled:
+            parts.append("Light " + ("OK" if self._detected_ports["lighting"] else "NOT FOUND ⚠"))
+        parts.append("CellCon " + (cellcon_port if self._detected_ports["cellcon"] else "NOT FOUND ⚠"))
+        hw_msg = " | ".join(parts)
+        self._lbl_hw_toast.setText(hw_msg)
 
         # Build Inspector from existing template (silent no-op if template absent)
         self._rebuild_inspector()
@@ -3205,11 +3374,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._camera is None:
             self._show_error("Camera not ready.")
             return None
+        if self._lighting:
+            self._lighting.on()
         try:
-            return self._camera.grab_first()
+            img = self._camera.grab_first()
+            return img
         except CameraError as e:
             self._show_error(str(e))
             return None
+        finally:
+            if self._lighting:
+                self._lighting.off()
 
     def _on_new_tmpl_click(self):
         if self._setup_state == 'idle':
@@ -3527,7 +3702,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             pass
 
         mode = "DEBUG" if self._cfg.get("DEBUG", True) else "RUN"
-        self._logger.start_lot(self._lot_number, self._package_name, mode)
+        hw_info = (
+            f"lighting={self._detected_ports.get('lighting') or 'N/A'} "
+            f"cellcon={self._detected_ports.get('cellcon') or 'N/A'}"
+        )
+        self._logger.start_lot(self._lot_number, self._package_name, mode, hw_info)
 
         gpio = self._gpio or RaspberryIO(io_enabled=False)
 
@@ -3578,6 +3757,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_warn.connect(self._show_error)
         self._worker.start()
         self._worker_last_tick = time.monotonic()
+        if self._lighting:
+            self._lighting.on()
 
         self._run_state = "running"
         self._btn_action.setText("Trigger" if self._is_mock_trigger_mode() else "Pause")
@@ -3809,6 +3990,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_error.setText("0")
         self._lbl_yield.setText("—")
         self._lbl_status.setText("Standby.")
+        if self._lighting:
+            self._lighting.off()
         self._reload_default_image()
         if self._preview_timer:
             self._preview_timer.start()
@@ -3881,11 +4064,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self._error_lbl.setText(f"Error: {msg}")
         self._error_banner.show()
 
+    def _on_redetect_click(self):
+        if self._run_state != "standby":
+            return
+        self._lbl_hw_toast.setText("Detecting…")
+        QtWidgets.QApplication.processEvents()
+
+        ports = _detect_ports(self._cfg.get("LIGHTING_USB_ID", ""))
+        self._detected_ports = ports
+
+        if ports["cellcon"]:
+            self._cfg["CELLCON_PORT"] = ports["cellcon"]
+            self._cellcon = CellCon(port=ports["cellcon"])
+
+        if ports["lighting"] and self._cfg.get("LIGHTING_ENABLE", False):
+            if self._lighting:
+                self._lighting.close()
+            self._lighting = LightingController(
+                enabled=True,
+                port=ports["lighting"],
+                value=self._cfg.get("LIGHTING_VALUE", 100),
+            )
+            self._lighting.set_brightness(self._cfg.get("LIGHTING_VALUE", 100))
+
+        parts = []
+        if self._cfg.get("LIGHTING_ENABLE", False):
+            parts.append("Light " + ("OK" if ports["lighting"] else "NOT FOUND ⚠"))
+        parts.append("CellCon " + (ports["cellcon"] or "NOT FOUND ⚠"))
+        self._lbl_hw_toast.setText(" | ".join(parts))
+
     # Close
     def closeEvent(self, e):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)
+        if self._lighting:
+            self._lighting.off()
+            self._lighting.close()
         if self._camera:
             self._camera.close()
         if self._gpio:

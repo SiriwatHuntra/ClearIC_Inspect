@@ -135,6 +135,21 @@ RETRY_DELAY_MS = 10
 WARMUP_FRAMES = 5
 
 
+# ─── Lighting ────────────────────────────────────────────────────────────────
+# true = drive serial lighting controller; false = skip entirely
+LIGHTING_ENABLE = true
+
+# Partial string to match in /dev/serial/by-id/ to identify lighting adapter
+# Set to "" to fall back to LIGHTING_PORT
+LIGHTING_USB_ID = "Prolific_Technology_Inc._USB-Serial_Controller"
+
+# Static fallback port when LIGHTING_USB_ID is blank or not matched
+LIGHTING_PORT = "/dev/ttyUSB1"
+
+# Brightness level 0–255 set at startup, held for the entire run
+LIGHTING_VALUE = 100
+
+
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────
 # IN — active HIGH 10 ms pulse — machine signals ready for one shot
 GPIO_START_PIN = 17

@@ -267,6 +267,10 @@ class TemplateError(_SystemError):
 class GPIOError(_SystemError):
     pass
 
+class LowMatchError(InspectionError):
+    """Template match score too low to trust — skip this frame, not fatal."""
+    pass
+
 class ConfigError(InspectionError):
     pass
 
@@ -1395,6 +1399,9 @@ class Inspector:
         # Phase 1: locate ICs
         if self._template_matcher is not None:
             rt_a, score = self._template_matcher.locate_ic(image_bgr)
+            if score < self._template_matcher._threshold:
+                raise LowMatchError(
+                    f"Template match {score:.3f} < {self._template_matcher._threshold:.3f} — frame skipped")
             rt_b = QtCore.QRect(
                 rt_a.x() + ic_b_dx, rt_a.y() + ic_b_dy,
                 ic_b_s["w"], ic_b_s["h"],
@@ -2153,6 +2160,15 @@ class RunWorker(QtCore.QThread):
             try:
                 self._inspector.inspect(img_bgr, debug=debug)
                 # pass — img_bgr annotated in-place; miss_a/miss_b stay []
+
+            except LowMatchError as lme:
+                # Transient bad frame — skip this cycle, do not break the loop
+                self.sig_status.emit(f"Low match — skipped. ({lme})")
+                if cam_mode == "camera":
+                    self._gpio.set_busy(False)
+                    if self._lighting:
+                        self._lighting.off()
+                continue
 
             except TemplateError as te:
                 cycle_ms = (time.perf_counter() - t0) * 1000

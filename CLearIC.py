@@ -2055,6 +2055,15 @@ class RunWorker(QtCore.QThread):
 
         if cam_mode == "camera":
             self._gpio.clear_outputs()  # ensure known-idle state before first cycle
+            try:
+                self._camera.open()
+                self._camera.warmup()
+            except CameraError as e:
+                self.sig_error.emit(f"Camera error: {e}")
+                self.sig_status.emit("ERROR — camera failed to open, restart required.")
+                self.sig_done.emit()
+                self.sig_status.emit("Standby.")
+                return
 
         while not self._stop:
 
@@ -2076,34 +2085,8 @@ class RunWorker(QtCore.QThread):
                     break
 
                 self._gpio.set_busy(True)
-
-                # Flash lighting and open camera for this snap
                 if self._lighting:
                     self._lighting.on()
-                try:
-                    self._camera.open()
-                    self._camera.warmup()
-                except CameraError as e:
-                    self._logger.log_error("CAMERA_ERROR", str(e), 0)
-                    reconnected = False
-                    for attempt in range(reconnect_attempts):
-                        self.sig_status.emit(
-                            f"Camera open failed — retrying {attempt + 1}/{reconnect_attempts}…")
-                        time.sleep(reconnect_delay)
-                        try:
-                            self._camera.open()
-                            self._camera.warmup()
-                            reconnected = True
-                            break
-                        except CameraError:
-                            pass
-                    if not reconnected:
-                        self.sig_error.emit(f"Camera error: {e}")
-                        self.sig_status.emit("ERROR — camera lost, restart required.")
-                        self._gpio.clear_outputs()
-                        if self._lighting:
-                            self._lighting.off()
-                        break
             else:
                 # Auto directory: brief yield then check stop
                 time.sleep(0.05)
@@ -2128,12 +2111,27 @@ class RunWorker(QtCore.QThread):
                         return
                     self.sig_status.emit(f"Skipping unreadable image: {_emsg}")
                     continue
-                # Camera mode: close and let next START trigger a fresh open+warmup
+                # Camera mode: attempt reconnect then continue
+                self.sig_status.emit("Camera grab failed — reconnecting…")
                 if self._camera.is_open():
                     self._camera.close()
-                if self._lighting:
-                    self._lighting.off()
-                self.sig_status.emit("Camera grab failed — will retry on next START.")
+                reconnected = False
+                for attempt in range(reconnect_attempts):
+                    time.sleep(reconnect_delay)
+                    self.sig_status.emit(
+                        f"Reconnecting {attempt + 1}/{reconnect_attempts}…")
+                    try:
+                        self._camera.open()
+                        self._camera.warmup()
+                        reconnected = True
+                        break
+                    except CameraError:
+                        pass
+                if not reconnected:
+                    self.sig_error.emit("Camera lost — restart required.")
+                    if self._lighting:
+                        self._lighting.off()
+                    break
                 self._gpio.set_busy(False)
                 continue
 
@@ -2150,6 +2148,7 @@ class RunWorker(QtCore.QThread):
             miss_b      = []
             ann         = img_bgr
             raw_bgr     = img_bgr.copy()   # preserve unannotated frame; inspect() annotates in-place
+            self.sig_image.emit(raw_bgr)   # show raw frame immediately after capture
 
             try:
                 self._inspector.inspect(img_bgr, debug=debug)
@@ -2254,7 +2253,7 @@ class RunWorker(QtCore.QThread):
                 ann_path = ""
 
             # Emit signals and log
-            self.sig_image.emit(img_bgr)
+            self.sig_image.emit(ann)
             self.sig_cycle_ms.emit(cycle_ms)
 
             if passed:
@@ -2277,9 +2276,9 @@ class RunWorker(QtCore.QThread):
                 self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH
-                self._camera.close()                              # close until next START snap
                 if self._lighting:
                     self._lighting.off()
+                # camera stays open — closed at lot end by exit guard
 
             try:
                 del img_bgr

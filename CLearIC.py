@@ -96,7 +96,7 @@ class ConfigLoader:
         "BLOB_MIN_RATIO":       0.0,    # 0.0 = disabled; 0.2 removes small non-pin blobs from binary map
         "TEMPLATE_MATCH_THR":   0.6,    # minimum match score for IC_A template matching
         "TEMPLATE_FIND_CONF_THR": 0.4,  # minimum score to accept IC_B in auto-detection
-        "LIGHTING_ENABLE":      False,
+        "LIGHTING_ENABLE":      true,
         "LIGHTING_USB_ID":      "Prolific_Technology_Inc._USB-Serial_Controller",
         "LIGHTING_PORT":        "/dev/ttyUSB1",
         "LIGHTING_VALUE":       100,

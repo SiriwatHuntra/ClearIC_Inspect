@@ -2047,15 +2047,6 @@ class RunWorker(QtCore.QThread):
         reconnect_attempts = int(self._cfg.get("RECONNECT_ATTEMPTS", 3))
         reconnect_delay   = float(self._cfg.get("RECONNECT_DELAY_S", 5.0))
 
-        # Camera preflight — verify camera is reachable before entering the loop.
-        if cam_mode == "camera":
-            try:
-                self._camera.grab_first()
-            except CameraError as e:
-                self.sig_error.emit(f"Camera not found: {e}")
-                self.sig_status.emit("ERROR — camera not found, cannot run.")
-                return
-
         self.sig_status.emit("Running…")
         _reset_image_counter()
         _cycle = 0
@@ -2083,6 +2074,30 @@ class RunWorker(QtCore.QThread):
                     break
 
                 self._gpio.set_busy(True)
+
+                # Open camera for this snap
+                try:
+                    self._camera.open()
+                    self._camera.warmup()
+                except CameraError as e:
+                    self._logger.log_error("CAMERA_ERROR", str(e), 0)
+                    reconnected = False
+                    for attempt in range(reconnect_attempts):
+                        self.sig_status.emit(
+                            f"Camera open failed — retrying {attempt + 1}/{reconnect_attempts}…")
+                        time.sleep(reconnect_delay)
+                        try:
+                            self._camera.open()
+                            self._camera.warmup()
+                            reconnected = True
+                            break
+                        except CameraError:
+                            pass
+                    if not reconnected:
+                        self.sig_error.emit(f"Camera error: {e}")
+                        self.sig_status.emit("ERROR — camera lost, restart required.")
+                        self._gpio.clear_outputs()
+                        break
             else:
                 # Auto directory: brief yield then check stop
                 time.sleep(0.05)
@@ -2107,20 +2122,12 @@ class RunWorker(QtCore.QThread):
                         return
                     self.sig_status.emit(f"Skipping unreadable image: {_emsg}")
                     continue
-                # Camera mode: attempt reconnect before giving up
-                reconnected = False
-                for attempt in range(reconnect_attempts):
-                    self.sig_status.emit(
-                        f"Camera lost — reconnecting {attempt + 1}/{reconnect_attempts}…")
-                    if self._camera.reconnect(1, reconnect_delay):
-                        reconnected = True
-                        break
-                if reconnected:
-                    continue   # retry this cycle
-                self.sig_error.emit(f"Camera error: {e}")
-                self.sig_status.emit("ERROR — camera lost, restart required.")
-                self._gpio.clear_outputs()
-                break
+                # Camera mode: close and let next START trigger a fresh open+warmup
+                if self._camera.is_open():
+                    self._camera.close()
+                self.sig_status.emit("Camera grab failed — will retry on next START.")
+                self._gpio.set_busy(False)
+                continue
 
             img_id = _next_image_id()
 
@@ -2149,6 +2156,8 @@ class RunWorker(QtCore.QThread):
                 self.sig_error.emit(f"Template error: {te}")
                 self.sig_status.emit("ERROR — template invalid, restart required.")
                 self._gpio.clear_outputs()
+                if self._camera.is_open():
+                    self._camera.close()
                 break
 
             except MarkMissingError as e1:
@@ -2194,6 +2203,8 @@ class RunWorker(QtCore.QThread):
                 self.sig_status.emit("ERROR — machine blocked, restart required.")
                 if cam_mode == "camera":
                     self._gpio.clear_outputs()
+                    if self._camera.is_open():
+                        self._camera.close()
                 break
 
             # Finalize paths and save
@@ -2254,6 +2265,7 @@ class RunWorker(QtCore.QThread):
                 self._gpio.pulse_end_pin()                        # LOW 40 ms → machine reads INSPEC_STAGE
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH
+                self._camera.close()                              # close until next START snap
 
             try:
                 del img_bgr
@@ -2294,6 +2306,8 @@ class RunWorker(QtCore.QThread):
 
         if cam_mode == "camera":
             self._gpio.clear_outputs()
+            if self._camera.is_open():
+                self._camera.close()
         self.sig_done.emit()   # always emit; _on_run_done guards against double-call
         self.sig_status.emit("Standby.")
 
@@ -3736,6 +3750,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Create and start RunWorker. Lock OCR fields for the duration of the run."""
         if self._preview_timer:
             self._preview_timer.stop()
+        if self._camera and self._camera.is_open():
+            self._camera.close()
         self._edit_op_number.setReadOnly(True)
         self._edit_ocr_expect.setReadOnly(True)
         self._worker = RunWorker(
@@ -3994,7 +4010,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lighting.off()
         self._reload_default_image()
         if self._preview_timer:
-            self._preview_timer.start()
+            self._preview_timer.stop()
 
     def _reload_default_image(self):
         """Display the first image (or a live grab) and rewind the index."""

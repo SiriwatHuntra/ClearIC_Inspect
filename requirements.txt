@@ -9,3 +9,5 @@
 # ── pip-installed inside the venv ───────────────────────────────────────────
 openvino                # OpenVINO runtime for YOLO inference
 pypylon                 # Basler Pylon Python binding (requires Pylon SDK system install)
+pyserial                # Serial port access — CellCon lot tracker + lighting controller
+tomlkit                 # TOML read/write with comment preservation — Config.toml

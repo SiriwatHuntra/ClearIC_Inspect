@@ -569,8 +569,9 @@ class LightingController:
     BAUD = 38400
 
     def __init__(self, enabled: bool, port: str, value: int = 100):
-        self._enabled = enabled
-        self._ser     = None
+        self._enabled       = enabled
+        self._ser           = None
+        self._controller_ok = False
         if not enabled:
             print("[Lighting] Disabled.")
             return
@@ -582,10 +583,38 @@ class LightingController:
                 stopbits=_serial.STOPBITS_ONE,
                 bytesize=_serial.EIGHTBITS,
                 timeout=1)
-            print(f"[Lighting] Port {port} OK.")
+            # Probe: send off command and read ACK to confirm controller is alive
+            self._ser.reset_input_buffer()
+            self._ser.write(b"@00L0007C\r\n")
+            resp = self._ser.read(32)
+            self._controller_ok = bool(resp)
+            if self._controller_ok:
+                print(f"[Lighting] Port {port} OK — controller responding.")
+            else:
+                print(f"[Lighting] Port {port} open but no response from controller ⚠")
         except Exception as e:
             print(f"[Lighting] Port error: {e}")
             self._enabled = False
+
+    @property
+    def controller_ok(self) -> bool:
+        return self._controller_ok
+
+    def probe(self, timeout_s: float = 0.2) -> bool:
+        """Send off command and read ACK. Returns True if controller responds."""
+        if not self._enabled or self._ser is None:
+            return False
+        try:
+            prev_timeout = self._ser.timeout
+            self._ser.timeout = timeout_s
+            self._ser.reset_input_buffer()
+            self._ser.write(b"@00L0007C\r\n")
+            resp = self._ser.read(32)
+            self._ser.timeout = prev_timeout
+            self._controller_ok = bool(resp)
+        except Exception:
+            self._controller_ok = False
+        return self._controller_ok
 
     def _send(self, data: bytes):
         if not self._enabled or self._ser is None:
@@ -2137,7 +2166,13 @@ class RunWorker(QtCore.QThread):
                 if cam_mode == "camera":
                     is_retry = True
                     retry_delay = self._cfg.get("RETRY_DELAY_MS", 250) / 1000
-                    time.sleep(retry_delay)
+                    # Lighting cycle: off → probe → on before re-grab
+                    if self._lighting:
+                        self._lighting.off()
+                        if not self._lighting.probe():
+                            self.sig_status.emit("Retry: lighting no response ⚠")
+                        self._lighting.on()
+                    time.sleep(retry_delay)   # camera exposure settles under fresh lighting
                     try:
                         img_bgr2 = self._camera.grab()
                         try:
@@ -3287,7 +3322,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Hardware toast
         parts = []
         if lighting_enabled:
-            parts.append("Light " + ("OK" if self._detected_ports["lighting"] else "NOT FOUND ⚠"))
+            if self._lighting and self._lighting.controller_ok:
+                _light_status = "OK"
+            elif self._detected_ports["lighting"]:
+                _light_status = "NO RESPONSE ⚠"
+            else:
+                _light_status = "NOT FOUND ⚠"
+            parts.append("Light " + _light_status)
         parts.append("CellCon " + (cellcon_port if self._detected_ports["cellcon"] else "NOT FOUND ⚠"))
         hw_msg = " | ".join(parts)
         self._lbl_hw_toast.setText(hw_msg)
@@ -4081,7 +4122,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         parts = []
         if self._cfg.get("LIGHTING_ENABLE", False):
-            parts.append("Light " + ("OK" if ports["lighting"] else "NOT FOUND ⚠"))
+            if self._lighting and self._lighting.controller_ok:
+                _light_status = "OK"
+            elif ports["lighting"]:
+                _light_status = "NO RESPONSE ⚠"
+            else:
+                _light_status = "NOT FOUND ⚠"
+            parts.append("Light " + _light_status)
         parts.append("CellCon " + (ports["cellcon"] or "NOT FOUND ⚠"))
         self._lbl_hw_toast.setText(" | ".join(parts))
 

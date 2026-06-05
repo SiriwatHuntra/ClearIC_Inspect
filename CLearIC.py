@@ -389,7 +389,7 @@ class Camera:
         """Return BGR ndarray or raise CameraError."""
         for attempt in range(self._retries + 1):
             try:
-                img = self._grab_once()
+                img = self._grab_basler() if self._mode == "camera" else self._grab_directory()
                 if img is not None:
                     return img
             except CameraError:
@@ -400,12 +400,6 @@ class Camera:
                 else:
                     raise CameraError(f"Grab failed after retries: {e}")
         raise CameraError("Grab returned None after retries")
-
-    def _grab_once(self) -> np.ndarray:
-        if self._mode == "camera":
-            return self._grab_basler()
-        else:
-            return self._grab_directory()
 
     def _grab_basler(self) -> np.ndarray:
         if self._camera is None:
@@ -462,31 +456,10 @@ class Camera:
             self._camera = None
         print("[Camera] Closed.")
 
-    def reconnect(self, attempts: int = 1, delay_s: float = 0.0) -> bool:
-        """Close and re-open the Basler camera. Returns True on success."""
-        if self._mode != "camera":
-            return False
-        for _ in range(max(1, attempts)):
-            self.close()
-            if delay_s > 0:
-                time.sleep(delay_s)
-            try:
-                self._open_basler()
-                self.warmup()
-                print("[Camera] Reconnected.")
-                return True
-            except CameraError as e:
-                print(f"[Camera] Reconnect attempt failed: {e}")
-        return False
-
     def is_open(self) -> bool:
         if self._mode == "camera":
             return self._camera is not None and self._camera.IsOpen()
         return bool(self._files)
-
-    def is_healthy(self) -> bool:
-        """True if camera is open and ready to accept triggers."""
-        return self.is_open()
 
     def has_more(self) -> bool:
         """Directory mode: True if there are still un-visited images this cycle."""
@@ -598,8 +571,6 @@ class LightingController:
     def __init__(self, enabled: bool, port: str, value: int = 100):
         self._enabled = enabled
         self._ser     = None
-        self._busy    = False
-        self._kill    = False
         if not enabled:
             print("[Lighting] Disabled.")
             return
@@ -611,33 +582,15 @@ class LightingController:
                 stopbits=_serial.STOPBITS_ONE,
                 bytesize=_serial.EIGHTBITS,
                 timeout=1)
-            threading.Thread(target=self._read_thread, daemon=True).start()
             print(f"[Lighting] Port {port} OK.")
         except Exception as e:
             print(f"[Lighting] Port error: {e}")
             self._enabled = False
 
-    def _read_thread(self):
-        while not self._kill:
-            try:
-                if self._ser and self._ser.readline():
-                    self._busy = False
-            except Exception:
-                pass
-
-    def _wait(self, timeout: float = 3.0):
-        t0 = time.time()
-        while self._busy:
-            if time.time() - t0 > timeout:
-                break
-            time.sleep(0.01)
-
     def _send(self, data: bytes):
         if not self._enabled or self._ser is None:
             return
-        self._wait()
         self._ser.write(data)
-        self._busy = True
 
     @staticmethod
     def _brightness_cmd(value: int) -> bytes:
@@ -656,7 +609,6 @@ class LightingController:
         self._send(b"@00L0007C\r\n")
 
     def close(self):
-        self._kill = True
         if self._ser:
             try:
                 self._ser.close()
@@ -1270,10 +1222,6 @@ class TemplateMatcher:
         abs_x = loc[0] + rx1
         abs_y = loc[1] + ry1
         found_ic_y = abs_y + strip_h
-
-        if score < self._threshold:
-            print(f"[TemplateMatcher] Low match score {score:.3f} < {self._threshold:.3f} — "
-                  "using best-match position anyway")
 
         return QtCore.QRect(abs_x, found_ic_y, ic_w, ic_h), float(score)
 

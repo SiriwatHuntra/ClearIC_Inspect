@@ -2007,7 +2007,8 @@ class RunWorker(QtCore.QThread):
 
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
-                 cfg: dict, lot_number: str = "", parent=None):
+                 cfg: dict, lot_number: str = "",
+                 lighting=None, parent=None):
         super().__init__(parent)
         self._camera     = camera
         self._inspector  = inspector
@@ -2015,6 +2016,7 @@ class RunWorker(QtCore.QThread):
         self._logger     = logger
         self._cfg        = cfg
         self._lot_number = lot_number
+        self._lighting   = lighting
         self._stop    = False
         self._running = threading.Event()
         self._running.set()
@@ -2075,7 +2077,9 @@ class RunWorker(QtCore.QThread):
 
                 self._gpio.set_busy(True)
 
-                # Open camera for this snap
+                # Flash lighting and open camera for this snap
+                if self._lighting:
+                    self._lighting.on()
                 try:
                     self._camera.open()
                     self._camera.warmup()
@@ -2097,6 +2101,8 @@ class RunWorker(QtCore.QThread):
                         self.sig_error.emit(f"Camera error: {e}")
                         self.sig_status.emit("ERROR — camera lost, restart required.")
                         self._gpio.clear_outputs()
+                        if self._lighting:
+                            self._lighting.off()
                         break
             else:
                 # Auto directory: brief yield then check stop
@@ -2125,6 +2131,8 @@ class RunWorker(QtCore.QThread):
                 # Camera mode: close and let next START trigger a fresh open+warmup
                 if self._camera.is_open():
                     self._camera.close()
+                if self._lighting:
+                    self._lighting.off()
                 self.sig_status.emit("Camera grab failed — will retry on next START.")
                 self._gpio.set_busy(False)
                 continue
@@ -2158,6 +2166,8 @@ class RunWorker(QtCore.QThread):
                 self._gpio.clear_outputs()
                 if self._camera.is_open():
                     self._camera.close()
+                if self._lighting:
+                    self._lighting.off()
                 break
 
             except MarkMissingError as e1:
@@ -2205,6 +2215,8 @@ class RunWorker(QtCore.QThread):
                     self._gpio.clear_outputs()
                     if self._camera.is_open():
                         self._camera.close()
+                    if self._lighting:
+                        self._lighting.off()
                 break
 
             # Finalize paths and save
@@ -2266,6 +2278,8 @@ class RunWorker(QtCore.QThread):
                 self._gpio.set_busy(False)                        # BUSY LOW after END pulse done
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH
                 self._camera.close()                              # close until next START snap
+                if self._lighting:
+                    self._lighting.off()
 
             try:
                 del img_bgr
@@ -2308,6 +2322,8 @@ class RunWorker(QtCore.QThread):
             self._gpio.clear_outputs()
             if self._camera.is_open():
                 self._camera.close()
+            if self._lighting:
+                self._lighting.off()
         self.sig_done.emit()   # always emit; _on_run_done guards against double-call
         self.sig_status.emit("Standby.")
 
@@ -3756,7 +3772,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._edit_ocr_expect.setReadOnly(True)
         self._worker = RunWorker(
             self._camera, inspector, gpio,
-            self._logger, self._cfg, lot_number=self._lot_number)
+            self._logger, self._cfg, lot_number=self._lot_number,
+            lighting=self._lighting)
         self._worker.sig_image.connect(self._on_image)
         self._worker.sig_result.connect(self._on_result)
         self._worker.sig_fail.connect(self._on_fail)
@@ -3773,8 +3790,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.sig_warn.connect(self._show_error)
         self._worker.start()
         self._worker_last_tick = time.monotonic()
-        if self._lighting:
-            self._lighting.on()
 
         self._run_state = "running"
         self._btn_action.setText("Trigger" if self._is_mock_trigger_mode() else "Pause")
@@ -4006,8 +4021,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_error.setText("0")
         self._lbl_yield.setText("—")
         self._lbl_status.setText("Standby.")
-        if self._lighting:
-            self._lighting.off()
         self._reload_default_image()
         if self._preview_timer:
             self._preview_timer.stop()

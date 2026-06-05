@@ -79,6 +79,12 @@ RETRY_PASS_THR = 0.90
 # Set to 0.2 to eliminate IC-corner reflections from the pin-patch template.
 BLOB_MIN_RATIO = 0.0
 
+# Minimum template match score for IC_A locate; below this logs a warning (0.0–1.0).
+TEMPLATE_MATCH_THR = 0.6
+
+# Minimum match score to accept IC_B during auto-detection at setup time (0.0–1.0).
+TEMPLATE_FIND_CONF_THR = 0.4
+
 # ─── Grid Geometry ───────────────────────────────────────────────────────────
 # Shrink IC bounding rect before splitting into cells (centred, e.g. 0.95 = 5% trim)
 CELL_SHRINK = 0.95

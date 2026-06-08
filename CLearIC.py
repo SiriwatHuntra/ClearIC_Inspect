@@ -100,6 +100,7 @@ class ConfigLoader:
         "LIGHTING_USB_ID":      "Prolific_Technology_Inc._USB-Serial_Controller",
         "LIGHTING_PORT":        "/dev/ttyUSB1",
         "LIGHTING_VALUE":       100,
+        "LIGHTING_TEST":        False,  # debug-only: flash lighting per loaded image in directory mode (mocks capture flash)
     }
 
     @classmethod
@@ -2030,6 +2031,11 @@ class RunWorker(QtCore.QThread):
     def run(self):
         cam_mode          = self._cfg.get("CAMERA", "directory")
         debug             = self._cfg.get("DEBUG", True)
+        # Debug-only directory-mode mock: flash lighting per loaded image,
+        # standing in for the on/off cycle a real camera capture would trigger
+        lighting_test     = (cam_mode != "camera" and debug
+                             and self._cfg.get("LIGHTING_TEST", False)
+                             and self._lighting is not None)
         reconnect_attempts = int(self._cfg.get("RECONNECT_ATTEMPTS", 3))
         reconnect_delay   = float(self._cfg.get("RECONNECT_DELAY_S", 5.0))
 
@@ -2076,6 +2082,8 @@ class RunWorker(QtCore.QThread):
                 time.sleep(0.05)
                 if self._stop:
                     break
+                if lighting_test:
+                    self._lighting.on()
 
             # Capture guard
             if self._stop:
@@ -2091,8 +2099,12 @@ class RunWorker(QtCore.QThread):
                 if cam_mode == "directory":
                     _emsg = str(e)
                     if "No files" in _emsg:
+                        if lighting_test:
+                            self._lighting.off()
                         self.sig_error.emit("No images in Input/ folder — add images and restart.")
                         return
+                    if lighting_test:
+                        self._lighting.off()
                     self.sig_status.emit(f"Skipping unreadable image: {_emsg}")
                     continue
                 # Camera mode: attempt reconnect then continue
@@ -2145,12 +2157,16 @@ class RunWorker(QtCore.QThread):
                     self._gpio.set_busy(False)
                     if self._lighting:
                         self._lighting.off()
+                elif lighting_test:
+                    self._lighting.off()
                 continue
 
             except TemplateError as te:
                 cycle_ms = (time.perf_counter() - t0) * 1000
                 self._logger.log_error("TEMPLATE_ERROR", str(te), cycle_ms)
                 if cam_mode == "directory":
+                    if lighting_test:
+                        self._lighting.off()
                     self.sig_status.emit(f"Skipping {img_id}: {te}")
                     continue
                 self.sig_error.emit(f"Template error: {te}")
@@ -2278,6 +2294,8 @@ class RunWorker(QtCore.QThread):
                 if self._lighting:
                     self._lighting.off()
                 # camera stays open — closed at lot end by exit guard
+            elif lighting_test:
+                self._lighting.off()
 
             try:
                 del img_bgr

@@ -149,6 +149,11 @@ LIGHTING_PORT = "/dev/ttyUSB1"
 # Brightness level 0–255 set at startup, held for the entire run
 LIGHTING_VALUE = 100
 
+# Debug-only, directory-mode test: flash lighting on/off as each Input/ image
+# loads, mocking the on/off cycle a real camera capture would trigger.
+# Requires DEBUG = true and USE_CAMERA = false; ignored in live camera mode.
+LIGHTING_TEST = false
+
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────
 # IN — active HIGH 10 ms pulse — machine signals ready for one shot

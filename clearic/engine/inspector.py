@@ -7,7 +7,7 @@ from PyQt5 import QtCore
 
 from ..utils.exceptions import MarkMissingError, TemplateError, LowMatchError
 from .detector import Detector
-from .template import TemplateMatcher, _build_cells, _safe_crop
+from .template import TemplateMatcher, _build_cells, _safe_crop, _scale_rect
 
 
 # Dataset collection run counter
@@ -102,12 +102,8 @@ class Inspector:
         ic_b_dx = int(self._ic_b_dx_tmpl * sx)
         ic_b_dy = int(self._ic_b_dy_tmpl * sy)
 
-        def _scale_r(r):
-            return {"x": int(r["x"] * sx), "y": int(r["y"] * sy),
-                    "w": max(1, int(r["w"] * sx)), "h": max(1, int(r["h"] * sy))}
-
-        ic_a_s = _scale_r(self._template["ic_a"])
-        ic_b_s = _scale_r(self._template["ic_b"])
+        ic_a_s = _scale_rect(self._template["ic_a"], sx, sy)
+        ic_b_s = _scale_rect(self._template["ic_b"], sx, sy)
 
         # Guard: verify image is large enough to cover both scaled IC regions
         min_w = max(ic_a_s["x"] + ic_a_s["w"], ic_b_s["x"] + ic_b_s["w"])

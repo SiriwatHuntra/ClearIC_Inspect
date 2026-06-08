@@ -64,6 +64,18 @@ def _safe_crop(image: np.ndarray, cx: int, cy: int,
     return image[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
 
 
+def _scaled(v, scale, min_val=None):
+    """Scale a single dimension; clamp to min_val if given (e.g. to avoid zero-size geometry)."""
+    r = int(v * scale)
+    return max(min_val, r) if min_val is not None else r
+
+
+def _scale_rect(r: dict, sx: float, sy: float) -> dict:
+    """Scale a {x, y, w, h} rect dict from template-resolution to current-image-resolution."""
+    return {"x": _scaled(r["x"], sx), "y": _scaled(r["y"], sy),
+            "w": _scaled(r["w"], sx, min_val=1), "h": _scaled(r["h"], sy, min_val=1)}
+
+
 def _contour_template(image_bgr: np.ndarray, min_blob_ratio: float = 0.0) -> np.ndarray:
     """BGR → binary bright-region map for template matching (region-based).
     MUST receive the full image — background blur and Otsu need global pixel
@@ -330,12 +342,12 @@ class TemplateMatcher:
             patch = cv2.resize(self._patch,
                                (max(1, int(pw0 * scale)), max(1, int(ph0 * scale))),
                                interpolation=interp)
-            ic_x = int(self._ic_x * scale)
-            ic_y_tmpl = int(self._ic_y * scale)
-            ic_w = max(1, int(self._ic_w * scale))
-            ic_h = max(1, int(self._ic_h * scale))
-            strip_h = int(self._strip_h * scale)
-            m = int(self._margin * scale)
+            ic_x      = _scaled(self._ic_x, scale)
+            ic_y_tmpl = _scaled(self._ic_y, scale)
+            ic_w      = _scaled(self._ic_w, scale, min_val=1)
+            ic_h      = _scaled(self._ic_h, scale, min_val=1)
+            strip_h   = _scaled(self._strip_h, scale)
+            m         = _scaled(self._margin, scale)
         else:
             patch = self._patch
             ic_x, ic_y_tmpl = self._ic_x, self._ic_y

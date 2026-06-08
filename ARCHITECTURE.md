@@ -1,6 +1,35 @@
 # ClearIC Inspect — Architecture
 
-Single-file application: `CLearIC.py`. All logic lives in one file; no modules.
+Modular package application. Entry point `main.py`; all logic lives under `clearic/`:
+
+```
+clearic/
+├── engine/
+│   ├── detector.py     # Detector — OpenVINO classifier
+│   ├── inspector.py    # Inspector, _build_cells helpers, _resolve_ic, dataset collection
+│   ├── template.py     # TemplateManager + TemplateMatcher + _contour_template + _find_second_ic
+│   └── worker.py       # RunWorker (QThread inspection loop)
+├── io/
+│   ├── __init__.py     # Camera facade — dispatches to BaslerCamera or DirectorySource
+│   ├── hardware.py     # BaslerCamera, RaspberryIO (GPIO), LightingController, CellCon
+│   └── source.py       # DirectorySource — USE_CAMERA=false file-loop image source
+├── ui/
+│   ├── browser.py      # FolderScanWorker, ThumbnailWorker, ImageCard, ImageBrowserPage
+│   ├── dialogs.py      # LotStartDialog
+│   ├── image_view.py   # ImageView — zoomable overlay/rubber-band widget
+│   ├── main_window.py  # MainWindow (incl. _ocr_api_call)
+│   └── style.py        # STYLE stylesheet constant
+└── utils/
+    ├── config.py       # ConfigLoader
+    ├── exceptions.py   # ErrorFlag, InspectionError hierarchy
+    ├── logger.py       # Logger (dual-CSV operation/result logging)
+    └── models.py       # Image dataclass, _next_image_id/_reset_image_counter
+```
+
+`Camera` (in `clearic/io/__init__.py`) is a thin facade preserving the original
+uniform interface (`grab`, `grab_first`, `warmup`, `is_open`, `has_more`, `reset`,
+`close`) while internally dispatching to `BaslerCamera` (hardware) or
+`DirectorySource` (file-loop), selected by the `CAMERA` config mode.
 
 ---
 
@@ -159,12 +188,12 @@ IC rect
 
 ## Threading Model
 
-| Thread | Class | Role |
-|---|---|---|
-| Main (GUI) | `MainWindow` | Qt event loop, UI updates |
-| Worker | `RunWorker(QThread)` | Camera grab → inspect → GPIO |
-| Thumbnail loader | `ThumbnailWorker(QThread)` | Load thumbnails for browser |
-| Folder scanner | `FolderScanWorker(QThread)` | Scan Output/ directory tree |
+| Thread | Class | Module | Role |
+|---|---|---|---|
+| Main (GUI) | `MainWindow` | `clearic.ui.main_window` | Qt event loop, UI updates |
+| Worker | `RunWorker(QThread)` | `clearic.engine.worker` | Camera grab → inspect → GPIO |
+| Thumbnail loader | `ThumbnailWorker(QThread)` | `clearic.ui.browser` | Load thumbnails for browser |
+| Folder scanner | `FolderScanWorker(QThread)` | `clearic.ui.browser` | Scan Output/ directory tree |
 
 Cross-thread communication: PyQt5 signals only. `RunWorker` emits:
 `sig_image`, `sig_result`, `sig_fail`, `sig_error`, `sig_warn`, `sig_status`,

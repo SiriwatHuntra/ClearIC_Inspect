@@ -25,7 +25,7 @@ CELLCON_PORT = "/dev/ttyUSB0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 # Folder containing images when USE_CAMERA = false
-DIR_INPUT = "Input/"
+DIR_INPUT = "Capture/"
 
 # Root output folder for raw and annotated results
 OUT_DIR = "Output/"
@@ -137,7 +137,7 @@ WARMUP_FRAMES = 5
 
 # ─── Lighting ────────────────────────────────────────────────────────────────
 # true = drive serial lighting controller; false = skip entirely
-LIGHTING_ENABLE = false
+LIGHTING_ENABLE = true
 
 # Partial string to match in /dev/serial/by-id/ to identify lighting adapter
 # Set to "" to fall back to LIGHTING_PORT

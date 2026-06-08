@@ -1,6 +1,6 @@
 # ─── Simple Setup (true / false only) ───────────────────────────────────────
 # true = live Basler camera, false = load images from Input/ (directory mode)
-USE_CAMERA = true
+USE_CAMERA = false
 
 # Set to true to drive real GPIO pins; false = log-only, safe without hardware
 IO = false
@@ -25,7 +25,7 @@ CELLCON_PORT = "/dev/ttyUSB0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 # Folder containing images when USE_CAMERA = false
-DIR_INPUT = "Capture/"
+DIR_INPUT = "Input/"
 
 # Root output folder for raw and annotated results
 OUT_DIR = "Output/"
@@ -137,7 +137,7 @@ WARMUP_FRAMES = 5
 
 # ─── Lighting ────────────────────────────────────────────────────────────────
 # true = drive serial lighting controller; false = skip entirely
-LIGHTING_ENABLE = true
+LIGHTING_ENABLE = false
 
 # Partial string to match in /dev/serial/by-id/ to identify lighting adapter
 # Set to "" to fall back to LIGHTING_PORT

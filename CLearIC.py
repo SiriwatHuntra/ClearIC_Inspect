@@ -788,11 +788,9 @@ class Detector:
                 raise ModelError(f"Model not found: {self._model_xml}")
             core  = ov.Core()
             model = core.read_model(self._model_xml)
-            # Dynamic batch (-1) lets classify_batch pass any N without re-compiling.
-            model.reshape([-1, 3, _CLS_INPUT_SIZE, _CLS_INPUT_SIZE])
             self._compiled = core.compile_model(model, "CPU", {
                 "INFERENCE_PRECISION_HINT": "f32",
-                "PERFORMANCE_HINT":         "THROUGHPUT",
+                "PERFORMANCE_HINT":         "LATENCY",
             })
             self._ready = True
             print(f"[Detector] OpenVINO classifier loaded: {self._model_xml}")
@@ -849,11 +847,11 @@ class Detector:
 
         if blobs:
             try:
-                batch = np.stack(blobs)   # [N, 3, H, W]
                 text_probs_all = np.zeros(len(blobs), dtype=np.float32)
                 for _ in range(self._n_passes):
-                    out = self._compiled(batch)
-                    text_probs_all += out[0][:, 1]   # P(Text) for each item
+                    for j, blob in enumerate(blobs):
+                        out = self._compiled(blob[np.newaxis])   # [1, 3, H, W]
+                        text_probs_all[j] += out[0][0, 1]        # P(Text)
                 text_probs_all /= self._n_passes
 
                 for j, idx in enumerate(indices):

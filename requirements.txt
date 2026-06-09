@@ -1,11 +1,39 @@
-# ── installed via apt (system-site-packages) ────────────────────────────────
-# python3-pyqt5        PyQt5 UI framework
-# python3-rpi.gpio     Raspberry Pi GPIO access
-# python3-gpiozero     High-level GPIO interface
-# python3-numpy        Array / matrix operations
-# python3-opencv       OpenCV image processing
-# Do NOT pip-install the above — use the system packages.
+# =============================================================================
+# ClearIC_Inspect — Environment Setup
+# =============================================================================
+#
+# SYSTEM PACKAGES (apt) — install once, before creating the venv
+# These cannot be pip-installed on Raspberry Pi OS; they must come from apt.
+#
+#   sudo apt update
+#   sudo apt install -y \
+#       python3-pyqt5 \
+#       python3-rpi.gpio \
+#       python3-numpy \
+#       python3-opencv
+#
+# BASLER PYLON SDK — required by pypylon
+# Download the arm64/armhf .deb from https://www.baslerweb.com/en/downloads/software-downloads/
+# then install it before creating the venv:
+#
+#   sudo dpkg -i pylon_*.deb
+#
+# =============================================================================
+# CREATE VENV (system-site-packages so PyQt5 / GPIO / numpy / cv2 are visible)
+# =============================================================================
+#
+#   python3 -m venv --system-site-packages .venv
+#
+# =============================================================================
+# ACTIVATE & INSTALL
+# =============================================================================
+#
+#   source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# =============================================================================
 
-# ── pip-installed inside the venv ───────────────────────────────────────────
-openvino                # OpenVINO runtime for YOLO inference
-pypylon                 # Basler Pylon Python binding (requires Pylon SDK system install)
+# pip-managed packages
+openvino
+pypylon

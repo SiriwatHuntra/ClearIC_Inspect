@@ -48,11 +48,9 @@ class ConfigLoader:
     #This defualt config is used as a template for the Config.toml file and as fallback for missing keys. It is not used directly in the code, but serves as a reference for the expected configuration parameters and their default values.
     DEFAULT_CONFIG = {
         "USE_CAMERA":           False,
-        "CONF_THR":             0.5,
         "TEXT_MIN_CONF":        0.80,
         "TEXT_NG_THRESHOLD":    2,
         "BLANK_CELL_STD_THR":   0.0,
-        "NMS_IOU_THR":          0.45,
         "CAMERA_SERIAL":        "",
         "EXPOSURE_US":          8000,
         "DEBUG":                True,
@@ -135,8 +133,6 @@ class ConfigLoader:
         if not isinstance(cfg["USE_CAMERA"], bool):
             raise ConfigError("USE_CAMERA must be true or false")
         cfg["CAMERA"] = "camera" if cfg["USE_CAMERA"] else "directory"
-        if not (0.0 < cfg["CONF_THR"] <= 1.0):
-            raise ConfigError("CONF_THR must be in (0, 1]")
         if not (0.0 < cfg["TEXT_MIN_CONF"] <= 1.0):
             raise ConfigError("TEXT_MIN_CONF must be in (0, 1]")
         if not (0.0 <= cfg["BLANK_CELL_STD_THR"] <= 255.0):
@@ -155,7 +151,7 @@ class ConfigLoader:
                 raise ConfigError(f"{pin_key} must be a BCM pin number (1–27)")
         if not isinstance(cfg["RESULT_OVERLAY"], bool):
             raise ConfigError("RESULT_OVERLAY must be true or false")
-        for _k in ("NMS_IOU_THR", "RETRY_PASS_THR", "CLS_UNCERTAIN_THR"):
+        for _k in ("RETRY_PASS_THR", "CLS_UNCERTAIN_THR"):
             if not (0.0 < cfg[_k] <= 1.0):
                 raise ConfigError(f"{_k} must be in (0, 1]")
         if not (0.0 < cfg["CELL_SHRINK"] <= 1.0):
@@ -224,14 +220,6 @@ class ConfigLoader:
         with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
             f.write(tomlkit.dumps(doc))
         return cls.load()
-
-# STAGE & ERROR FLAGS
-class ErrorFlag(Enum):
-    NONE     = "NONE"
-    CAMERA   = "CAMERA"
-    MODEL    = "MODEL"
-    GPIO     = "GPIO"
-    TEMPLATE = "TEMPLATE"
 
 # EXCEPTIONS
 class InspectionError(Exception):
@@ -783,12 +771,11 @@ class Detector:
     Output shape: [1, 2]  — index 0 = NoText, index 1 = Text
     """
 
-    def __init__(self, conf_thr: float = 0.5, text_min_conf: float = 0.80,
+    def __init__(self, text_min_conf: float = 0.80,
                  blank_cell_std_thr: float = 0.0,
                  model_path: str = "Text_cls-2/best_openvino_model/best.xml",
                  n_passes: int = 3, uncertain_thr: float = 0.50,
                  debug: bool = False, **_):
-        self._conf_thr           = conf_thr
         self._text_min_conf      = text_min_conf
         self._blank_cell_std_thr = blank_cell_std_thr
         self._n_passes           = max(1, int(n_passes))
@@ -3242,7 +3229,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._cfg
         try:
             self._detector = Detector(
-                conf_thr=cfg.get("CONF_THR", 0.5),
                 text_min_conf=cfg.get("TEXT_MIN_CONF", 0.80),
                 blank_cell_std_thr=cfg.get("BLANK_CELL_STD_THR", 0.0),
                 model_path=cfg.get("MODEL_PATH",

@@ -7,7 +7,6 @@ Each ROI cell is cropped and classified as Text (present) or NoText (absent).
 Sections (in order)
 -------------------
   ConfigLoader        Config.toml loader with defaults
-  Stage / ErrorFlag   State enums
   Exceptions          InspectionError hierarchy
   Image               Image dataclass + ID generator
   Camera              Basler camera or directory source
@@ -32,7 +31,6 @@ import time
 import signal
 import fcntl
 import threading
-from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -55,7 +53,6 @@ class ConfigLoader:
         "EXPOSURE_US":          8000,
         "DEBUG":                True,
         "IO":                   False,
-        "MODE":                 "DEBUG",
         "COLLECT_DATASET":      False,
         "DIR_INPUT":            "Input/",
         "OUT_DIR":              "Output/",
@@ -557,7 +554,7 @@ class LightingController:
     """Serial ring-light controller (RS232 over USB-Prolific, IFWFOCR01 protocol)."""
     BAUD = 38400
 
-    def __init__(self, enabled: bool, port: str, value: int = 100):
+    def __init__(self, enabled: bool, port: str):
         self._enabled       = enabled
         self._ser           = None
         self._controller_ok = False
@@ -1133,21 +1130,6 @@ class TemplateManager:
         _tmp = _TEMPLATE_PREVIEW + ".tmp.png"
         cv2.imwrite(_tmp, preview)
         os.replace(_tmp, _TEMPLATE_PREVIEW)
-
-    @staticmethod
-    def compute_rois(template: dict, grid_cfg: dict | None = None) -> tuple:
-        """Returns (ic_a_cells, ic_b_cells) — list of 6 (x,y,w,h) per IC."""
-        g = grid_cfg or {}
-        def _cells(box: dict) -> list:
-            return _build_cells(
-                box["x"], box["y"], box["w"], box["h"],
-                cell_shrink=g.get("CELL_SHRINK", 0.95),
-                cell_expand=g.get("CELL_EXPAND", 1.2),
-                col_gap_pct=g.get("COL_GAP_PCT", 40.0),
-                grid_margin_top=g.get("GRID_MARGIN_TOP", 0.0),
-                grid_margin_bot=g.get("GRID_MARGIN_BOT", 15.0),
-            )
-        return _cells(template["ic_a"]), _cells(template["ic_b"])
 
 # TEMPLATE MATCHER
 class TemplateMatcher:
@@ -3318,7 +3300,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lighting   = LightingController(
             enabled=lighting_enabled,
             port=lighting_port,
-            value=cfg.get("LIGHTING_VALUE", 100),
         )
         if lighting_enabled:
             self._lighting.set_brightness(cfg.get("LIGHTING_VALUE", 100))
@@ -4120,7 +4101,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lighting = LightingController(
                 enabled=True,
                 port=ports["lighting"],
-                value=self._cfg.get("LIGHTING_VALUE", 100),
             )
             self._lighting.set_brightness(self._cfg.get("LIGHTING_VALUE", 100))
 

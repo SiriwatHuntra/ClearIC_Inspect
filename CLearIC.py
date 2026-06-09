@@ -2325,7 +2325,7 @@ class RunWorker(QtCore.QThread):
                 is_suspect = True
                 suffix     = "_GS"
 
-            save_image = suffix != "_G"  # skip saving clean-pass images
+            save_image = debug or suffix != "_G"  # debug: save all; production: skip clean pass
 
             final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
             ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")

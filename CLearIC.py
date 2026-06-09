@@ -28,6 +28,7 @@ import csv
 import json
 import glob
 import time
+import queue
 import signal
 import fcntl
 import threading
@@ -787,9 +788,11 @@ class Detector:
                 raise ModelError(f"Model not found: {self._model_xml}")
             core  = ov.Core()
             model = core.read_model(self._model_xml)
+            # Dynamic batch (-1) lets classify_batch pass any N without re-compiling.
+            model.reshape([-1, 3, _CLS_INPUT_SIZE, _CLS_INPUT_SIZE])
             self._compiled = core.compile_model(model, "CPU", {
                 "INFERENCE_PRECISION_HINT": "f32",
-                "PERFORMANCE_HINT":         "LATENCY",
+                "PERFORMANCE_HINT":         "THROUGHPUT",
             })
             self._ready = True
             print(f"[Detector] OpenVINO classifier loaded: {self._model_xml}")
@@ -803,49 +806,72 @@ class Detector:
 
     def warmup(self, frames: int = 5):
         blank = np.zeros((_CLS_INPUT_SIZE, _CLS_INPUT_SIZE, 3), dtype=np.uint8)
+        blanks = [blank] * _TOTAL_CELLS
         for _ in range(frames):
-            self.classify_crop(blank)
+            self.classify_batch(blanks)
         print(f"[Detector] Warmup done ({frames} frames).")
 
     def classify_crop(self, crop_bgr: np.ndarray) -> tuple:
+        """Single-crop convenience wrapper around classify_batch."""
+        return self.classify_batch([crop_bgr])[0]
+
+    def classify_batch(self, crops: list) -> list:
         """
-        Classify one ROI cell crop.
-        Returns (class_idx, confidence):
+        Classify a list of BGR cell crops in a single OpenVINO inference call.
+        Returns list of (class_idx, confidence) in the same order as input.
           class_idx 0 = NoText  (mark absent)
           class_idx 1 = Text    (mark present)
+        Blank-cell shortcut and multi-pass averaging are applied per crop.
         """
-        if not self._ready or self._compiled is None:
-            return 0, 0.0
-        try:
-            sz = _CLS_INPUT_SIZE
+        if not self._ready or self._compiled is None or not crops:
+            return [(0, 0.0)] * len(crops)
+
+        sz      = _CLS_INPUT_SIZE
+        results = [None] * len(crops)
+        indices = []   # positions that need inference
+        blobs   = []   # preprocessed [3, H, W] arrays for those positions
+
+        for i, crop_bgr in enumerate(crops):
+            if crop_bgr is None or crop_bgr.size == 0:
+                results[i] = (0, 0.0)
+                continue
             if crop_bgr.ndim == 2:
                 crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_GRAY2BGR)
-            if crop_bgr.size == 0:
-                return 0, 0.0
             if self._blank_cell_std_thr > 0.0:
                 _g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.ndim == 3 else crop_bgr
                 if float(_g.std()) < self._blank_cell_std_thr:
-                    return 0, 1.0   # guard-triggered NoText; conf=1.0 marks it in logs
+                    results[i] = (0, 1.0)   # guard-triggered NoText; conf=1.0 marks it in logs
+                    continue
             resized = cv2.resize(crop_bgr, (sz, sz))
             blob    = resized[:, :, ::-1].astype(np.float32) / 255.0
-            blob    = blob.transpose(2, 0, 1)[np.newaxis]   # [1, 3, sz, sz]
-            text_probs = []
-            for _ in range(self._n_passes):
-                result = self._compiled(blob)
-                text_probs.append(float(result[0][0][1]))   # P(Text) each pass
-            text_prob   = sum(text_probs) / len(text_probs)
-            notext_prob = 1.0 - text_prob
-            # Require Text probability to clear TEXT_MIN_CONF; anything below → NoText.
-            # Asymmetric on purpose: guards unmarked products without penalising NoText.
-            if text_prob >= self._text_min_conf:
-                return 1, text_prob
-            if self._debug and text_prob >= self._uncertain_thr:
-                print(f"[Detector] Uncertain cell: text_prob={text_prob:.3f} "
-                      f"(gate={self._text_min_conf:.2f})")
-            return 0, notext_prob
-        except Exception as e:
-            print(f"[Detector] Classify error: {e}")
-            return 0, 0.0
+            blobs.append(blob.transpose(2, 0, 1))   # [3, H, W]
+            indices.append(i)
+
+        if blobs:
+            try:
+                batch = np.stack(blobs)   # [N, 3, H, W]
+                text_probs_all = np.zeros(len(blobs), dtype=np.float32)
+                for _ in range(self._n_passes):
+                    out = self._compiled(batch)
+                    text_probs_all += out[0][:, 1]   # P(Text) for each item
+                text_probs_all /= self._n_passes
+
+                for j, idx in enumerate(indices):
+                    text_prob   = float(text_probs_all[j])
+                    notext_prob = 1.0 - text_prob
+                    if text_prob >= self._text_min_conf:
+                        results[idx] = (1, text_prob)
+                    else:
+                        if self._debug and text_prob >= self._uncertain_thr:
+                            print(f"[Detector] Uncertain cell {idx}: text_prob={text_prob:.3f} "
+                                  f"(gate={self._text_min_conf:.2f})")
+                        results[idx] = (0, notext_prob)
+            except Exception as e:
+                print(f"[Detector] Batch classify error: {e}")
+                for idx in indices:
+                    results[idx] = (0, 0.0)
+
+        return results
 
 # Dataset collection run counter
 _data_run_counter = 0
@@ -934,14 +960,29 @@ def _safe_crop(image: np.ndarray, cx: int, cy: int,
     ih, iw = image.shape[:2]
     return image[max(0, cy):min(ih, cy + ch), max(0, cx):min(iw, cx + cw)]
 
-def _contour_template(image_bgr: np.ndarray, min_blob_ratio: float = 0.0) -> np.ndarray:
+# Downscale factor applied inside _contour_template before the expensive blur/morph steps.
+# Result is returned at 1/N resolution; callers that do coordinate arithmetic must multiply
+# match locations back by this factor.  1 = full resolution (original behaviour).
+_CONTOUR_DOWNSCALE = 2
+
+def _contour_template(image_bgr: np.ndarray,
+                      min_blob_ratio: float = 0.0,
+                      downscale: int = _CONTOUR_DOWNSCALE) -> np.ndarray:
     """BGR → binary bright-region map for template matching (region-based).
     MUST receive the full image — background blur and Otsu need global pixel
     context to produce the same result at template-save time and search time.
-    Pipeline: median denoise → background-divide → Otsu → morph open → morph close
-             → optional connected-component blob filter (min_blob_ratio > 0).
+    Pipeline: [optional downscale] → median denoise → background-divide →
+              Otsu → morph open → morph close → optional blob filter.
+    downscale: resize to 1/N before processing; returned map is at that resolution.
+               Morph kernels are scaled proportionally to preserve effective size.
     min_blob_ratio: drop any blob whose area < ratio × largest_blob_area (0.0 = disabled).
     """
+    if downscale > 1:
+        h, w = image_bgr.shape[:2]
+        image_bgr = cv2.resize(image_bgr,
+                               (max(1, w // downscale), max(1, h // downscale)),
+                               interpolation=cv2.INTER_AREA)
+
     gray     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
     # Median: remove sensor grain, preserve pin boundary sharpness
@@ -957,12 +998,16 @@ def _contour_template(image_bgr: np.ndarray, min_blob_ratio: float = 0.0) -> np.
     _, bright_mask = cv2.threshold(norm, 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    # Scale morph kernels so their effective footprint stays constant in full-res pixels.
+    open_k  = max(3, (9  // downscale) | 1)   # keep odd; minimum 3
+    close_k = max(3, (5  // downscale) | 1)
+
     # Open: remove small tape-noise blobs smaller than a pin
-    k_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    k_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (open_k,  open_k))
     cleaned = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, k_open)
 
     # Close: fill small holes inside surviving pin blobs → solid filled regions
-    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
     result  = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close)
 
     # Connected-component blob filter: remove blobs smaller than ratio × largest blob.
@@ -1026,7 +1071,7 @@ class TemplateManager:
           where Y2 = ic bottom, Y3 = Y2 + pin_height (50% of IC height)
 
         Returns (patch, strip_h) where strip_h = y - y_start = -(IC height).
-        strip_h is negative because the patch starts below the IC top.
+        strip_h is in full-res pixels; patch is at 1/_CONTOUR_DOWNSCALE resolution.
         TemplateMatcher uses: patch_top = ic_y - strip_h  →  ic_y + IC_h  ✓
         """
         x, y = ic_rect.x(), ic_rect.y()
@@ -1034,14 +1079,17 @@ class TemplateManager:
         h1 = max(1, int(h * 0.5))  # pin strip height = 50% of IC height
 
         img_h, img_w = image_bgr.shape[:2]
-        y_start = y + h                    # Y2: IC bottom
-        y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area
+        y_start = y + h                    # Y2: IC bottom (full-res)
+        y_end   = min(img_h, y + h + h1)  # Y3: bottom of pin area (full-res)
         x_end   = min(x + w, img_w)
 
-        full_bin = _contour_template(image_bgr, min_blob_ratio)[y_start:y_end, x:x_end]
-        strip_h  = y - y_start  # = -h  (patch is below IC top by IC height)
+        # Run preprocessing at reduced resolution; crop coords scaled accordingly
+        ds       = _CONTOUR_DOWNSCALE
+        full_bin = _contour_template(image_bgr, min_blob_ratio)  # already at 1/ds
+        patch    = full_bin[y_start // ds : y_end // ds, x // ds : x_end // ds]
+        strip_h  = y - y_start  # = -h  (full-res; used by TemplateMatcher for QRect math)
 
-        return full_bin, strip_h
+        return patch, strip_h
 
     @staticmethod
     def save_patches(full_patch: np.ndarray):
@@ -1164,65 +1212,74 @@ class TemplateMatcher:
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
         Returns (QRect, score).
-        Matches the pin-area patch (below IC body) against the frame.
-        Preprocessing is applied only to the ±search_margin ROI for speed.
-        strip_h is negative (patch starts below IC top), so:
-          exp_patch_y = ic_y - strip_h = ic_y + IC_h
-          ic_y        = matched_patch_y + strip_h = matched_patch_y - IC_h
-        If the current image has a different width than the template was saved at,
-        the patch and all search parameters are scaled to match.
+        Preprocessing runs at 1/_CONTOUR_DOWNSCALE resolution for speed; all
+        intermediate coords are in downscaled space and converted back before return.
+        strip_h is in full-res pixels (negative: patch is below IC top by IC height).
+        If the current image differs from the saved template resolution, the patch
+        and stored coords are scaled to match before downscaling.
         """
         img_h, img_w = image_bgr.shape[:2]
+        ds = _CONTOUR_DOWNSCALE
 
-        # Scale patch and search geometry to current image resolution
+        # --- resolve template coords to current full-res image space ---
         if self._template_w > 0 and abs(img_w / self._template_w - 1.0) > 0.01:
             scale = img_w / self._template_w
             ph0, pw0 = self._patch.shape[:2]
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            # patch is stored at (template_w // ds) width; rescale to (img_w // ds) width
             patch = cv2.resize(self._patch,
                                (max(1, int(pw0 * scale)), max(1, int(ph0 * scale))),
                                interpolation=interp)
-            ic_x = int(self._ic_x * scale)
-            ic_y_tmpl = int(self._ic_y * scale)
-            ic_w = max(1, int(self._ic_w * scale))
-            ic_h = max(1, int(self._ic_h * scale))
+            ic_x    = int(self._ic_x    * scale)
+            ic_y    = int(self._ic_y    * scale)
+            ic_w    = max(1, int(self._ic_w * scale))
+            ic_h    = max(1, int(self._ic_h * scale))
             strip_h = int(self._strip_h * scale)
-            m = int(self._margin * scale)
+            m       = int(self._margin  * scale)
         else:
-            patch = self._patch
-            ic_x, ic_y_tmpl = self._ic_x, self._ic_y
-            ic_w, ic_h = self._ic_w, self._ic_h
+            patch   = self._patch
+            ic_x    = self._ic_x
+            ic_y    = self._ic_y
+            ic_w    = self._ic_w
+            ic_h    = self._ic_h
             strip_h = self._strip_h
-            m = self._margin
+            m       = self._margin
 
-        ph, pw = patch.shape[:2]
-        exp_y = ic_y_tmpl - strip_h
+        ph, pw  = patch.shape[:2]           # patch dims already at 1/ds scale
+        exp_y   = ic_y - strip_h            # full-res expected patch-top Y
 
-        rx1 = max(0, ic_x - m)
-        ry1 = max(0, exp_y - m)
-        rx2 = min(img_w, ic_x + pw + m)
-        ry2 = min(img_h, exp_y + ph + m)
+        # --- build search window in downscaled space ---
+        ds_w    = max(1, img_w // ds)
+        ds_h    = max(1, img_h // ds)
+        m_ds    = max(1, m // ds)
+        rx1     = max(0,    ic_x  // ds - m_ds)
+        ry1     = max(0,    exp_y // ds - m_ds)
+        rx2     = min(ds_w, ic_x  // ds + pw + m_ds)
+        ry2     = min(ds_h, exp_y // ds + ph + m_ds)
 
-        # Full-image preprocess first — same global histogram as template-save time
+        # Full-image preprocess at reduced resolution
         full_filtered = _contour_template(image_bgr, self._min_blob_ratio)
 
-        roi_bgr = image_bgr[ry1:ry2, rx1:rx2]
+        def _qrect(loc_x_ds: int, loc_y_ds: int) -> QtCore.QRect:
+            """Convert a downscaled match location to a full-res IC QRect."""
+            return QtCore.QRect(loc_x_ds * ds,
+                                loc_y_ds * ds + strip_h,
+                                ic_w, ic_h)
 
-        if roi_bgr.size == 0 or roi_bgr.shape[0] < ph or roi_bgr.shape[1] < pw:
-            # ROI empty or too small — search full preprocessed frame (already computed)
+        if full_filtered.shape[0] < ph or full_filtered.shape[1] < pw:
             res = cv2.matchTemplate(full_filtered, patch, cv2.TM_CCOEFF_NORMED)
             _, score, _, loc = cv2.minMaxLoc(res)
-            found_ic_y = loc[1] + strip_h
-            return QtCore.QRect(loc[0], found_ic_y, ic_w, ic_h), float(score)
+            return _qrect(loc[0], loc[1]), float(score)
 
         filtered = full_filtered[ry1:ry2, rx1:rx2]
+        if filtered.size == 0 or filtered.shape[0] < ph or filtered.shape[1] < pw:
+            res = cv2.matchTemplate(full_filtered, patch, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            return _qrect(loc[0], loc[1]), float(score)
+
         res = cv2.matchTemplate(filtered, patch, cv2.TM_CCOEFF_NORMED)
         _, score, _, loc = cv2.minMaxLoc(res)
-        abs_x = loc[0] + rx1
-        abs_y = loc[1] + ry1
-        found_ic_y = abs_y + strip_h
-
-        return QtCore.QRect(abs_x, found_ic_y, ic_w, ic_h), float(score)
+        return _qrect(loc[0] + rx1, loc[1] + ry1), float(score)
 
 def _find_second_ic(image_bgr: np.ndarray,
                     ref_rect: QtCore.QRect,
@@ -1238,27 +1295,30 @@ def _find_second_ic(image_bgr: np.ndarray,
     """
     x, y, w, h = ref_rect.x(), ref_rect.y(), ref_rect.width(), ref_rect.height()
     img_h, img_w = image_bgr.shape[:2]
+    ds = _CONTOUR_DOWNSCALE
 
-    # Full-image preprocess — same pipeline as extract_patches and locate_ic
+    # Full-image preprocess at reduced resolution — same pipeline as extract_patches/locate_ic
     full_map = _contour_template(image_bgr, min_blob_ratio)
+    # full_map is at (img_w // ds, img_h // ds)
 
-    # Extend template downward to include pin area (same geometry as extract_patches)
-    h1  = max(1, int(h * 0.5))
-    ty1 = max(0, y)
-    ty2 = min(img_h, y + h + h1)   # IC body + pin area below
-    tx1 = max(0, x)
-    tx2 = min(img_w, x + w)
+    # Extend template downward to include pin area; all coords divided by ds
+    h1   = max(1, int(h * 0.5))
+    ty1  = max(0, y)          // ds
+    ty2  = min(img_h, y + h + h1) // ds
+    tx1  = max(0, x)          // ds
+    tx2  = min(img_w, x + w)  // ds
     template = full_map[ty1:ty2, tx1:tx2]
     if template.size == 0:
         return None, 0.0
 
-    mid = img_w // 2
-    if (x + w // 2) < mid:   # ref is on left → search right half
-        search   = full_map[:, mid:]
-        x_offset = mid
-    else:                     # ref is on right → search left half
-        search   = full_map[:, :mid]
-        x_offset = 0
+    ds_mid   = (img_w // ds) // 2
+    img_mid  = img_w // 2
+    if (x + w // 2) < img_mid:   # ref is on left → search right half
+        search      = full_map[:, ds_mid:]
+        x_offset_ds = ds_mid
+    else:                          # ref is on right → search left half
+        search      = full_map[:, :ds_mid]
+        x_offset_ds = 0
 
     if search.shape[1] < template.shape[1] or search.shape[0] < template.shape[0]:
         return None, 0.0
@@ -1267,8 +1327,8 @@ def _find_second_ic(image_bgr: np.ndarray,
     _, score, _, loc = cv2.minMaxLoc(result)
 
     if score >= conf_thr:
-        # loc[1] = IC body top (template extends downward only → top is unchanged)
-        return QtCore.QRect(loc[0] + x_offset, loc[1], w, h), float(score)
+        # Convert downscaled match location back to full-res
+        return QtCore.QRect((loc[0] + x_offset_ds) * ds, loc[1] * ds, w, h), float(score)
     return None, float(score)
 
 # INSPECTOR
@@ -1341,7 +1401,7 @@ class Inspector:
             raise TemplateError(
                 f"Image {img_w}×{img_h} too small — template requires at least {min_w}×{min_h}")
 
-        annotated = image_bgr  # draw in-place; caller saves raw before calling inspect()
+        annotated = image_bgr.copy()   # draw on a copy; original stays clean for raw_bgr
 
         # Phase 1: locate ICs
         if self._template_matcher is not None:
@@ -1376,9 +1436,14 @@ class Inspector:
                 print(f"[Inspector] scale=({sx:.3f},{sy:.3f}) "
                       "No TemplateMatcher — using scaled fixed template coordinates")
 
-        # Phase 2: crop each cell and classify as Text / NoText
-        missing_a, hits_a, confs_a = self._check_ic(image_bgr, ic_a_cells, annotated, debug)
-        missing_b, hits_b, confs_b = self._check_ic(image_bgr, ic_b_cells, annotated, debug)
+        # Phase 2: collect all 12 crops → one batched inference → annotate both ICs
+        crops_a = [_safe_crop(image_bgr, cx, cy, cw, ch) for cx, cy, cw, ch in ic_a_cells]
+        crops_b = [_safe_crop(image_bgr, cx, cy, cw, ch) for cx, cy, cw, ch in ic_b_cells]
+        batch_results = self._detector.classify_batch(crops_a + crops_b)
+        missing_a, hits_a, confs_a = self._check_ic(
+            image_bgr, ic_a_cells, annotated, debug, precomputed=batch_results[:6])
+        missing_b, hits_b, confs_b = self._check_ic(
+            image_bgr, ic_b_cells, annotated, debug, precomputed=batch_results[6:])
 
         if self._collect_dataset:
             global _data_run_counter
@@ -1403,9 +1468,12 @@ class Inspector:
                             self._grid_margin_top, self._grid_margin_bot)
 
     def _check_ic(self, image_bgr: np.ndarray, cells: list,
-                  annotated: np.ndarray, debug: bool) -> tuple:
+                  annotated: np.ndarray, debug: bool,
+                  precomputed: list | None = None) -> tuple:
         """
-        Crop each ROI cell from image_bgr and classify as Text / NoText.
+        Annotate cells and build result lists.
+        precomputed: list of (cls_idx, conf) from classify_batch — when provided,
+                     no inference is run here; crops are still taken for debug logging.
         Returns (missing, hits_flags, text_confs).
         text_confs: per-cell Text-class confidence (6 floats, 0–1).
         """
@@ -1418,13 +1486,17 @@ class Inspector:
         for idx, (cx, cy, cw, ch) in enumerate(cells):
             row = idx // 2 + 1
             col = idx %  2 + 1
-            crop = _safe_crop(image_bgr, cx, cy, cw, ch)
-            cls_idx, conf = self._detector.classify_crop(crop) if crop.size > 0 else (0, 0.0)
-            present   = (cls_idx == 1)   # 1 = Text (mark present)
-            text_conf = conf if cls_idx == 1 else (1.0 - conf)  # Text-class probability
+            if precomputed is not None:
+                cls_idx, conf = precomputed[idx]
+            else:
+                crop = _safe_crop(image_bgr, cx, cy, cw, ch)
+                cls_idx, conf = self._detector.classify_crop(crop) if crop.size > 0 else (0, 0.0)
+            present   = (cls_idx == 1)
+            text_conf = conf if cls_idx == 1 else (1.0 - conf)
             hits_flags.append(present)
             text_confs.append(text_conf)
             if debug:
+                crop = _safe_crop(image_bgr, cx, cy, cw, ch)
                 lbl = "Text" if present else "NoText"
                 std_str = f"{crop.std():.1f}" if crop.size > 0 else "n/a"
                 print(f"[Cell R{row}C{col}] "
@@ -1945,7 +2017,7 @@ class RunWorker(QtCore.QThread):
 
     Camera mode: wait_for_start() blocks on START_PIN HIGH (active HIGH);
       IO=False: blocks until MainWindow calls trigger() per cycle.
-    Directory mode: auto-loops with 50 ms yield between cycles.
+    Directory mode: auto-loops, yielding only on I/O.
     """
     sig_image    = QtCore.pyqtSignal(object)          # annotated BGR ndarray
     sig_result   = QtCore.pyqtSignal(bool, bool, bool)       # ic_a_pass, ic_b_pass, is_suspect
@@ -1975,6 +2047,35 @@ class RunWorker(QtCore.QThread):
         self._running = threading.Event()
         self._running.set()
         self._drain_needed = threading.Event()
+        self._write_q      : queue.SimpleQueue | None = None
+        self._write_thread : threading.Thread  | None = None
+
+    def _start_write_thread(self):
+        """Start background thread that drains the async imwrite queue."""
+        self._write_q = queue.SimpleQueue()
+        def _writer():
+            while True:
+                item = self._write_q.get()
+                if item is None:   # sentinel — exit
+                    break
+                path, arr = item
+                cv2.imwrite(path, arr)
+        self._write_thread = threading.Thread(
+            target=_writer, name="ImwriteWorker", daemon=True)
+        self._write_thread.start()
+
+    def _stop_write_thread(self):
+        """Flush all pending writes and stop the background thread."""
+        if self._write_q is not None:
+            self._write_q.put(None)   # sentinel
+        if self._write_thread is not None:
+            self._write_thread.join(timeout=15.0)
+            self._write_thread = None
+        self._write_q = None
+
+    def _async_imwrite(self, path: str, arr: np.ndarray):
+        if self._write_q is not None:
+            self._write_q.put((path, arr))
 
     def stop(self):
         self._stop = True
@@ -2011,6 +2112,7 @@ class RunWorker(QtCore.QThread):
         self.sig_status.emit("Running…")
         _reset_image_counter()
         _cycle = 0
+        self._start_write_thread()
 
         if cam_mode == "camera":
             self._gpio.clear_outputs()  # ensure known-idle state before first cycle
@@ -2020,6 +2122,7 @@ class RunWorker(QtCore.QThread):
             except CameraError as e:
                 self.sig_error.emit(f"Camera error: {e}")
                 self.sig_status.emit("ERROR — camera failed to open, restart required.")
+                self._stop_write_thread()
                 self.sig_done.emit()
                 self.sig_status.emit("Standby.")
                 return
@@ -2047,8 +2150,8 @@ class RunWorker(QtCore.QThread):
                 if self._lighting:
                     self._lighting.on()
             else:
-                # Auto directory: brief yield then check stop
-                time.sleep(0.05)
+                # Auto directory: I/O already yields; no explicit sleep needed
+                # time.sleep(0.05)
                 if self._stop:
                     break
                 if lighting_test:
@@ -2108,16 +2211,17 @@ class RunWorker(QtCore.QThread):
             self.sig_status.emit("Inspecting…")
 
             # Inspect (with one retry on fail)
+            # inspect() returns an annotated copy; img_bgr stays unannotated (= raw_bgr).
             is_retry    = False
             miss_a      = []
             miss_b      = []
-            ann         = img_bgr
-            raw_bgr     = img_bgr.copy()   # preserve unannotated frame; inspect() annotates in-place
+            raw_bgr     = img_bgr          # unannotated original; inspect() no longer modifies it
+            ann         = img_bgr          # placeholder; replaced by inspect() return or e.annotated
             self.sig_image.emit(raw_bgr)   # show raw frame immediately after capture
 
             try:
-                self._inspector.inspect(img_bgr, debug=debug)
-                # pass — img_bgr annotated in-place; miss_a/miss_b stay []
+                _, _, _, _, ann = self._inspector.inspect(img_bgr, debug=debug)
+                # pass — ann is the annotated copy; miss_a/miss_b stay []
 
             except LowMatchError as lme:
                 # Transient bad frame — skip this cycle, do not break the loop
@@ -2161,14 +2265,11 @@ class RunWorker(QtCore.QThread):
                     try:
                         img_bgr2 = self._camera.grab()
                         try:
-                            self._inspector.inspect(img_bgr2, debug=debug)
-                            # Retry passed — use retry frame
-                            img_bgr = img_bgr2
-                            ann     = img_bgr2
+                            _, _, _, _, ann = self._inspector.inspect(img_bgr2, debug=debug)
+                            # Retry passed — ann is annotated copy of retry frame
                             miss_a  = []
                             miss_b  = []
                         except MarkMissingError as e2:
-                            img_bgr = img_bgr2
                             ann     = e2.annotated
                             w2      = self._cfg.get("RETRY_W2", 0.7)
                             w1      = self._cfg.get("RETRY_W1", 0.3)
@@ -2231,8 +2332,8 @@ class RunWorker(QtCore.QThread):
             final_real = os.path.join(real_dir, f"{img_id}{suffix}.jpg")
             ann_path   = os.path.join(ann_dir,  f"{img_id}{suffix}.jpg")
             if save_image:
-                cv2.imwrite(final_real, raw_bgr)
-                cv2.imwrite(ann_path, ann)
+                self._async_imwrite(final_real, raw_bgr)
+                self._async_imwrite(ann_path, ann)
             else:
                 ann_path = ""
 
@@ -2309,6 +2410,7 @@ class RunWorker(QtCore.QThread):
                 self._camera.close()
             if self._lighting:
                 self._lighting.off()
+        self._stop_write_thread()   # flush all pending disk writes before signalling done
         self.sig_done.emit()   # always emit; _on_run_done guards against double-call
         self.sig_status.emit("Standby.")
 

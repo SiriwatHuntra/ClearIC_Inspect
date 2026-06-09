@@ -8,6 +8,10 @@ IO = false
 # Print extra debug logs and save annotated image every cycle
 DEBUG = True
 
+# Debug-only: flash lighting per loaded image in directory mode, mocking a real
+# capture flash. Requires DEBUG = true and USE_CAMERA = false.
+LIGHTING_TEST = false
+
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false
 
@@ -16,9 +20,6 @@ RESULT_OVERLAY = true
 
 
 # ─── System ──────────────────────────────────────────────────────────────────
-# Label written into log records
-MODE = "PRODUCTION"
-
 # Serial port for Cell-con lot number reader
 CELLCON_PORT = "/dev/ttyUSB0"
 
@@ -44,10 +45,7 @@ MODEL_PATH = "Text_cls-2/best_openvino_model/best.xml"
 
 
 # ─── Classifier / Inspection ─────────────────────────────────────────────────
-# Minimum overall classifier confidence to accept any prediction
-CONF_THR = 0.85
-
-# Text-class probability must exceed this to call a cell PASS
+# Text-class probability must exceed this to call a cell PASS  (sole active threshold)
 TEXT_MIN_CONF = 0.80
 
 # Number of inference passes per cell; averaged before applying TEXT_MIN_CONF (1 = off, 3 recommended)
@@ -65,11 +63,8 @@ BLANK_CELL_STD_THR = 0.0
 # Non-maximum suppression IoU threshold (detection post-processing)
 NMS_IOU_THR = 0.45
 
-# weight for second-attempt confidence
-RETRY_W2       = 0.7    
-
-# weight for first-attempt confidence
-RETRY_W1       = 0.3    
+# weight for second-attempt confidence (first-attempt weight = 1.0 − RETRY_W2)
+RETRY_W2       = 0.7
 
 # weighted score threshold to call a retried cell PASS
 RETRY_PASS_THR = 0.90
@@ -136,6 +131,7 @@ WARMUP_FRAMES = 5
 
 
 # ─── Lighting ────────────────────────────────────────────────────────────────
+# (LIGHTING_TEST → see Simple Setup above)
 # true = drive serial lighting controller; false = skip entirely
 LIGHTING_ENABLE = true
 
@@ -148,11 +144,6 @@ LIGHTING_PORT = "/dev/ttyUSB1"
 
 # Brightness level 0–255 set at startup, held for the entire run
 LIGHTING_VALUE = 100
-
-# Debug-only, directory-mode test: flash lighting on/off as each Input/ image
-# loads, mocking the on/off cycle a real camera capture would trigger.
-# Requires DEBUG = true and USE_CAMERA = false; ignored in live camera mode.
-LIGHTING_TEST = true
 
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────

@@ -35,5 +35,5 @@
 # =============================================================================
 
 # pip-managed packages
-openvino
-pypylon
+# pip install openvino
+# pip install pypylon

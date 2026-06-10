@@ -80,6 +80,13 @@ TEMPLATE_MATCH_THR = 0.6
 # Minimum match score to accept IC_B during auto-detection at setup time (0.0–1.0).
 TEMPLATE_FIND_CONF_THR = 0.4
 
+# ±px around the expected pin-patch position to search for IC_A (locate_ic).
+# X stays tight (mechanical placement is stable in X; IC_B sits ~476px away —
+# too large a margin risks locking onto it instead). Y needs to be much larger
+# to cover real placement-tolerance drift (measured -196..+144px on this fixture).
+TEMPLATE_SEARCH_MARGIN_X = 80
+TEMPLATE_SEARCH_MARGIN_Y = 200
+
 # ─── Grid Geometry ───────────────────────────────────────────────────────────
 # Shrink IC bounding rect before splitting into cells (centred, e.g. 0.95 = 5% trim)
 CELL_SHRINK = 0.95

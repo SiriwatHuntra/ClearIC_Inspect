@@ -92,6 +92,8 @@ class ConfigLoader:
         "BLOB_MIN_RATIO":       0.0,    # 0.0 = disabled; 0.2 removes small non-pin blobs from binary map
         "TEMPLATE_MATCH_THR":   0.6,    # minimum match score for IC_A template matching
         "TEMPLATE_FIND_CONF_THR": 0.4,  # minimum score to accept IC_B in auto-detection
+        "TEMPLATE_SEARCH_MARGIN_X": 80,  # ±px around expected pin-patch X position to search for IC_A
+        "TEMPLATE_SEARCH_MARGIN_Y": 200, # ±px around expected pin-patch Y position to search for IC_A
         "LIGHTING_ENABLE":      True,
         "LIGHTING_USB_ID":      "Prolific_Technology_Inc._USB-Serial_Controller",
         "LIGHTING_PORT":        "/dev/ttyUSB1",
@@ -179,6 +181,9 @@ class ConfigLoader:
             raise ConfigError("TEMPLATE_MATCH_THR must be 0.0–1.0")
         if not (0.0 <= cfg["TEMPLATE_FIND_CONF_THR"] <= 1.0):
             raise ConfigError("TEMPLATE_FIND_CONF_THR must be 0.0–1.0")
+        for _k in ("TEMPLATE_SEARCH_MARGIN_X", "TEMPLATE_SEARCH_MARGIN_Y"):
+            if not isinstance(cfg[_k], int) or not (0 <= cfg[_k] <= 500):
+                raise ConfigError(f"{_k} must be an integer in [0, 500]")
         _w_sum = cfg["RETRY_W2"] + cfg["RETRY_W1"]
         if abs(_w_sum - 1.0) > 0.001:
             print(f"[Config] Warning: RETRY_W2 + RETRY_W1 = {_w_sum:.3f} (expected 1.0)")
@@ -255,8 +260,11 @@ class GPIOError(_SystemError):
     pass
 
 class LowMatchError(InspectionError):
-    """Template match score too low to trust — skip this frame, not fatal."""
-    pass
+    """Template match score too low to trust IC position."""
+    def __init__(self, msg: str = "", annotated=None, score: float = 0.0):
+        self.annotated = annotated
+        self.score     = score
+        super().__init__(msg)
 
 class ConfigError(InspectionError):
     pass
@@ -1192,7 +1200,8 @@ class TemplateMatcher:
                  strip_h: int = 0,
                  ic_x: int = 0, ic_y: int = 0,
                  ic_w: int = 0, ic_h: int = 0,
-                 search_margin: int = 60,
+                 search_margin_x: int = 60,
+                 search_margin_y: int = 60,
                  template_w: int = 0,
                  min_blob_ratio: float = 0.0):
         self._patch          = full_patch
@@ -1203,7 +1212,8 @@ class TemplateMatcher:
         self._ic_y           = ic_y   # expected IC_A top from template
         self._ic_w           = ic_w
         self._ic_h           = ic_h
-        self._margin         = search_margin   # px around expected pos to search
+        self._margin_x       = search_margin_x   # ±px around expected X pos to search
+        self._margin_y       = search_margin_y   # ±px around expected Y pos to search
         self._template_w     = template_w      # image width when template was saved (0 = unknown)
         self._min_blob_ratio = min_blob_ratio  # passed to _contour_template at search time
 
@@ -1233,7 +1243,8 @@ class TemplateMatcher:
             ic_w    = max(1, int(self._ic_w * scale))
             ic_h    = max(1, int(self._ic_h * scale))
             strip_h = int(self._strip_h * scale)
-            m       = int(self._margin  * scale)
+            mx      = int(self._margin_x * scale)
+            my      = int(self._margin_y * scale)
         else:
             patch   = self._patch
             ic_x    = self._ic_x
@@ -1241,7 +1252,8 @@ class TemplateMatcher:
             ic_w    = self._ic_w
             ic_h    = self._ic_h
             strip_h = self._strip_h
-            m       = self._margin
+            mx      = self._margin_x
+            my      = self._margin_y
 
         ph, pw  = patch.shape[:2]           # patch dims already at 1/ds scale
         exp_y   = ic_y - strip_h            # full-res expected patch-top Y
@@ -1249,11 +1261,12 @@ class TemplateMatcher:
         # --- build search window in downscaled space ---
         ds_w    = max(1, img_w // ds)
         ds_h    = max(1, img_h // ds)
-        m_ds    = max(1, m // ds)
-        rx1     = max(0,    ic_x  // ds - m_ds)
-        ry1     = max(0,    exp_y // ds - m_ds)
-        rx2     = min(ds_w, ic_x  // ds + pw + m_ds)
-        ry2     = min(ds_h, exp_y // ds + ph + m_ds)
+        mx_ds   = max(1, mx // ds)
+        my_ds   = max(1, my // ds)
+        rx1     = max(0,    ic_x  // ds - mx_ds)
+        ry1     = max(0,    exp_y // ds - my_ds)
+        rx2     = min(ds_w, ic_x  // ds + pw + mx_ds)
+        ry2     = min(ds_h, exp_y // ds + ph + my_ds)
 
         # Full-image preprocess at reduced resolution
         full_filtered = _contour_template(image_bgr, self._min_blob_ratio)
@@ -1405,8 +1418,14 @@ class Inspector:
         if self._template_matcher is not None:
             rt_a, score = self._template_matcher.locate_ic(image_bgr)
             if score < self._template_matcher._threshold:
+                label = f"LOW MATCH {score:.2f}"
+                h, w  = annotated.shape[:2]
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.putText(annotated, label, (w - tw - 8, h - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
                 raise LowMatchError(
-                    f"Template match {score:.3f} < {self._template_matcher._threshold:.3f} — frame skipped")
+                    f"Template match {score:.3f} < {self._template_matcher._threshold:.3f}",
+                    annotated=annotated, score=score)
             rt_b = QtCore.QRect(
                 rt_a.x() + ic_b_dx, rt_a.y() + ic_b_dy,
                 ic_b_s["w"], ic_b_s["h"],
@@ -2222,15 +2241,17 @@ class RunWorker(QtCore.QThread):
                 # pass — ann is the annotated copy; miss_a/miss_b stay []
 
             except LowMatchError as lme:
-                # Transient bad frame — skip this cycle, do not break the loop
-                self.sig_status.emit(f"Low match — skipped. ({lme})")
                 if cam_mode == "camera":
+                    # Camera: skip — next trigger will grab a fresh frame
+                    self.sig_status.emit(f"Low match {lme.score:.2f} — skipped")
                     self._gpio.set_busy(False)
                     if self._lighting:
                         self._lighting.off()
-                elif lighting_test:
-                    self._lighting.off()
-                continue
+                    continue
+                # Directory: save as NG — all cells forced missing, annotated with LOW MATCH text
+                miss_a = [[r, c] for r in (1, 2, 3) for c in (1, 2)]
+                miss_b = [[r, c] for r in (1, 2, 3) for c in (1, 2)]
+                ann    = lme.annotated if lme.annotated is not None else img_bgr
 
             except TemplateError as te:
                 cycle_ms = (time.perf_counter() - t0) * 1000
@@ -3447,6 +3468,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 ic_w=ic_a["w"], ic_h=ic_a["h"],
                 template_w=tmpl.get("img_w", 0),
                 min_blob_ratio=self._cfg.get("BLOB_MIN_RATIO", 0.0),
+                search_margin_x=self._cfg.get("TEMPLATE_SEARCH_MARGIN_X", 80),
+                search_margin_y=self._cfg.get("TEMPLATE_SEARCH_MARGIN_Y", 200),
             )
         self._inspector = Inspector(
             self._detector, tmpl, template_matcher=matcher,

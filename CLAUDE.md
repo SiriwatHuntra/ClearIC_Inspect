@@ -89,6 +89,8 @@ All configuration lives in `Config.toml` — no hardcoded dev flags. `ConfigLoad
 | `BLOB_MIN_RATIO` | `0.0` | Remove blobs < ratio × largest blob from `_contour_template` output; `0.0` = disabled; `0.2` removes IC-corner reflections |
 | `TEMPLATE_MATCH_THR` | `0.6` | Minimum match score for IC_A locate; below this logs a warning |
 | `TEMPLATE_FIND_CONF_THR` | `0.4` | Minimum match score to accept IC_B during auto-detection at setup |
+| `TEMPLATE_SEARCH_MARGIN_X` | `80` | ±px around expected pin-patch X position to search for IC_A |
+| `TEMPLATE_SEARCH_MARGIN_Y` | `200` | ±px around expected pin-patch Y position to search for IC_A |
 
 ### Grid geometry
 
@@ -177,7 +179,7 @@ image_bgr
   │
   ├─ _contour_template(image_bgr)  → full_filtered   ← full image, always
   │
-  ├─ compute search window: ic_x ± search_margin, exp_pin_y ± search_margin
+  ├─ compute search window: ic_x ± TEMPLATE_SEARCH_MARGIN_X, exp_pin_y ± TEMPLATE_SEARCH_MARGIN_Y
   │
   ├─ filtered = full_filtered[ry1:ry2, rx1:rx2]      ← crop AFTER preprocess
   │
@@ -216,7 +218,7 @@ Background division normalises lot-to-lot brightness variation without amplifyin
 Called identically at template-save time, search time, and IC_B setup detection so all three see the same global histogram.
 
 ### `TemplateMatcher.locate_ic(image_bgr) → (QRect, score)`
-Calls `_contour_template(image_bgr)` on the **full frame** first, then crops the `±search_margin` search window from the result. Matches the saved pin-area blob patch (50% of IC height below body) with `TM_CCOEFF_NORMED`. Always returns best-match position; logs a warning if score < threshold.
+Calls `_contour_template(image_bgr)` on the **full frame** first, then crops a `±TEMPLATE_SEARCH_MARGIN_X` / `±TEMPLATE_SEARCH_MARGIN_Y` search window from the result. Matches the saved pin-area blob patch (50% of IC height below body) with `TM_CCOEFF_NORMED`. Always returns best-match position; logs a warning if score < threshold.
 
 ### `_resolve_ic(missing_first, confs_first, confs_second) → still_missing`
 Confidence-weighted retry: `w = 0.7 * conf_second + 0.3 * conf_first`. Cell is PASS only if `w >= 0.90`. Applied only to cells that were missing on the first attempt.
@@ -423,7 +425,7 @@ Output suffixes: `_G` (clean pass), `_GS` (suspect pass), `_NGS` (suspect NG), `
 |---|---|---|
 | `TEXT_MIN_CONF` | Config.toml | Minimum text probability for PASS |
 | `TEXT_NG_THRESHOLD` | Config.toml | Missing-cell count: `_GS` vs `_NGS` boundary |
-| `search_margin` | `TemplateMatcher.__init__` | ±px around expected IC_A pin-patch position |
+| `TEMPLATE_SEARCH_MARGIN_X` / `_Y` | Config.toml | ±px around expected IC_A pin-patch position (X tight, Y wide) |
 | `match_threshold` | `template.json` | Minimum match score (below → warning only) |
 | `DISK_WARN_MB` | Config.toml | Free-space warning threshold |
 | `LOG_RETENTION` | Config.toml | Days to retain log files (default 730 = 2 years) |

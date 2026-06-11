@@ -250,6 +250,10 @@ class _SystemError(InspectionError):
 class CameraError(_SystemError):
     pass
 
+class CameraDisconnectedError(CameraError):
+    """Raised when no Basler camera can be enumerated at all (hardware unplugged/powered off)."""
+    pass
+
 class ModelError(_SystemError):
     pass
 
@@ -441,6 +445,20 @@ class Camera:
             except Exception as e:
                 print(f"[Camera] Exposure set error: {e}")
 
+    def set_serial(self, serial: str):
+        """Update the target serial for subsequent open()/retry calls (camera mode)."""
+        self._serial = serial
+
+    def get_serial(self) -> str:
+        """Return the serial of the currently-open Basler device, or '' if not
+        in camera mode / not open."""
+        if self._mode == "camera" and self._camera is not None and self._camera.IsOpen():
+            try:
+                return self._camera.GetDeviceInfo().GetSerialNumber()
+            except Exception:
+                return ""
+        return ""
+
     def close(self):
         if self._camera:
             try:
@@ -558,47 +576,64 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
     return result
 
 
-def _detect_camera_serial(preferred: str = "") -> tuple:
+def _open_camera_auto(camera: "Camera", cfg: dict):
     """
-    Enumerate connected Basler cameras via pypylon.
-    Returns (serial, model) of the camera to use — the 'preferred' serial if
-    still connected, otherwise the first device found. ("", "") if no
-    camera is connected or pypylon is unavailable.
-    """
-    try:
-        from pypylon import pylon
-    except ImportError:
-        return "", ""
-    try:
-        factory = pylon.TlFactory.GetInstance()
-        devices = factory.EnumerateDevices()
-    except Exception as e:
-        print(f"[Camera] Device enumeration failed: {e}")
-        return "", ""
-    for device in devices:
-        if preferred and device.GetSerialNumber() == preferred:
-            return device.GetSerialNumber(), device.GetModelName()
-    if devices:
-        device = devices[0]
-        return device.GetSerialNumber(), device.GetModelName()
-    return "", ""
+    Open `camera`, auto-(re)registering CAMERA_SERIAL in cfg/Config.toml.
 
+    Camera mode:
+      1. Try camera.open() with the configured serial (cfg["CAMERA_SERIAL"],
+         possibly "").
+      2. On success: if CAMERA_SERIAL was blank, look up the connected
+         device's real serial via camera.get_serial() and persist it.
+      3. On failure: enumerate connected Basler devices.
+         - none found at all -> CameraDisconnectedError("Hardware disconnected...")
+         - configured serial IS among them -> camera is present but open()
+           failed for another reason; re-raise original error unchanged
+         - otherwise -> a different camera is present; register its serial
+           (Config.toml + cfg + camera.set_serial), retry open() once
+           (errors from the retry propagate unchanged)
 
-def _auto_register_camera(cfg: dict) -> str:
-    """
-    Detect the connected Basler camera and persist its serial to Config.toml
-    (CAMERA_SERIAL) if it differs from the configured one, so the same unit
-    is targeted on subsequent starts. Camera mode only.
-    Returns the serial now in cfg["CAMERA_SERIAL"].
+    Directory mode: camera.open() directly; any error propagates unchanged.
     """
     if cfg.get("CAMERA") != "camera":
-        return cfg.get("CAMERA_SERIAL", "")
-    serial, model = _detect_camera_serial(cfg.get("CAMERA_SERIAL", ""))
-    if serial and serial != cfg.get("CAMERA_SERIAL", ""):
-        ConfigLoader.update({"CAMERA_SERIAL": serial})
-        cfg["CAMERA_SERIAL"] = serial
-        print(f"[Camera] Auto-registered {model} (S/N {serial}) → CAMERA_SERIAL")
-    return cfg.get("CAMERA_SERIAL", "")
+        camera.open()
+        return
+
+    try:
+        camera.open()
+    except CameraError as original_err:
+        try:
+            from pypylon import pylon
+            devices = pylon.TlFactory.GetInstance().EnumerateDevices()
+        except Exception as e:
+            print(f"[Camera] Device enumeration failed: {e}")
+            raise CameraDisconnectedError(
+                "Hardware disconnected — no Basler camera detected.") from original_err
+
+        if not devices:
+            raise CameraDisconnectedError(
+                "Hardware disconnected — no Basler camera detected.") from original_err
+
+        configured_serial = cfg.get("CAMERA_SERIAL", "")
+        if configured_serial and any(d.GetSerialNumber() == configured_serial for d in devices):
+            raise  # configured camera present but open() failed for another reason
+
+        found = devices[0]
+        found_serial = found.GetSerialNumber()
+        found_model  = found.GetModelName()
+        ConfigLoader.update({"CAMERA_SERIAL": found_serial})
+        cfg["CAMERA_SERIAL"] = found_serial
+        camera.set_serial(found_serial)
+        print(f"[Camera] Auto-registered {found_model} (S/N {found_serial}) → CAMERA_SERIAL")
+        camera.open()  # retry once; propagates unchanged on failure
+
+    if not cfg.get("CAMERA_SERIAL", ""):
+        serial = camera.get_serial()
+        if serial:
+            ConfigLoader.update({"CAMERA_SERIAL": serial})
+            cfg["CAMERA_SERIAL"] = serial
+            camera.set_serial(serial)
+            print(f"[Camera] Auto-registered S/N {serial} → CAMERA_SERIAL")
 
 
 # LIGHTING CONTROLLER
@@ -2249,10 +2284,12 @@ class RunWorker(QtCore.QThread):
                     self.sig_status.emit(
                         f"Reconnecting {attempt + 1}/{reconnect_attempts}…")
                     try:
-                        self._camera.open()
+                        _open_camera_auto(self._camera, self._cfg)
                         self._camera.warmup()
                         reconnected = True
                         break
+                    except CameraDisconnectedError as cde:
+                        self.sig_warn.emit(str(cde))
                     except CameraError:
                         pass
                 if not reconnected:
@@ -3404,9 +3441,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
 
-        if cfg.get("CAMERA") == "camera":
-            _auto_register_camera(cfg)
-
         self._camera_init_kwargs = dict(
             mode=cfg.get("CAMERA", "directory"),
             serial=cfg.get("CAMERA_SERIAL", ""),
@@ -3420,7 +3454,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         try:
             self._camera = Camera(**self._camera_init_kwargs)
-            self._camera.open()
+            _open_camera_auto(self._camera, cfg)
+            self._camera_init_kwargs["serial"] = cfg.get("CAMERA_SERIAL", "")
         except CameraError as e:
             self._show_error(str(e))
             if cfg.get("CAMERA") == "camera":
@@ -3533,12 +3568,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _retry_camera_open(self):
         """Called every 5 s when camera failed to open at startup (camera mode only)."""
-        if self._cfg.get("CAMERA") == "camera":
-            _auto_register_camera(self._cfg)
-            self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
+        self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
         try:
             cam = Camera(**self._camera_init_kwargs)
-            cam.open()
+            _open_camera_auto(cam, self._cfg)
+            self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
             self._camera = cam
             self._camera.warmup()
             try:
@@ -3557,6 +3591,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error_banner.hide()
             self._update_setup_buttons()
             self._lbl_status.setText("Camera reconnected.")
+        except CameraDisconnectedError as e:
+            self._show_error(str(e))
+            self._lbl_status.setText("Camera not found — retrying in 5 s…")
         except CameraError:
             self._lbl_status.setText("Camera not found — retrying in 5 s…")
 

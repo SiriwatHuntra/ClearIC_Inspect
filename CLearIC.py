@@ -558,6 +558,49 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
     return result
 
 
+def _detect_camera_serial(preferred: str = "") -> tuple:
+    """
+    Enumerate connected Basler cameras via pypylon.
+    Returns (serial, model) of the camera to use — the 'preferred' serial if
+    still connected, otherwise the first device found. ("", "") if no
+    camera is connected or pypylon is unavailable.
+    """
+    try:
+        from pypylon import pylon
+    except ImportError:
+        return "", ""
+    try:
+        factory = pylon.TlFactory.GetInstance()
+        devices = factory.EnumerateDevices()
+    except Exception as e:
+        print(f"[Camera] Device enumeration failed: {e}")
+        return "", ""
+    for device in devices:
+        if preferred and device.GetSerialNumber() == preferred:
+            return device.GetSerialNumber(), device.GetModelName()
+    if devices:
+        device = devices[0]
+        return device.GetSerialNumber(), device.GetModelName()
+    return "", ""
+
+
+def _auto_register_camera(cfg: dict) -> str:
+    """
+    Detect the connected Basler camera and persist its serial to Config.toml
+    (CAMERA_SERIAL) if it differs from the configured one, so the same unit
+    is targeted on subsequent starts. Camera mode only.
+    Returns the serial now in cfg["CAMERA_SERIAL"].
+    """
+    if cfg.get("CAMERA") != "camera":
+        return cfg.get("CAMERA_SERIAL", "")
+    serial, model = _detect_camera_serial(cfg.get("CAMERA_SERIAL", ""))
+    if serial and serial != cfg.get("CAMERA_SERIAL", ""):
+        ConfigLoader.update({"CAMERA_SERIAL": serial})
+        cfg["CAMERA_SERIAL"] = serial
+        print(f"[Camera] Auto-registered {model} (S/N {serial}) → CAMERA_SERIAL")
+    return cfg.get("CAMERA_SERIAL", "")
+
+
 # LIGHTING CONTROLLER
 class LightingController:
     """Serial ring-light controller (RS232 over USB-Prolific, IFWFOCR01 protocol)."""
@@ -3361,6 +3404,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except GPIOError as e:
             self._show_error(f"GPIO init failed: {e}")
 
+        if cfg.get("CAMERA") == "camera":
+            _auto_register_camera(cfg)
+
         self._camera_init_kwargs = dict(
             mode=cfg.get("CAMERA", "directory"),
             serial=cfg.get("CAMERA_SERIAL", ""),
@@ -3487,6 +3533,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _retry_camera_open(self):
         """Called every 5 s when camera failed to open at startup (camera mode only)."""
+        if self._cfg.get("CAMERA") == "camera":
+            _auto_register_camera(self._cfg)
+            self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
         try:
             cam = Camera(**self._camera_init_kwargs)
             cam.open()

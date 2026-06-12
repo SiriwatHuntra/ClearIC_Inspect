@@ -3622,8 +3622,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ann_show_labels=self._cfg.get("RESULT_OVERLAY", True),
         )
 
-    def _retry_camera_open(self):
-        """Called every 5 s when camera failed to open at startup (camera mode only)."""
+    def _try_reopen_camera(self) -> bool:
+        """Attempt to (re)open the Basler camera. Camera-mode only.
+
+        Closes any existing (non-open) camera handle first. On success, warms
+        up, grabs+shows a first frame, and arms the preview timer per
+        `_live_mode`. Returns True on success, False on CameraError.
+        """
+        if self._camera:
+            self._camera.close()
         self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
         try:
             cam = Camera(**self._camera_init_kwargs)
@@ -3637,8 +3644,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._setup_image = img
             except CameraError:
                 pass
-            if self._cam_retry_timer is not None:
-                self._cam_retry_timer.stop()
             if self._preview_timer is None:
                 self._preview_timer = QtCore.QTimer(self)
                 self._preview_timer.setInterval(100)
@@ -3646,13 +3651,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._live_mode:
                 self._preview_timer.start()
             self._btn_live.setEnabled(True)
+            return True
+        except CameraError:
+            self._camera = None
+            return False
+
+    def _retry_camera_open(self):
+        """Called every 5 s when camera failed to open at startup (camera mode only)."""
+        if self._try_reopen_camera():
+            if self._cam_retry_timer is not None:
+                self._cam_retry_timer.stop()
             self._error_banner.hide()
             self._update_setup_buttons()
             self._lbl_status.setText("Camera reconnected.")
-        except CameraDisconnectedError as e:
-            self._show_error(str(e))
-            self._lbl_status.setText("Camera not found — retrying in 5 s…")
-        except CameraError:
+        else:
             self._lbl_status.setText("Camera not found — retrying in 5 s…")
 
     # Rubber-band template setup flow
@@ -4400,6 +4412,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lighting.set_brightness(self._cfg.get("LIGHTING_VALUE", 100))
 
         parts = []
+
+        if self._cfg.get("CAMERA") == "camera":
+            if self._camera and self._camera.is_open():
+                cam_status = "OK"
+            elif self._try_reopen_camera():
+                if self._cam_retry_timer is not None:
+                    self._cam_retry_timer.stop()
+                self._error_banner.hide()
+                self._update_setup_buttons()
+                cam_status = "OK"
+            else:
+                cam_status = "NOT FOUND ⚠"
+            parts.append("Camera " + cam_status)
+
         if self._cfg.get("LIGHTING_ENABLE", False):
             if self._lighting and self._lighting.controller_ok:
                 _light_status = "OK"

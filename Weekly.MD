@@ -29,3 +29,8 @@ Optimization
  - Read from TOML -> Retry with auto regis -> Toast Hardware disconnect error
  - Hardware disconect detection and reconnection try
 
+USB hardware detection improvement
+ - Fix Cellcon and Lighting port detection failing with 4 USB devices connected
+ - Replace by-id chip identity match (ambiguous, same Prolific chip for both adapters) with functional probe
+ - Cellcon identified by LA -> LS protocol response, Lighting identified by ACK to off command
+

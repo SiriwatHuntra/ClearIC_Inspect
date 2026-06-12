@@ -1,22 +1,32 @@
 #LSI_PC PASSWORD "acce551b1e"
 import threading
+import multiprocessing
 from pypylon import pylon
 from pypylon import genicam
 import cv2
 import time
 # import pytesseract
 # from pytesseract import Output
+from PIL import Image, ImageDraw, ImageFilter
+import time
+import datetime
 import pickle
 import numpy as np
+import argparse
+import shutil
 import os
 import socket
 # import os.system
 import sys
+import RPi.GPIO as GPIO
+# import gpiod as GPIO
+import glob
 # import pytesseract
 # import pyautogui
 import requests
 import json
 import base64
+import pymssql
 import serial
 import logging
 import subprocess
@@ -32,6 +42,7 @@ from PyQt5.QtWidgets import *
 # from settingDialog import Ui_Dialog
 # from PyQt5.uic import loadUi
 from PyQt5.uic import *
+from getch import getche, getch
 
 Ui_MainWindow, QtBaseClass = uic.loadUiType("dialog1.ui")
 # Ui_SettingWindow, QtBaseClass = uic.loadUiType('setting.ui')

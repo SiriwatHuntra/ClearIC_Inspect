@@ -535,31 +535,34 @@ class CellCon:
 def _detect_ports(usb_id_hint: str = "") -> dict:
     """
     Returns {"lighting": path|None, "cellcon": path|None}.
-    Lighting: resolved from /dev/serial/by-id/ by matching usb_id_hint.
-    CellCon:  LA\\r\\n probe on remaining ttyUSB ports (3 retries, 0.5 s each).
+
+    Both serial adapters (CellCon + lighting) are usually the same Prolific
+    USB-RS232 chip, so they are indistinguishable by /dev/serial/by-id identity.
+    Identify each by how it *responds* instead — mirrors IFWFOCR01.checkComPort:
+
+      CellCon : LA\\r\\n probe; the port whose reply line starts with 'LS' wins.
+      Lighting: among the remaining ports, the one that ACKs the off command
+                '@00L0007C\\r\\n'. Falls back to a usb_id_hint by-id match, then
+                to the first remaining ttyUSB port.
     """
-    result = {"lighting": None, "cellcon": None}
+    import serial as _serial
+    result   = {"lighting": None, "cellcon": None}
+    all_ports = sorted(glob.glob("/dev/ttyUSB*"))
 
-    # Lighting: claimed first by hardware identity
-    if usb_id_hint:
-        for link in glob.glob("/dev/serial/by-id/*"):
-            if usb_id_hint in os.path.basename(link):
-                result["lighting"] = os.path.realpath(link)
-                break
+    def _open(port, timeout):
+        return _serial.Serial(port, 38400,
+                              parity=_serial.PARITY_NONE,
+                              stopbits=_serial.STOPBITS_ONE,
+                              bytesize=_serial.EIGHTBITS,
+                              timeout=timeout)
 
-    # CellCon: probe remaining ports
-    candidates = sorted(p for p in glob.glob("/dev/ttyUSB*")
-                        if p != result["lighting"])
-    for port in candidates:
+    # CellCon: functional probe across all ports (authoritative)
+    for port in all_ports:
         try:
-            import serial as _serial
-            with _serial.Serial(port, 38400,
-                                parity=_serial.PARITY_NONE,
-                                stopbits=_serial.STOPBITS_ONE,
-                                bytesize=_serial.EIGHTBITS,
-                                timeout=0.5) as s:
+            with _open(port, 0.5) as s:
+                s.reset_input_buffer()
                 s.write(b"LA\r\n")
-                for _ in range(3):
+                for _ in range(10):
                     line = s.readline().decode("utf-8", errors="ignore").strip()
                     if line.startswith("LS"):
                         result["cellcon"] = port
@@ -568,6 +571,31 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
             pass
         if result["cellcon"]:
             break
+
+    # Lighting: functional ACK probe among the remaining ports
+    remaining = [p for p in all_ports if p != result["cellcon"]]
+    for port in remaining:
+        try:
+            with _open(port, 0.3) as s:
+                s.reset_input_buffer()
+                s.write(b"@00L0007C\r\n")
+                if s.read(32):
+                    result["lighting"] = port
+                    break
+        except Exception:
+            pass
+
+    # Lighting fallbacks if no controller ACKed: by-id hint, then first remaining
+    if not result["lighting"] and remaining:
+        if usb_id_hint:
+            for link in glob.glob("/dev/serial/by-id/*"):
+                if usb_id_hint in os.path.basename(link):
+                    real = os.path.realpath(link)
+                    if real in remaining:
+                        result["lighting"] = real
+                        break
+        if not result["lighting"]:
+            result["lighting"] = remaining[0]
 
     light_str = result["lighting"] or "NOT FOUND"
     cell_str  = result["cellcon"]  or "NOT FOUND"

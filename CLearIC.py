@@ -3924,10 +3924,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from CellCon / subclass hook)
-        lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
-        if lot is None:
-            self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
-            return   # operator cancelled
+        if not self._cfg.get("DEBUG", True):
+            # Production: CellCon is authoritative — retreat if no lot received
+            # (mirrors IFWFOCR01.getLotNumFromCellcon() 'err' handling)
+            lot = self._cellcon.get_lot()
+            if not lot:
+                QtWidgets.QMessageBox.warning(
+                    self, "CellCon", "Lot number not found",
+                    QtWidgets.QMessageBox.Close)
+                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                return   # retreat — no lot from CellCon
+        else:
+            lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
+            if lot is None:
+                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                return   # operator cancelled
         self._lot_number   = lot
         self._package_name = inspector._template.get("package_name", "")
 

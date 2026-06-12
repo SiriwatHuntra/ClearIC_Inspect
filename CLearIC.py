@@ -471,7 +471,8 @@ class Camera:
 
     def is_open(self) -> bool:
         if self._mode == "camera":
-            return self._camera is not None and self._camera.IsOpen()
+            return (self._camera is not None and self._camera.IsOpen()
+                    and not self._camera.IsCameraDeviceRemoved())
         return bool(self._files)
 
     def has_more(self) -> bool:
@@ -3212,6 +3213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         eb_lay.setContentsMargins(8, 4, 8, 4)
         self._error_lbl = QtWidgets.QLabel("")
         self._error_lbl.setStyleSheet("color:#FFFFFF;font-weight:bold")
+        self._error_lbl.setWordWrap(True)
         eb_lay.addWidget(self._error_lbl)
         self._error_banner.hide()
         left_lay.addWidget(self._error_banner)
@@ -3650,11 +3652,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._preview_timer.timeout.connect(self._on_preview_tick)
             if self._live_mode:
                 self._preview_timer.start()
+            self._view.set_live(self._live_mode)
             self._btn_live.setEnabled(True)
             return True
         except CameraError:
             self._camera = None
             return False
+
+    def _on_camera_lost(self):
+        """Camera became unreachable during runtime — clean up and arm auto-retry."""
+        if self._camera:
+            self._camera.close()
+            self._camera = None
+        if self._preview_timer:
+            self._preview_timer.stop()
+        self._view.set_live(False)
+        self._btn_live.setEnabled(False)
+        if self._cam_retry_timer is None:
+            self._cam_retry_timer = QtCore.QTimer(self)
+            self._cam_retry_timer.setInterval(5000)
+            self._cam_retry_timer.timeout.connect(self._retry_camera_open)
+        if not self._cam_retry_timer.isActive():
+            self._cam_retry_timer.start()
+        self._show_error("Camera disconnected — check USB cable/power.")
+        self._lbl_status.setText("Camera not found — retrying in 5 s…")
 
     def _retry_camera_open(self):
         """Called every 5 s when camera failed to open at startup (camera mode only)."""
@@ -4053,7 +4074,7 @@ class MainWindow(QtWidgets.QMainWindow):
             img = self._camera.grab()
             self._view.set_image(img)
         except CameraError:
-            pass
+            self._on_camera_lost()
 
     def _start_worker(self, inspector: "Inspector", gpio: "RaspberryIO"):
         """Create and start RunWorker. Lock OCR fields for the duration of the run."""
@@ -4385,7 +4406,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_error(msg)   # after standby — _enter_standby does not clear the error banner
 
     # Error banner
+    _ERROR_MSG_MAX = 160
+
     def _show_error(self, msg: str):
+        msg = " ".join(msg.split())   # collapse embedded newlines/whitespace
+        if len(msg) > self._ERROR_MSG_MAX:
+            msg = msg[:self._ERROR_MSG_MAX - 1] + "…"
         self._error_lbl.setText(f"Error: {msg}")
         self._error_banner.show()
 
@@ -4423,6 +4449,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._update_setup_buttons()
                 cam_status = "OK"
             else:
+                self._on_camera_lost()
                 cam_status = "NOT FOUND ⚠"
             parts.append("Camera " + cam_status)
 

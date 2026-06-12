@@ -250,6 +250,10 @@ class _SystemError(InspectionError):
 class CameraError(_SystemError):
     pass
 
+class CameraDisconnectedError(CameraError):
+    """Raised when no Basler camera can be enumerated at all (hardware unplugged/powered off)."""
+    pass
+
 class ModelError(_SystemError):
     pass
 
@@ -441,6 +445,20 @@ class Camera:
             except Exception as e:
                 print(f"[Camera] Exposure set error: {e}")
 
+    def set_serial(self, serial: str):
+        """Update the target serial for subsequent open()/retry calls (camera mode)."""
+        self._serial = serial
+
+    def get_serial(self) -> str:
+        """Return the serial of the currently-open Basler device, or '' if not
+        in camera mode / not open."""
+        if self._mode == "camera" and self._camera is not None and self._camera.IsOpen():
+            try:
+                return self._camera.GetDeviceInfo().GetSerialNumber()
+            except Exception:
+                return ""
+        return ""
+
     def close(self):
         if self._camera:
             try:
@@ -517,31 +535,34 @@ class CellCon:
 def _detect_ports(usb_id_hint: str = "") -> dict:
     """
     Returns {"lighting": path|None, "cellcon": path|None}.
-    Lighting: resolved from /dev/serial/by-id/ by matching usb_id_hint.
-    CellCon:  LA\\r\\n probe on remaining ttyUSB ports (3 retries, 0.5 s each).
+
+    Both serial adapters (CellCon + lighting) are usually the same Prolific
+    USB-RS232 chip, so they are indistinguishable by /dev/serial/by-id identity.
+    Identify each by how it *responds* instead — mirrors IFWFOCR01.checkComPort:
+
+      CellCon : LA\\r\\n probe; the port whose reply line starts with 'LS' wins.
+      Lighting: among the remaining ports, the one that ACKs the off command
+                '@00L0007C\\r\\n'. Falls back to a usb_id_hint by-id match, then
+                to the first remaining ttyUSB port.
     """
-    result = {"lighting": None, "cellcon": None}
+    import serial as _serial
+    result   = {"lighting": None, "cellcon": None}
+    all_ports = sorted(glob.glob("/dev/ttyUSB*"))
 
-    # Lighting: claimed first by hardware identity
-    if usb_id_hint:
-        for link in glob.glob("/dev/serial/by-id/*"):
-            if usb_id_hint in os.path.basename(link):
-                result["lighting"] = os.path.realpath(link)
-                break
+    def _open(port, timeout):
+        return _serial.Serial(port, 38400,
+                              parity=_serial.PARITY_NONE,
+                              stopbits=_serial.STOPBITS_ONE,
+                              bytesize=_serial.EIGHTBITS,
+                              timeout=timeout)
 
-    # CellCon: probe remaining ports
-    candidates = sorted(p for p in glob.glob("/dev/ttyUSB*")
-                        if p != result["lighting"])
-    for port in candidates:
+    # CellCon: functional probe across all ports (authoritative)
+    for port in all_ports:
         try:
-            import serial as _serial
-            with _serial.Serial(port, 38400,
-                                parity=_serial.PARITY_NONE,
-                                stopbits=_serial.STOPBITS_ONE,
-                                bytesize=_serial.EIGHTBITS,
-                                timeout=0.5) as s:
+            with _open(port, 0.5) as s:
+                s.reset_input_buffer()
                 s.write(b"LA\r\n")
-                for _ in range(3):
+                for _ in range(10):
                     line = s.readline().decode("utf-8", errors="ignore").strip()
                     if line.startswith("LS"):
                         result["cellcon"] = port
@@ -551,11 +572,96 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
         if result["cellcon"]:
             break
 
+    # Lighting: functional ACK probe among the remaining ports
+    remaining = [p for p in all_ports if p != result["cellcon"]]
+    for port in remaining:
+        try:
+            with _open(port, 0.3) as s:
+                s.reset_input_buffer()
+                s.write(b"@00L0007C\r\n")
+                if s.read(32):
+                    result["lighting"] = port
+                    break
+        except Exception:
+            pass
+
+    # Lighting fallbacks if no controller ACKed: by-id hint, then first remaining
+    if not result["lighting"] and remaining:
+        if usb_id_hint:
+            for link in glob.glob("/dev/serial/by-id/*"):
+                if usb_id_hint in os.path.basename(link):
+                    real = os.path.realpath(link)
+                    if real in remaining:
+                        result["lighting"] = real
+                        break
+        if not result["lighting"]:
+            result["lighting"] = remaining[0]
+
     light_str = result["lighting"] or "NOT FOUND"
     cell_str  = result["cellcon"]  or "NOT FOUND"
     print(f"[Ports] Lighting → {light_str}")
     print(f"[Ports] CellCon  → {cell_str}")
     return result
+
+
+def _open_camera_auto(camera: "Camera", cfg: dict):
+    """
+    Open `camera`, auto-(re)registering CAMERA_SERIAL in cfg/Config.toml.
+
+    Camera mode:
+      1. Try camera.open() with the configured serial (cfg["CAMERA_SERIAL"],
+         possibly "").
+      2. On success: if CAMERA_SERIAL was blank, look up the connected
+         device's real serial via camera.get_serial() and persist it.
+      3. On failure: enumerate connected Basler devices.
+         - none found at all -> CameraDisconnectedError("Hardware disconnected...")
+         - configured serial IS among them -> camera is present but open()
+           failed for another reason; re-raise original error unchanged
+         - otherwise -> a different camera is present; register its serial
+           (Config.toml + cfg + camera.set_serial), retry open() once
+           (errors from the retry propagate unchanged)
+
+    Directory mode: camera.open() directly; any error propagates unchanged.
+    """
+    if cfg.get("CAMERA") != "camera":
+        camera.open()
+        return
+
+    try:
+        camera.open()
+    except CameraError as original_err:
+        try:
+            from pypylon import pylon
+            devices = pylon.TlFactory.GetInstance().EnumerateDevices()
+        except Exception as e:
+            print(f"[Camera] Device enumeration failed: {e}")
+            raise CameraDisconnectedError(
+                "Hardware disconnected — no Basler camera detected.") from original_err
+
+        if not devices:
+            raise CameraDisconnectedError(
+                "Hardware disconnected — no Basler camera detected.") from original_err
+
+        configured_serial = cfg.get("CAMERA_SERIAL", "")
+        if configured_serial and any(d.GetSerialNumber() == configured_serial for d in devices):
+            raise  # configured camera present but open() failed for another reason
+
+        found = devices[0]
+        found_serial = found.GetSerialNumber()
+        found_model  = found.GetModelName()
+        ConfigLoader.update({"CAMERA_SERIAL": found_serial})
+        cfg["CAMERA_SERIAL"] = found_serial
+        camera.set_serial(found_serial)
+        print(f"[Camera] Auto-registered {found_model} (S/N {found_serial}) → CAMERA_SERIAL")
+        camera.open()  # retry once; propagates unchanged on failure
+
+    if not cfg.get("CAMERA_SERIAL", ""):
+        serial = camera.get_serial()
+        if serial:
+            ConfigLoader.update({"CAMERA_SERIAL": serial})
+            cfg["CAMERA_SERIAL"] = serial
+            camera.set_serial(serial)
+            print(f"[Camera] Auto-registered S/N {serial} → CAMERA_SERIAL")
 
 
 # LIGHTING CONTROLLER
@@ -2206,10 +2312,12 @@ class RunWorker(QtCore.QThread):
                     self.sig_status.emit(
                         f"Reconnecting {attempt + 1}/{reconnect_attempts}…")
                     try:
-                        self._camera.open()
+                        _open_camera_auto(self._camera, self._cfg)
                         self._camera.warmup()
                         reconnected = True
                         break
+                    except CameraDisconnectedError as cde:
+                        self.sig_warn.emit(str(cde))
                     except CameraError:
                         pass
                 if not reconnected:
@@ -3374,7 +3482,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         try:
             self._camera = Camera(**self._camera_init_kwargs)
-            self._camera.open()
+            _open_camera_auto(self._camera, cfg)
+            self._camera_init_kwargs["serial"] = cfg.get("CAMERA_SERIAL", "")
         except CameraError as e:
             self._show_error(str(e))
             if cfg.get("CAMERA") == "camera":
@@ -3487,9 +3596,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _retry_camera_open(self):
         """Called every 5 s when camera failed to open at startup (camera mode only)."""
+        self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
         try:
             cam = Camera(**self._camera_init_kwargs)
-            cam.open()
+            _open_camera_auto(cam, self._cfg)
+            self._camera_init_kwargs["serial"] = self._cfg.get("CAMERA_SERIAL", "")
             self._camera = cam
             self._camera.warmup()
             try:
@@ -3508,6 +3619,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error_banner.hide()
             self._update_setup_buttons()
             self._lbl_status.setText("Camera reconnected.")
+        except CameraDisconnectedError as e:
+            self._show_error(str(e))
+            self._lbl_status.setText("Camera not found — retrying in 5 s…")
         except CameraError:
             self._lbl_status.setText("Camera not found — retrying in 5 s…")
 
@@ -3810,10 +3924,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from CellCon / subclass hook)
-        lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
-        if lot is None:
-            self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
-            return   # operator cancelled
+        if not self._cfg.get("DEBUG", True):
+            # Production: CellCon is authoritative — retreat if no lot received
+            # (mirrors IFWFOCR01.getLotNumFromCellcon() 'err' handling)
+            lot = self._cellcon.get_lot()
+            if not lot:
+                QtWidgets.QMessageBox.warning(
+                    self, "CellCon", "Lot number not found",
+                    QtWidgets.QMessageBox.Close)
+                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                return   # retreat — no lot from CellCon
+        else:
+            lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
+            if lot is None:
+                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                return   # operator cancelled
         self._lot_number   = lot
         self._package_name = inspector._template.get("package_name", "")
 

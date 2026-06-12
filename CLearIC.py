@@ -1841,67 +1841,67 @@ class Logger:
 # STYLESHEET
 STYLE = """
 QMainWindow, QWidget#root {
-    background: #5465FF;
+    background: #10172E;
 }
 QTabWidget::pane {
-    background: #5465FF;
+    background: #10172E;
     border: none;
 }
 QTabBar::tab {
-    background: #788BFF;
+    background: #1B2745;
     color: #FFFFFF;
     padding: 6px 18px;
     border-radius: 4px 4px 0 0;
     font-size: 12px;
 }
 QTabBar::tab:selected {
-    background: #5465FF;
+    background: #10172E;
     color: #FFFFFF;
     font-weight: bold;
 }
 QFrame#panel_right {
-    background: #5465FF;
+    background: #10172E;
 }
 QFrame#setup_frame, QFrame#controls_frame {
-    background: #788BFF;
+    background: #1B2745;
     border-radius: 8px;
     padding: 8px;
 }
 QFrame#main_view {
-    background: #788BFF;
+    background: #1B2745;
     border-radius: 8px;
 }
 QFrame#image_area {
-    background: #E2FDFF;
+    background: #10172E;
     border-radius: 8px;
 }
 QFrame#badge_area, QFrame#stats_area {
-    background: #9BB1FF;
+    background: #26355C;
     border-radius: 8px;
     padding: 8px;
 }
 QFrame#badge_pass {
-    background: #BFD7FF;
+    background: #324876;
     border-radius: 8px;
     padding: 8px;
 }
 QFrame#badge_fail {
-    background: #EF5350;
+    background: #6E2B2B;
     border-radius: 8px;
     padding: 8px;
 }
 QFrame#badge_idle {
-    background: #9BB1FF;
+    background: #26355C;
     border-radius: 8px;
     padding: 8px;
 }
 QFrame#error_banner {
-    background: #EF5350;
+    background: #6E2B2B;
     border-radius: 8px;
     padding: 6px;
 }
 QPushButton {
-    background: #5465FF;
+    background: #3D55A8;
     color: #FFFFFF;
     border-radius: 6px;
     padding: 6px 12px;
@@ -1909,13 +1909,13 @@ QPushButton {
     border: none;
 }
 QPushButton:disabled {
-    background: #788BFF;
-    color: #BFD7FF;
+    background: #1B2745;
+    color: #4D5E8C;
 }
 QLineEdit {
-    background: #FFFFFF;
-    color: #5465FF;
-    border: 2px solid #5465FF;
+    background: #0B1020;
+    color: #A9B8DC;
+    border: 2px solid #3D55A8;
     border-radius: 6px;
     padding: 4px 8px;
 }
@@ -1923,7 +1923,7 @@ QLabel {
     color: #FFFFFF;
 }
 QLabel#stat_value {
-    color: #E2FDFF;
+    color: #A9B8DC;
     font-weight: bold;
 }
 QCheckBox {
@@ -1943,10 +1943,10 @@ QCheckBox::indicator:checked {
     image: none;
 }
 QCheckBox:disabled {
-    color: #BFD7FF;
+    color: #4D5E8C;
 }
 QCheckBox::indicator:disabled {
-    border-color: #BFD7FF;
+    border-color: #4D5E8C;
 }
 """
 
@@ -1971,6 +1971,13 @@ class ImageView(QtWidgets.QLabel):
         self.setMouseTracking(True)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Expanding)
+
+        self._lbl_live = QtWidgets.QLabel("LIVE", self)
+        self._lbl_live.setStyleSheet(
+            "color:#00FF00; font-weight:bold; font-size:14px; background: transparent;")
+        self._lbl_live.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self._lbl_live.adjustSize()
+        self._lbl_live.hide()
 
     # image
     def set_image(self, img: np.ndarray):
@@ -2010,8 +2017,16 @@ class ImageView(QtWidgets.QLabel):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._reposition_live_label()
         if e.size() != e.oldSize():
             QtCore.QTimer.singleShot(0, self._refresh)
+
+    # live indicator
+    def set_live(self, on: bool):
+        self._lbl_live.setVisible(on)
+
+    def _reposition_live_label(self):
+        self._lbl_live.move(self.width() - self._lbl_live.width() - 10, 8)
 
     # coordinate helper
     def _to_img(self, pt: QtCore.QPoint) -> QtCore.QPoint:
@@ -2688,7 +2703,7 @@ class ImageCard(QtWidgets.QFrame):
         elif _stem.endswith("_G"):
             card_bg = "#478B8D"   # teal — PASS
         else:
-            card_bg = "#788BFF"
+            card_bg = "#1B2745"
         # Scoped selector: only this QFrame, not child labels
         self.setStyleSheet(
             f"QFrame#image_card{{background:{card_bg};border-radius:5px;}}")
@@ -2704,7 +2719,7 @@ class ImageCard(QtWidgets.QFrame):
         lay.addWidget(self._thumb)
 
         name_lbl = QtWidgets.QLabel(filename)
-        name_lbl.setStyleSheet("font-size:9px;color:#E2FDFF;background:transparent;")
+        name_lbl.setStyleSheet("font-size:9px;color:#A9B8DC;background:transparent;")
         name_lbl.setAlignment(QtCore.Qt.AlignCenter)
         metrics = QtGui.QFontMetrics(name_lbl.font())
         elided  = metrics.elidedText(filename, QtCore.Qt.ElideMiddle, card_w - 6)
@@ -2755,8 +2770,8 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._folder_list.setMinimumWidth(150)
         self._folder_list.setMaximumWidth(260)
         self._folder_list.setStyleSheet(
-            "QListWidget{background:#788BFF;border-radius:6px;color:#FFFFFF;font-size:11px}"
-            "QListWidget::item:selected{background:#5465FF;color:#FFFFFF}"
+            "QListWidget{background:#1B2745;border-radius:6px;color:#FFFFFF;font-size:11px}"
+            "QListWidget::item:selected{background:#3D55A8;color:#FFFFFF}"
         )
         self._folder_list.itemClicked.connect(self._on_folder_selected)
         root.addWidget(self._folder_list)
@@ -2798,7 +2813,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         nav.addWidget(self._btn_prev)
         self._lbl_nav = QtWidgets.QLabel("—")
         self._lbl_nav.setAlignment(QtCore.Qt.AlignCenter)
-        self._lbl_nav.setStyleSheet("color:#E2FDFF;font-size:11px")
+        self._lbl_nav.setStyleSheet("color:#A9B8DC;font-size:11px")
         nav.addWidget(self._lbl_nav, stretch=1)
         self._btn_next = QtWidgets.QPushButton("→")
         self._btn_next.setFixedWidth(48)
@@ -2842,7 +2857,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
         # Count label
         self._lbl_count = QtWidgets.QLabel("—")
-        self._lbl_count.setStyleSheet("font-size:16px;font-weight:bold;color:#E2FDFF")
+        self._lbl_count.setStyleSheet("font-size:16px;font-weight:bold;color:#A9B8DC")
         self._lbl_count.setAlignment(QtCore.Qt.AlignCenter)
         self._lbl_count.setWordWrap(True)
         right_lay.addWidget(self._lbl_count)
@@ -2858,13 +2873,13 @@ class ImageBrowserPage(QtWidgets.QWidget):
         right_lay.addWidget(kb_frame)
 
         lbl_kb = QtWidgets.QLabel("Controls")
-        lbl_kb.setStyleSheet("font-size:14px;font-weight:bold;color:#E2FDFF")
+        lbl_kb.setStyleSheet("font-size:14px;font-weight:bold;color:#A9B8DC")
         kb_lay.addWidget(lbl_kb)
 
         _KBD_STYLE = (
-            "QLabel{font-size:13px;color:#E2FDFF;padding:1px 0px;}")
+            "QLabel{font-size:13px;color:#A9B8DC;padding:1px 0px;}")
         _KEY_STYLE = (
-            "QLabel{font-size:13px;font-weight:bold;color:#5465FF;"
+            "QLabel{font-size:13px;font-weight:bold;color:#3D55A8;"
             "background:#FFFFFF;border-radius:3px;padding:2px 7px;}")
 
         for key_text, desc_text in [
@@ -2887,9 +2902,9 @@ class ImageBrowserPage(QtWidgets.QWidget):
         self._btn_back = QtWidgets.QPushButton("← Back")
         self._btn_back.clicked.connect(self._back_to_grid)
         self._btn_back.setStyleSheet(
-            "QPushButton{background:#FFFFFF;color:#5465FF;border-radius:6px;"
+            "QPushButton{background:#FFFFFF;color:#3D55A8;border-radius:6px;"
             "padding:8px 14px;font-weight:bold;font-size:12px;}"
-            "QPushButton:hover{background:#E2FDFF;}")
+            "QPushButton:hover{background:#A9B8DC;}")
         self._btn_back.hide()
         right_lay.addWidget(self._btn_back)
 
@@ -2922,7 +2937,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
 
     def _section_label(self, text: str) -> QtWidgets.QLabel:
         lbl = QtWidgets.QLabel(text)
-        lbl.setStyleSheet("font-size:11px;font-weight:bold;color:#E2FDFF")
+        lbl.setStyleSheet("font-size:11px;font-weight:bold;color:#A9B8DC")
         return lbl
 
     def _toggle_btn(self, text: str, checked: bool) -> QtWidgets.QPushButton:
@@ -2930,9 +2945,9 @@ class ImageBrowserPage(QtWidgets.QWidget):
         btn.setCheckable(True)
         btn.setChecked(checked)
         btn.setStyleSheet(
-            "QPushButton{background:#788BFF;color:#FFFFFF;border-radius:4px;"
+            "QPushButton{background:#1B2745;color:#FFFFFF;border-radius:4px;"
             "padding:5px 8px;font-size:11px}"
-            "QPushButton:checked{background:#FFFFFF;color:#5465FF;font-weight:bold}"
+            "QPushButton:checked{background:#FFFFFF;color:#3D55A8;font-weight:bold}"
         )
         return btn
 
@@ -3143,6 +3158,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_image:   np.ndarray | None   = None
         self._setup_state:   str                 = 'idle'   # idle/draw_a/draw_b/ready
 
+        # live preview state
+        self._live_mode:     bool                = False
+
         screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
         self.move(screen.x() + int(screen.width() * 0.05),
@@ -3221,12 +3239,22 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(8)
 
+        # Live section
+        live_frame, live_lay = self._make_section_frame("Live", spacing=6, obj_name="setup_frame")
+
+        self._btn_live = QtWidgets.QPushButton("Live")
+        self._btn_live.setEnabled(False)   # enabled in _init_system once camera is confirmed open
+        self._btn_live.clicked.connect(self._on_live_click)
+        live_lay.addWidget(self._btn_live)
+
+        right_lay.addWidget(live_frame)
+
         # Setup section
         setup_frame, setup_lay = self._make_section_frame("Setup", spacing=6, obj_name="setup_frame")
 
         self._lbl_tmpl_status = QtWidgets.QLabel("No template saved.")
         self._lbl_tmpl_status.setStyleSheet(
-            "font-size:11px;color:#E2FDFF;padding:4px 0px;")
+            "font-size:11px;color:#A9B8DC;padding:4px 0px;")
         self._lbl_tmpl_status.setWordWrap(True)
         self._lbl_tmpl_status.setMinimumHeight(36)
         setup_lay.addWidget(self._lbl_tmpl_status)
@@ -3288,7 +3316,7 @@ class MainWindow(QtWidgets.QMainWindow):
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             lbl = QtWidgets.QLabel(label)
-            lbl.setStyleSheet("font-size:10px;color:#E2FDFF")
+            lbl.setStyleSheet("font-size:10px;color:#A9B8DC")
             row.addWidget(lbl)
             row.addStretch()
             row.addWidget(widget)
@@ -3317,7 +3345,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ocr_frame, ocr_lay = self._make_section_frame("OCR Input", spacing=6, obj_name="setup_frame")
 
         lbl_op = QtWidgets.QLabel("Operator No. (6 digits):")
-        lbl_op.setStyleSheet("font-size:10px;color:#E2FDFF")
+        lbl_op.setStyleSheet("font-size:10px;color:#A9B8DC")
         ocr_lay.addWidget(lbl_op)
 
         self._edit_op_number = QtWidgets.QLineEdit()
@@ -3328,7 +3356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ocr_lay.addWidget(self._edit_op_number)
 
         lbl_mark = QtWidgets.QLabel("Expected Mark (6 chars, A–Z / 0–9):")
-        lbl_mark.setStyleSheet("font-size:10px;color:#E2FDFF")
+        lbl_mark.setStyleSheet("font-size:10px;color:#A9B8DC")
         ocr_lay.addWidget(lbl_mark)
 
         self._edit_ocr_expect = QtWidgets.QLineEdit()
@@ -3342,7 +3370,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._lbl_ocr_status = QtWidgets.QLabel("Fill both fields to enable Start.")
         self._lbl_ocr_status.setWordWrap(True)
-        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#E2FDFF")
+        self._lbl_ocr_status.setStyleSheet("font-size:11px;color:#A9B8DC")
         ocr_lay.addWidget(self._lbl_ocr_status)
 
         right_lay.addWidget(self._ocr_frame)   # always visible
@@ -3376,7 +3404,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frame.setObjectName("badge_pass")
             frame._result_lbl.setText("PASS")
             frame._result_lbl.setStyleSheet(
-                "font-size:16px;font-weight:bold;color:#5465FF")
+                "font-size:16px;font-weight:bold;color:#8FB4FF")
         else:
             frame.setObjectName("badge_fail")
             frame._result_lbl.setText("FAIL")
@@ -3402,7 +3430,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         lbl = QtWidgets.QLabel(label)
-        lbl.setStyleSheet("font-size:11px;color:#E2FDFF;font-weight:bold")
+        lbl.setStyleSheet("font-size:11px;color:#A9B8DC;font-weight:bold")
         val = QtWidgets.QLabel(value)
         val.setStyleSheet("font-size:11px;color:#FFFFFF")
         val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
@@ -3511,7 +3539,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._preview_timer = QtCore.QTimer(self)
             self._preview_timer.setInterval(100)
             self._preview_timer.timeout.connect(self._on_preview_tick)
-            self._preview_timer.start()
+            self._btn_live.setEnabled(True)
 
         # Port detection with visible feedback
         self._lbl_status.setText("Detecting hardware…")
@@ -3615,7 +3643,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._preview_timer = QtCore.QTimer(self)
                 self._preview_timer.setInterval(100)
                 self._preview_timer.timeout.connect(self._on_preview_tick)
-            self._preview_timer.start()
+            if self._live_mode:
+                self._preview_timer.start()
+            self._btn_live.setEnabled(True)
             self._error_banner.hide()
             self._update_setup_buttons()
             self._lbl_status.setText("Camera reconnected.")
@@ -3724,14 +3754,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "Check that each cell covers one mark position.\n"
             "Click Confirm to save, or Cancel to redraw.")
         info.setWordWrap(True)
-        info.setStyleSheet("font-size:11px;color:#E2FDFF")
+        info.setStyleSheet("font-size:11px;color:#A9B8DC")
         outer.addWidget(info)
 
         panels = QtWidgets.QHBoxLayout()
         ih, iw = img.shape[:2]
         for ic, label_text in ((ic_a, "IC_A"), (ic_b, "IC_B")):
             grp = QtWidgets.QGroupBox(label_text)
-            grp.setStyleSheet("color:#E2FDFF;font-weight:bold")
+            grp.setStyleSheet("color:#A9B8DC;font-weight:bold")
             grid = QtWidgets.QGridLayout(grp)
             grid.setSpacing(4)
             cells = _build_cells(
@@ -3753,7 +3783,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     80, 80, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
                 row_n, col_n = divmod(idx, 2)
                 lbl_name = QtWidgets.QLabel(f"R{row_n+1}C{col_n+1}")
-                lbl_name.setStyleSheet("font-size:9px;color:#E2FDFF")
+                lbl_name.setStyleSheet("font-size:9px;color:#A9B8DC")
                 lbl_name.setAlignment(QtCore.Qt.AlignCenter)
                 lbl_pix = QtWidgets.QLabel()
                 lbl_pix.setPixmap(pix)
@@ -3920,7 +3950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ocr_expect_value = self._edit_ocr_expect.text().strip()
 
         # Clear right-panel status immediately on Start click
-        self._set_ocr_status("Verifying lot number…", color="#E2FDFF")    
+        self._set_ocr_status("Verifying lot number…", color="#A9B8DC")    
         self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from CellCon / subclass hook)
@@ -3932,12 +3962,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(
                     self, "CellCon", "Lot number not found",
                     QtWidgets.QMessageBox.Close)
-                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
                 return   # retreat — no lot from CellCon
         else:
             lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
             if lot is None:
-                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
                 return   # operator cancelled
         self._lot_number   = lot
         self._package_name = inspector._template.get("package_name", "")
@@ -3990,8 +4020,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._logger.log_ocr(self._ocr_operator, self._ocr_used_mark)
         self._start_worker(inspector, gpio)
 
+    def _on_live_click(self):
+        self._live_mode = not self._live_mode
+        if self._live_mode:
+            self._btn_live.setText("Close")
+            self._view.set_live(True)
+            if self._preview_timer:
+                self._preview_timer.start()
+        else:
+            self._btn_live.setText("Live")
+            self._view.set_live(False)
+            if self._preview_timer:
+                self._preview_timer.stop()
+
     def _on_preview_tick(self):
-        if self._run_state != "standby" or not self._camera or self._setup_state != 'idle':
+        if (not self._live_mode or self._run_state != "standby"
+                or not self._camera or self._setup_state != 'idle'):
             return
         try:
             img = self._camera.grab()
@@ -4043,7 +4087,7 @@ class MainWindow(QtWidgets.QMainWindow):
             valid = self._ocr_fields_valid()
             self._btn_action.setEnabled(valid)
             if not valid:
-                self._set_ocr_status("Fill both fields to enable Start.", color="#E2FDFF")
+                self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
 
     def _ocr_api_call(self, lot: str, operator: str, expected_mark: str) -> bool:
         """POST to ReadMark API, compare result, POST CreateRecord. Returns True = proceed."""
@@ -4078,14 +4122,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 data = resp.json()
                 if not isinstance(data, list):
                     if debug:
-                        self._set_ocr_status("[DEBUG] ReadMark: unexpected response format — skipped", "#E2FDFF")
+                        self._set_ocr_status("[DEBUG] ReadMark: unexpected response format — skipped", "#A9B8DC")
                         is_pass = 1
                     else:
                         self._set_ocr_status("ReadMark: unexpected server response format", "#FF6B6B")
                         return False
                 elif not data:
                     if debug:
-                        self._set_ocr_status("[DEBUG] ReadMark: lot not found — skipped", "#E2FDFF")
+                        self._set_ocr_status("[DEBUG] ReadMark: lot not found — skipped", "#A9B8DC")
                         is_pass = 1
                     else:
                         self._set_ocr_status("ReadMark: lot not in DB — cannot verify", "#FF6B6B")
@@ -4094,7 +4138,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     std_mark = data[0].get("mark")
                     if std_mark is None:
                         if debug:
-                            self._set_ocr_status("[DEBUG] ReadMark: 'mark' field missing — skipped", "#E2FDFF")
+                            self._set_ocr_status("[DEBUG] ReadMark: 'mark' field missing — skipped", "#A9B8DC")
                             is_pass = 1
                         else:
                             self._set_ocr_status("ReadMark: server response missing 'mark' field", "#FF6B6B")
@@ -4140,7 +4184,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     return False
                 is_pass = 1
             elif debug:
-                self._set_ocr_status("[DEBUG] ReadMark unavailable — skipped", "#E2FDFF")
+                self._set_ocr_status("[DEBUG] ReadMark unavailable — skipped", "#A9B8DC")
                 is_pass = 1
             else:
                 self._set_ocr_status(f"ReadMark API error {resp.status_code} — check credentials/server", "#FF6B6B")
@@ -4165,7 +4209,7 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[OCR] {exc}")
             err_str = str(exc).lower()
             if debug:
-                self._set_ocr_status("[DEBUG] API unavailable — skipped", "#E2FDFF")
+                self._set_ocr_status("[DEBUG] API unavailable — skipped", "#A9B8DC")
                 return True
             if any(k in err_str for k in ("connection", "timeout", "unreachable")):
                 self._lbl_ocr_status.setText("ReadMark API unreachable — check network connection")
@@ -4247,7 +4291,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._edit_ocr_expect.setReadOnly(False)
         self._edit_op_number.clear()    # force re-entry each lot; prevent ID carry-over
         self._edit_ocr_expect.clear()   # each lot's mark must be entered fresh
-        self._set_ocr_status("Fill both fields to enable Start.", "#E2FDFF")
+        self._set_ocr_status("Fill both fields to enable Start.", "#A9B8DC")
         self._btn_action.setEnabled(self._ocr_fields_valid())   # False — fields now empty
         self._lbl_lot_info.setText("—")
         self._update_badge(self._badge_a, None)
@@ -4260,7 +4304,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_status.setText("Standby.")
         self._reload_default_image()
         if self._preview_timer:
-            self._preview_timer.stop()
+            if self._live_mode:
+                self._preview_timer.start()
+            else:
+                self._preview_timer.stop()
 
     def _reload_default_image(self):
         """Display the first image (or a live grab) and rewind the index."""

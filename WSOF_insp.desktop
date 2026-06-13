@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ClearIC Inspect
+Comment=IC Text Inspection System
+Path=/home/pi/ClearIC_Inspect
+Exec=bash -c "source venv/bin/activate && python CLearIC.py"
+Icon=accessories-document-viewer
+Terminal=true
+Categories=Utility;
+StartupNotify=true

@@ -34,3 +34,22 @@ USB hardware detection improvement
  - Replace by-id chip identity match (ambiguous, same Prolific chip for both adapters) with functional probe
  - Cellcon identified by LA -> LS protocol response, Lighting identified by ACK to off command
 
+Lot number flow
+ - Production mode: Cell-con is authoritative, retreat with warning if no lot received
+ - Debug mode: keep manual lot dialog entry
+
+Live preview mode
+ - Add Live/Close toggle button, off by default
+ - Show green LIVE label on image view while active
+ - Pause during inspection, auto-resume after standby
+ - Integrate with camera retry-open flow
+
+UI theme
+ - Repaint app theme from light blue/purple to dimly dark-blue
+ - Roll back IC Status section to simple badge row under image view
+
+Hardware re-detect / camera disconnect
+ - Add camera check to Re-detect Hardware button (OK / reopen / NOT FOUND)
+ - Fix error banner text overflow on long camera error messages (wrap + shorten)
+ - Detect physical camera unplug (IsCameraDeviceRemoved) during Live mode and on re-detect, auto-arm reconnect retry
+

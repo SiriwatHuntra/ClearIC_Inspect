@@ -1978,6 +1978,28 @@ QCheckBox:disabled {
 QCheckBox::indicator:disabled {
     border-color: #4D5E8C;
 }
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #0B1020;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #3D55A8;
+    width: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QSlider::sub-page:horizontal {
+    background: #3D55A8;
+    border-radius: 3px;
+}
+QSpinBox {
+    background: #0B1020;
+    color: #A9B8DC;
+    border: 2px solid #3D55A8;
+    border-radius: 6px;
+    padding: 2px 4px;
+}
 """
 
 class ImageView(QtWidgets.QLabel):
@@ -3334,6 +3356,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_lay.addWidget(live_frame)
 
+        # Lighting section — hidden unless Live mode + camera mode +
+        # lighting controller enabled (see _update_lighting_section_visibility)
+        self._light_frame, light_lay = self._make_section_frame(
+            "Lighting", spacing=6, obj_name="setup_frame")
+
+        bright_lbl = QtWidgets.QLabel("Brightness")
+        bright_lbl.setStyleSheet("font-size:10px;color:#A9B8DC")
+        light_lay.addWidget(bright_lbl)
+
+        bright_row = QtWidgets.QHBoxLayout()
+        bright_row.setContentsMargins(0, 0, 0, 0)
+        bright_row.setSpacing(6)
+
+        init_brightness = int(self._cfg.get("LIGHTING_VALUE", 100))
+
+        self._brightness_save_timer = QtCore.QTimer(self)
+        self._brightness_save_timer.setSingleShot(True)
+        self._brightness_save_timer.setInterval(400)
+        self._brightness_save_timer.timeout.connect(self._persist_brightness)
+
+        self._slider_brightness = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._slider_brightness.setRange(0, 255)
+        self._slider_brightness.setValue(init_brightness)
+        self._slider_brightness.valueChanged.connect(self._on_brightness_slider_changed)
+        bright_row.addWidget(self._slider_brightness, 1)
+
+        self._spin_brightness = QtWidgets.QSpinBox()
+        self._spin_brightness.setRange(0, 255)
+        self._spin_brightness.setValue(init_brightness)
+        self._spin_brightness.setFixedWidth(56)
+        self._spin_brightness.valueChanged.connect(self._on_brightness_spin_changed)
+        bright_row.addWidget(self._spin_brightness)
+
+        light_lay.addLayout(bright_row)
+
+        self._light_frame.setVisible(False)   # shown by _update_lighting_section_visibility
+        right_lay.addWidget(self._light_frame)
+
         # Setup section
         setup_frame, setup_lay = self._make_section_frame("Setup", spacing=6, obj_name="setup_frame")
 
@@ -3646,6 +3706,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if lighting_enabled:
             self._lighting.set_brightness(cfg.get("LIGHTING_VALUE", 100))
+        self._update_lighting_section_visibility()
 
         # Hardware toast
         parts = []
@@ -4148,6 +4209,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self._view.set_live(False)
             if self._preview_timer:
                 self._preview_timer.stop()
+        self._update_lighting_section_visibility()
+
+    # Lighting brightness slider/spinbox — only shown in Live + camera mode
+    def _update_lighting_section_visibility(self):
+        visible = (self._live_mode
+                   and self._cfg.get("CAMERA") == "camera"
+                   and self._lighting is not None
+                   and self._lighting._enabled)
+        self._light_frame.setVisible(visible)
+
+    def _on_brightness_slider_changed(self, value: int):
+        if self._spin_brightness.value() != value:
+            self._spin_brightness.blockSignals(True)
+            self._spin_brightness.setValue(value)
+            self._spin_brightness.blockSignals(False)
+        self._apply_brightness(value)
+
+    def _on_brightness_spin_changed(self, value: int):
+        if self._slider_brightness.value() != value:
+            self._slider_brightness.blockSignals(True)
+            self._slider_brightness.setValue(value)
+            self._slider_brightness.blockSignals(False)
+        self._apply_brightness(value)
+
+    def _apply_brightness(self, value: int):
+        self._cfg["LIGHTING_VALUE"] = value
+        if self._lighting:
+            self._lighting.set_brightness(value)
+        self._brightness_save_timer.start()   # debounced TOML write
+
+    def _persist_brightness(self):
+        ConfigLoader.save({"LIGHTING_VALUE": self._cfg.get("LIGHTING_VALUE", 100)})
 
     def _on_preview_tick(self):
         if (not self._live_mode or self._run_state != "standby"

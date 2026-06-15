@@ -1,6 +1,6 @@
 # ─── Simple Setup (true / false only) ───────────────────────────────────────
 # true = live Basler camera, false = load images from Input/ (directory mode)
-USE_CAMERA = false
+USE_CAMERA = true
 
 # Set to true to drive real GPIO pins; false = log-only, safe without hardware
 IO = false

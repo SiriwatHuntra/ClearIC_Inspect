@@ -1,16 +1,16 @@
 # ─── Simple Setup (true / false only) ───────────────────────────────────────
 # true = live Basler camera, false = load images from Input/ (directory mode)
-USE_CAMERA = true
+USE_CAMERA = false
 
 # Set to true to drive real GPIO pins; false = log-only, safe without hardware
-IO = true
+IO = false
 
 # Print extra debug logs and save annotated image every cycle
 DEBUG = True
 
 # Debug-only: flash lighting per loaded image in directory mode, mocking a real
 # capture flash. Requires DEBUG = true and USE_CAMERA = false.
-LIGHTING_TEST = false
+LIGHTING_TEST = true
 
 # Save cropped cells to Dataset/ for model retraining
 COLLECT_DATASET = false

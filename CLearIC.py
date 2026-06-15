@@ -605,6 +605,30 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
     return result
 
 
+def _detect_lighting_port(exclude: str = "") -> str | None:
+    """Lighting-only ACK probe across /dev/ttyUSB*, skipping `exclude`.
+
+    Returns the first port that ACKs '@00L0007C\\r\\n', or None.
+    """
+    import serial as _serial
+    for port in sorted(glob.glob("/dev/ttyUSB*")):
+        if port == exclude:
+            continue
+        try:
+            with _serial.Serial(port, 38400,
+                                 parity=_serial.PARITY_NONE,
+                                 stopbits=_serial.STOPBITS_ONE,
+                                 bytesize=_serial.EIGHTBITS,
+                                 timeout=0.3) as s:
+                s.reset_input_buffer()
+                s.write(b"@00L0007C\r\n")
+                if s.read(32):
+                    return port
+        except Exception:
+            pass
+    return None
+
+
 def _open_camera_auto(camera: "Camera", cfg: dict):
     """
     Open `camera`, auto-(re)registering CAMERA_SERIAL in cfg/Config.toml.
@@ -672,6 +696,7 @@ class LightingController:
 
     def __init__(self, enabled: bool, port: str):
         self._enabled       = enabled
+        self._port          = port
         self._ser           = None
         self._controller_ok = False
         if not enabled:
@@ -2174,6 +2199,8 @@ class RunWorker(QtCore.QThread):
     sig_resumed       = QtCore.pyqtSignal()
     sig_warn          = QtCore.pyqtSignal(str) # soft warning — run continues
 
+    _LIGHT_FAIL_THRESHOLD = 8   # consecutive bad cycles before re-detect attempt
+
     def __init__(self, camera: Camera, inspector: Inspector,
                  gpio: RaspberryIO, logger: Logger,
                  cfg: dict, lot_number: str = "",
@@ -2186,6 +2213,8 @@ class RunWorker(QtCore.QThread):
         self._cfg        = cfg
         self._lot_number = lot_number
         self._lighting   = lighting
+        self._light_ok_last     = None   # None=unknown, True/False=last observed state
+        self._light_fail_streak = 0
         self._stop    = False
         self._running = threading.Event()
         self._running.set()
@@ -2219,6 +2248,56 @@ class RunWorker(QtCore.QThread):
     def _async_imwrite(self, path: str, arr: np.ndarray):
         if self._write_q is not None:
             self._write_q.put((path, arr))
+
+    def _check_lighting_health(self):
+        """Debounced lighting-health check, called once per completed camera-mode cycle.
+
+        Emits sig_warn only on OK<->down transitions. After
+        _LIGHT_FAIL_THRESHOLD consecutive failures (and every multiple
+        thereof), attempts to re-detect the controller on another port.
+        """
+        if not self._lighting._enabled:
+            return
+
+        if self._light_ok_last is False:
+            ok = self._lighting.probe()
+        else:
+            ok = self._lighting.controller_ok
+
+        if ok:
+            self._light_fail_streak = 0
+            if self._light_ok_last is False:
+                self.sig_warn.emit("Lighting controller responding again ✓")
+            self._light_ok_last = True
+            return
+
+        self._light_fail_streak += 1
+        if self._light_ok_last is not False:
+            self.sig_warn.emit("Lighting controller no response ⚠ — check USB connection")
+        self._light_ok_last = False
+
+        if self._light_fail_streak % self._LIGHT_FAIL_THRESHOLD == 0:
+            self._try_relocate_lighting()
+
+    def _try_relocate_lighting(self):
+        """Sustained lighting failure — the adapter may have re-enumerated on a
+        different /dev/ttyUSB* node. Re-probe and reconnect if found."""
+        old_port = self._lighting._port
+        new_port = _detect_lighting_port(exclude=old_port)
+        if not new_port:
+            self.sig_status.emit("Lighting re-detect: no controller found ⚠")
+            return
+
+        self.sig_status.emit(f"Lighting re-detect: found controller on {new_port} — reconnecting…")
+        self._lighting.close()
+        self._lighting = LightingController(enabled=True, port=new_port)
+        if self._lighting.controller_ok:
+            self._lighting.set_brightness(self._cfg.get("LIGHTING_VALUE", 100))
+            self._light_fail_streak = 0
+            self._light_ok_last = True
+            self.sig_warn.emit(f"Lighting controller reconnected on {new_port} ✓")
+        else:
+            self.sig_status.emit(f"Lighting re-detect: {new_port} opened but no ACK ⚠")
 
     def stop(self):
         self._stop = True
@@ -2509,6 +2588,7 @@ class RunWorker(QtCore.QThread):
                 self._gpio.set_inspec_stage(True)                 # restore idle HIGH
                 if self._lighting:
                     self._lighting.off()
+                    self._check_lighting_health()
                 # camera stays open — closed at lot end by exit guard
             elif lighting_test:
                 self._lighting.off()
@@ -4311,6 +4391,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_run_done(self):
         """Called when the worker loop exits."""
+        if self._worker is not None:
+            self._lighting = self._worker._lighting
         if self._run_state == "standby":
             return   # Stop already handled this via _stop_run; ignore queued sig_done
         elapsed = time.monotonic() - self._session_start_time

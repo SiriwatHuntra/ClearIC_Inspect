@@ -150,7 +150,7 @@ LIGHTING_USB_ID = "Prolific_Technology_Inc._USB-Serial_Controller"
 LIGHTING_PORT = "/dev/ttyUSB1"
 
 # Brightness level 0–255 set at startup, held for the entire run
-LIGHTING_VALUE = 255
+LIGHTING_VALUE = 40
 
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────

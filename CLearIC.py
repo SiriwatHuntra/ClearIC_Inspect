@@ -2045,6 +2045,9 @@ class ImageView(QtWidgets.QLabel):
         self._lbl_live.adjustSize()
         self._lbl_live.hide()
 
+        self._font_label     = QtGui.QFont("Arial", 9, QtGui.QFont.Bold)
+        self._pen_rubberband = QtGui.QPen(QtGui.QColor("#FFD700"), 2, QtCore.Qt.DashLine)
+
     # image
     def set_image(self, img: np.ndarray):
         if img is None:
@@ -2068,11 +2071,22 @@ class ImageView(QtWidgets.QLabel):
         if lw < 2 or lh < 2:   # widget not yet sized — skip to avoid feedback loop
             return
         h, w = self._orig.shape[:2]
-        rgb  = cv2.cvtColor(self._orig, cv2.COLOR_BGR2RGB)
-        qi   = QtGui.QImage(bytes(rgb.data), w, h, 3 * w, QtGui.QImage.Format_RGB888)
-        pix  = QtGui.QPixmap.fromImage(qi)
-        pix  = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
-                          QtCore.Qt.SmoothTransformation)
+        scale = min(lw / w, lh / h)
+        if scale < 1.0:
+            # Shrink the raw frame first — converting/copying it at full
+            # resolution just to immediately downscale in Qt wastes CPU on
+            # every preview tick and inspection cycle.
+            sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+            small  = cv2.resize(self._orig, (sw, sh), interpolation=cv2.INTER_AREA)
+            rgb    = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            qi     = QtGui.QImage(bytes(rgb.data), sw, sh, 3 * sw, QtGui.QImage.Format_RGB888)
+            pix    = QtGui.QPixmap.fromImage(qi)
+        else:
+            rgb = cv2.cvtColor(self._orig, cv2.COLOR_BGR2RGB)
+            qi  = QtGui.QImage(bytes(rgb.data), w, h, 3 * w, QtGui.QImage.Format_RGB888)
+            pix = QtGui.QPixmap.fromImage(qi)
+            pix = pix.scaled(lw, lh, QtCore.Qt.KeepAspectRatio,
+                              QtCore.Qt.SmoothTransformation)
         if w > 0:
             self._scale = pix.width() / w
         self._offset = QtCore.QPoint((lw - pix.width())  // 2,
@@ -2143,15 +2157,14 @@ class ImageView(QtWidgets.QLabel):
             painter.setBrush(QtCore.Qt.NoBrush)
             painter.drawRect(wr)
             if label:
-                painter.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
+                painter.setFont(self._font_label)
                 painter.setPen(color)
                 painter.drawText(wr.topLeft() + QtCore.QPoint(3, 14), label)
 
         if has_rb:
             rb_img    = QtCore.QRect(self._rb_start, self._rb_cur).normalized()
             rb_widget = self._to_widget(rb_img)
-            pen = QtGui.QPen(QtGui.QColor("#FFD700"), 2, QtCore.Qt.DashLine)
-            painter.setPen(pen)
+            painter.setPen(self._pen_rubberband)
             painter.setBrush(QtCore.Qt.NoBrush)
             painter.drawRect(rb_widget)
 
@@ -4260,7 +4273,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_brightness(self, value: int):
         self._cfg["LIGHTING_VALUE"] = value
         if self._lighting:
+            # @00F (set brightness) only updates a register — the controller
+            # doesn't apply the new level until @00L1 (ON) is re-sent.
             self._lighting.set_brightness(value)
+            self._lighting.on()
         self._brightness_save_timer.start()   # debounced TOML write
 
     def _persist_brightness(self):

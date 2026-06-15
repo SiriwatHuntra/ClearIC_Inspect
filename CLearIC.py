@@ -721,7 +721,11 @@ class LightingController:
     def _send(self, data: bytes):
         if not self._enabled or self._ser is None:
             return
-        self._ser.write(data)
+        try:
+            self._ser.write(data)
+        except Exception as e:
+            print(f"[Lighting] Write error: {e} — controller unreachable")
+            self._controller_ok = False
 
     @staticmethod
     def _brightness_cmd(value: int) -> bytes:
@@ -2320,8 +2324,7 @@ class RunWorker(QtCore.QThread):
                     continue
                 # Camera mode: attempt reconnect then continue
                 self.sig_status.emit("Camera grab failed — reconnecting…")
-                if self._camera.is_open():
-                    self._camera.close()
+                self._camera.close()
                 reconnected = False
                 for attempt in range(reconnect_attempts):
                     time.sleep(reconnect_delay)

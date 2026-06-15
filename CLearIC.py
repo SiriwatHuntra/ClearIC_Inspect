@@ -563,9 +563,9 @@ def _detect_ports(usb_id_hint: str = "") -> dict:
             with _open(port, 0.5) as s:
                 s.reset_input_buffer()
                 s.write(b"LA\r\n")
-                for _ in range(10):
-                    line = s.readline().decode("utf-8", errors="ignore").strip()
-                    if line.startswith("LS"):
+                resp = s.read(256).decode("utf-8", errors="ignore")
+                for line in resp.splitlines():
+                    if line.strip().startswith("LS"):
                         result["cellcon"] = port
                         break
         except Exception:

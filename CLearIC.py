@@ -1119,7 +1119,7 @@ def _safe_crop(image: np.ndarray, cx: int, cy: int,
 # Downscale factor applied inside _contour_template before the expensive blur/morph steps.
 # Result is returned at 1/N resolution; callers that do coordinate arithmetic must multiply
 # match locations back by this factor.  1 = full resolution (original behaviour).
-_CONTOUR_DOWNSCALE = 2
+_CONTOUR_DOWNSCALE = 3
 
 def _contour_template(image_bgr: np.ndarray,
                       min_blob_ratio: float = 0.0,
@@ -1212,6 +1212,7 @@ class TemplateManager:
             "strip_h":         strip_h,
             "img_w":           img_w,
             "img_h":           img_h,
+            "contour_downscale": _CONTOUR_DOWNSCALE,  # downscale the patch was baked at
         }
         _tmp = _TEMPLATE_FILE + ".tmp"
         with open(_tmp, "w") as f:
@@ -1353,7 +1354,8 @@ class TemplateMatcher:
                  search_margin_x: int = 60,
                  search_margin_y: int = 60,
                  template_w: int = 0,
-                 min_blob_ratio: float = 0.0):
+                 min_blob_ratio: float = 0.0,
+                 save_downscale: int = 2):
         self._patch          = full_patch
         self._threshold      = threshold
         self._strip_h        = strip_h   # px from patch top to IC top edge
@@ -1366,6 +1368,7 @@ class TemplateMatcher:
         self._margin_y       = search_margin_y   # ±px around expected Y pos to search
         self._template_w     = template_w      # image width when template was saved (0 = unknown)
         self._min_blob_ratio = min_blob_ratio  # passed to _contour_template at search time
+        self._save_downscale = max(1, int(save_downscale))  # downscale the patch was baked at
 
     def locate_ic(self, image_bgr: np.ndarray) -> tuple:
         """
@@ -1377,33 +1380,34 @@ class TemplateMatcher:
         and stored coords are scaled to match before downscaling.
         """
         img_h, img_w = image_bgr.shape[:2]
-        ds = _CONTOUR_DOWNSCALE
+        ds = _CONTOUR_DOWNSCALE   # downscale used for THIS run's search map
 
-        # --- resolve template coords to current full-res image space ---
-        if self._template_w > 0 and abs(img_w / self._template_w - 1.0) > 0.01:
-            scale = img_w / self._template_w
+        # --- resolve template coords + patch scale to current image space ---
+        # IC geometry is stored in full-res px → scales only with the image
+        # resolution ratio (coord_scale). The patch is stored at the save-time
+        # downscale → it must additionally be rescaled by (save_downscale / ds)
+        # so it still matches the search map even when _CONTOUR_DOWNSCALE has
+        # changed since the template was saved (legacy patches were baked at /2).
+        coord_scale = (img_w / self._template_w) if self._template_w > 0 else 1.0
+        patch_scale = coord_scale * self._save_downscale / ds
+
+        ic_x    = int(self._ic_x    * coord_scale)
+        ic_y    = int(self._ic_y    * coord_scale)
+        ic_w    = max(1, int(self._ic_w * coord_scale))
+        ic_h    = max(1, int(self._ic_h * coord_scale))
+        strip_h = int(self._strip_h * coord_scale)
+        mx      = int(self._margin_x * coord_scale)
+        my      = int(self._margin_y * coord_scale)
+
+        if abs(patch_scale - 1.0) > 0.01:
             ph0, pw0 = self._patch.shape[:2]
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            # patch is stored at (template_w // ds) width; rescale to (img_w // ds) width
+            interp = cv2.INTER_AREA if patch_scale < 1.0 else cv2.INTER_LINEAR
             patch = cv2.resize(self._patch,
-                               (max(1, int(pw0 * scale)), max(1, int(ph0 * scale))),
+                               (max(1, int(pw0 * patch_scale)),
+                                max(1, int(ph0 * patch_scale))),
                                interpolation=interp)
-            ic_x    = int(self._ic_x    * scale)
-            ic_y    = int(self._ic_y    * scale)
-            ic_w    = max(1, int(self._ic_w * scale))
-            ic_h    = max(1, int(self._ic_h * scale))
-            strip_h = int(self._strip_h * scale)
-            mx      = int(self._margin_x * scale)
-            my      = int(self._margin_y * scale)
         else:
-            patch   = self._patch
-            ic_x    = self._ic_x
-            ic_y    = self._ic_y
-            ic_w    = self._ic_w
-            ic_h    = self._ic_h
-            strip_h = self._strip_h
-            mx      = self._margin_x
-            my      = self._margin_y
+            patch = self._patch
 
         ph, pw  = patch.shape[:2]           # patch dims already at 1/ds scale
         exp_y   = ic_y - strip_h            # full-res expected patch-top Y
@@ -2485,6 +2489,7 @@ class RunWorker(QtCore.QThread):
             # Inspect (with one retry on fail)
             # inspect() returns an annotated copy; img_bgr stays unannotated (= raw_bgr).
             is_retry    = False
+            no_template = False
             miss_a      = []
             miss_b      = []
             raw_bgr     = img_bgr          # unannotated original; inspect() no longer modifies it
@@ -2509,21 +2514,22 @@ class RunWorker(QtCore.QThread):
                 ann    = lme.annotated if lme.annotated is not None else img_bgr
 
             except TemplateError as te:
-                cycle_ms = (time.perf_counter() - t0) * 1000
-                self._logger.log_error("TEMPLATE_ERROR", str(te), cycle_ms)
-                if cam_mode == "directory":
-                    if lighting_test:
-                        self._lighting.off()
-                    self.sig_status.emit(f"Skipping {img_id}: {te}")
-                    continue
-                self.sig_error.emit(f"Template error: {te}")
-                self.sig_status.emit("ERROR — template invalid, restart required.")
-                self._gpio.clear_outputs()
-                if self._camera.is_open():
-                    self._camera.close()
-                if self._lighting:
-                    self._lighting.off()
-                break
+                self._logger.log_error("TEMPLATE_ERROR", str(te),
+                                       (time.perf_counter() - t0) * 1000)
+                self.sig_status.emit(f"No template match — recorded as NOWORK: {te}")
+                # Record as NOWORK and treat like a full NG: all cells forced
+                # missing, annotated frame built fresh since inspect() raised
+                # before creating its own copy. Falls through to the common
+                # finalize/save/GPIO section below — run keeps going.
+                no_template = True
+                miss_a = [[r, c] for r in (1, 2, 3) for c in (1, 2)]
+                miss_b = [[r, c] for r in (1, 2, 3) for c in (1, 2)]
+                ann    = img_bgr.copy()
+                label  = "NO TEMPLATE"
+                h, w   = ann.shape[:2]
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.putText(ann, label, (w - tw - 8, h - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
             except MarkMissingError as e1:
                 if cam_mode == "camera":
@@ -2591,7 +2597,7 @@ class RunWorker(QtCore.QThread):
             elif n_missing >= _TOTAL_CELLS:
                 passed     = False
                 is_suspect = False
-                suffix     = "_NG"
+                suffix     = "_NOWORK" if no_template else "_NG"
             elif n_missing >= _ng_threshold:
                 passed     = False
                 is_suspect = True
@@ -2827,7 +2833,9 @@ class ImageCard(QtWidgets.QFrame):
         self.setCursor(QtCore.Qt.PointingHandCursor)
 
         _stem = os.path.splitext(filename)[0]
-        if _stem.endswith("_NGS"):
+        if _stem.endswith("_NOWORK"):
+            card_bg = "#8A5FBF"   # purple — template not found
+        elif _stem.endswith("_NGS"):
             card_bg = "#E07820"   # orange — FAIL suspect
         elif _stem.endswith("_GS"):
             card_bg = "#A0B830"   # yellow-green — PASS suspect
@@ -3130,7 +3138,7 @@ class ImageBrowserPage(QtWidgets.QWidget):
         stem = os.path.splitext(os.path.basename(path))[0]
         sfx  = stem.rsplit("_", 1)[-1] if "_" in stem else ""
         if flt == "FAIL":
-            return sfx in ("NG", "NGS")
+            return sfx in ("NG", "NGS", "NOWORK")
         if flt == "PASS":
             return sfx in ("G", "GS")
         if flt == "SUSPECT":
@@ -3790,6 +3798,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 min_blob_ratio=self._cfg.get("BLOB_MIN_RATIO", 0.0),
                 search_margin_x=self._cfg.get("TEMPLATE_SEARCH_MARGIN_X", 80),
                 search_margin_y=self._cfg.get("TEMPLATE_SEARCH_MARGIN_Y", 200),
+                save_downscale=tmpl.get("contour_downscale", 2),  # legacy patches were baked at /2
             )
         self._inspector = Inspector(
             self._detector, tmpl, template_matcher=matcher,
@@ -4202,7 +4211,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
         # Purge orphaned temp files from today's output dir (leftover from crashes)
-        _VALID_SFX = ("_G.jpg", "_NG.jpg", "_GS.jpg", "_NGS.jpg")
+        _VALID_SFX = ("_G.jpg", "_NG.jpg", "_GS.jpg", "_NGS.jpg", "_NOWORK.jpg")
         today_dir  = os.path.join(out_dir, datetime.now().strftime("%Y%m%d"))
         if os.path.isdir(today_dir):
             for _root, _, _files in os.walk(today_dir):

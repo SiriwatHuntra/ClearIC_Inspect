@@ -6,7 +6,7 @@ USE_CAMERA = true
 IO = false
 
 # Print extra debug logs and save annotated image every cycle
-DEBUG = true
+DEBUG = false
 
 # Debug-only: flash lighting per loaded image in directory mode, mocking a real
 # capture flash. Requires DEBUG = true and USE_CAMERA = false.

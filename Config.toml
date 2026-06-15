@@ -6,7 +6,7 @@ USE_CAMERA = true
 IO = false
 
 # Print extra debug logs and save annotated image every cycle
-DEBUG = True
+DEBUG = true
 
 # Debug-only: flash lighting per loaded image in directory mode, mocking a real
 # capture flash. Requires DEBUG = true and USE_CAMERA = false.
@@ -150,7 +150,7 @@ LIGHTING_USB_ID = "Prolific_Technology_Inc._USB-Serial_Controller"
 LIGHTING_PORT = "/dev/ttyUSB1"
 
 # Brightness level 0–255 set at startup, held for the entire run
-LIGHTING_VALUE = 100
+LIGHTING_VALUE = 255
 
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────

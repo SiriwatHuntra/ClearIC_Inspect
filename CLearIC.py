@@ -101,22 +101,26 @@ class ConfigLoader:
         "LIGHTING_TEST":        False,  # debug-only: flash lighting per loaded image in directory mode (mocks capture flash)
     }
 
+    @staticmethod
+    def _normalize_booleans(raw: str) -> str:
+        """Lowercase Python-style True/False so tomlkit (strict TOML) can parse them."""
+        import re as _re
+        return _re.sub(
+            r'(=\s*)(True|TRUE|False|FALSE)(\s*(?:#.*)?$)',
+            lambda m: m.group(1) + m.group(2).lower() + m.group(3),
+            raw,
+            flags=_re.MULTILINE,
+        )
+
     @classmethod
     def load(cls) -> dict:
         import tomlkit
         if not os.path.exists(cls.CONFIG_FILE):
             raise ConfigError("Config.toml not found — create it before running.")
         try:
-            import re as _re
             with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
                 _raw = f.read()
-            _raw = _re.sub(
-                r'(=\s*)(True|TRUE|False|FALSE)(\s*(?:#.*)?$)',
-                lambda m: m.group(1) + m.group(2).lower() + m.group(3),
-                _raw,
-                flags=_re.MULTILINE,
-            )
-            data = tomlkit.loads(_raw)
+            data = tomlkit.loads(cls._normalize_booleans(_raw))
         except Exception as e:
             raise ConfigError(f"Config.toml unreadable: {e}")
         cfg = dict(cls.DEFAULT_CONFIG)
@@ -195,13 +199,27 @@ class ConfigLoader:
         return cfg
 
     @classmethod
+    def _load_doc(cls):
+        """Load Config.toml as an editable tomlkit document (preserves comments/formatting).
+
+        Only a missing file falls back to a blank document. A file that exists
+        but fails to parse raises ConfigError — it must NOT be silently
+        replaced with a blank document, or save()/update() would wipe it.
+        """
+        import tomlkit
+        if not os.path.exists(cls.CONFIG_FILE):
+            return tomlkit.document()
+        with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+            _raw = f.read()
+        try:
+            return tomlkit.loads(cls._normalize_booleans(_raw))
+        except Exception as e:
+            raise ConfigError(f"Config.toml unreadable: {e}")
+
+    @classmethod
     def save(cls, updates: dict):
         import tomlkit
-        try:
-            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
-                doc = tomlkit.load(f)
-        except Exception:
-            doc = tomlkit.document()
+        doc = cls._load_doc()
         for k, v in updates.items():
             if k in cls.DEFAULT_CONFIG:
                 doc[k] = v
@@ -211,17 +229,7 @@ class ConfigLoader:
     @classmethod
     def update(cls, updates: dict):
         """Merge partial updates into saved config. Only known keys are accepted."""
-        import tomlkit
-        try:
-            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
-                doc = tomlkit.load(f)
-        except Exception:
-            doc = tomlkit.document()
-        for k, v in updates.items():
-            if k in cls.DEFAULT_CONFIG:
-                doc[k] = v
-        with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
-            f.write(tomlkit.dumps(doc))
+        cls.save(updates)
         return cls.load()
 
 # EXCEPTIONS
@@ -748,6 +756,12 @@ class LightingController:
             return
         try:
             self._ser.write(data)
+            # Drain the controller's ACK — some units won't accept the next
+            # command until the previous response has been read off the port.
+            prev_timeout = self._ser.timeout
+            self._ser.timeout = 0.05
+            self._ser.read(32)
+            self._ser.timeout = prev_timeout
         except Exception as e:
             print(f"[Lighting] Write error: {e} — controller unreachable")
             self._controller_ok = False
@@ -3704,6 +3718,11 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=lighting_enabled,
             port=lighting_port,
         )
+        if self._lighting._enabled and not self._lighting.controller_ok:
+            # Some units don't respond on the first open after power-up/USB
+            # re-enumeration — closing and reopening the port wakes them up.
+            self._lighting.close()
+            self._lighting = LightingController(enabled=True, port=lighting_port)
         if lighting_enabled:
             self._lighting.set_brightness(cfg.get("LIGHTING_VALUE", 100))
         self._update_lighting_section_visibility()
@@ -3846,7 +3865,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error(str(e))
             return None
         finally:
-            if self._lighting:
+            # Leave the light on if Live mode is active and wants it on
+            if self._lighting and not self._live_mode:
                 self._lighting.off()
 
     def _on_new_tmpl_click(self):
@@ -4202,11 +4222,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._live_mode:
             self._btn_live.setText("Close")
             self._view.set_live(True)
+            if self._lighting:
+                self._lighting.on()
             if self._preview_timer:
                 self._preview_timer.start()
         else:
             self._btn_live.setText("Live")
             self._view.set_live(False)
+            if self._lighting:
+                self._lighting.off()
             if self._preview_timer:
                 self._preview_timer.stop()
         self._update_lighting_section_visibility()

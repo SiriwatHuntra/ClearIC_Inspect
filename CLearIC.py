@@ -3403,6 +3403,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._brightness_save_timer.setInterval(400)
         self._brightness_save_timer.timeout.connect(self._persist_brightness)
 
+        self._brightness_send_timer = QtCore.QTimer(self)
+        self._brightness_send_timer.setSingleShot(True)
+        self._brightness_send_timer.setInterval(80)
+        self._brightness_send_timer.timeout.connect(self._send_brightness)
+
         self._slider_brightness = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._slider_brightness.setRange(0, 255)
         self._slider_brightness.setValue(init_brightness)
@@ -4272,12 +4277,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_brightness(self, value: int):
         self._cfg["LIGHTING_VALUE"] = value
+        self._brightness_send_timer.start()   # debounced hardware write (~80ms)
+        self._brightness_save_timer.start()   # debounced TOML write (400ms)
+
+    def _send_brightness(self):
         if self._lighting:
             # @00F (set brightness) only updates a register — the controller
             # doesn't apply the new level until @00L1 (ON) is re-sent.
+            value = self._cfg.get("LIGHTING_VALUE", 100)
             self._lighting.set_brightness(value)
             self._lighting.on()
-        self._brightness_save_timer.start()   # debounced TOML write
 
     def _persist_brightness(self):
         ConfigLoader.save({"LIGHTING_VALUE": self._cfg.get("LIGHTING_VALUE", 100)})

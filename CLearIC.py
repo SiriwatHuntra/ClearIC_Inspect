@@ -937,8 +937,9 @@ class Detector:
         self._n_passes           = max(1, int(n_passes))
         self._uncertain_thr      = float(uncertain_thr)
         self._debug              = debug
-        self._compiled = None
-        self._ready    = False
+        self._compiled    = None
+        self._infer_queue = None
+        self._ready       = False
         try:
             import openvino as ov
             self._model_xml = model_path
@@ -946,10 +947,15 @@ class Detector:
                 raise ModelError(f"Model not found: {self._model_xml}")
             core  = ov.Core()
             model = core.read_model(self._model_xml)
+            # THROUGHPUT: lets OpenVINO run the 12 per-cell inferences concurrently
+            # across CPU streams via the async queue below. f32 keeps results
+            # bit-identical to the old single-stream path — only scheduling changes.
             self._compiled = core.compile_model(model, "CPU", {
                 "INFERENCE_PRECISION_HINT": "f32",
-                "PERFORMANCE_HINT":         "LATENCY",
+                "PERFORMANCE_HINT":         "THROUGHPUT",
             })
+            # jobs=0 → OV sizes the pool to OPTIMAL_NUMBER_OF_INFER_REQUESTS.
+            self._infer_queue = ov.AsyncInferQueue(self._compiled)
             self._ready = True
             print(f"[Detector] OpenVINO classifier loaded: {self._model_xml}")
         except ModelError:
@@ -1005,12 +1011,25 @@ class Detector:
 
         if blobs:
             try:
-                text_probs_all = np.zeros(len(blobs), dtype=np.float32)
-                for _ in range(self._n_passes):
+                n   = len(blobs)
+                npp = self._n_passes
+                # One unique output slot per (pass, blob) so the async callbacks
+                # never write the same element → no cross-thread race. Pass count
+                # is preserved for behaviour parity (deterministic model → each
+                # pass yields the same value; averaging is a no-op when npp == 1).
+                probs = np.zeros(n * npp, dtype=np.float32)
+
+                def _on_done(request, slot):
+                    probs[slot] = request.get_output_tensor(0).data[0, 1]  # P(Text)
+
+                self._infer_queue.set_callback(_on_done)
+                for p in range(npp):
+                    base = p * n
                     for j, blob in enumerate(blobs):
-                        out = self._compiled(blob[np.newaxis])   # [1, 3, H, W]
-                        text_probs_all[j] += out[0][0, 1]        # P(Text)
-                text_probs_all /= self._n_passes
+                        self._infer_queue.start_async(blob[np.newaxis], userdata=base + j)
+                self._infer_queue.wait_all()
+
+                text_probs_all = probs.reshape(npp, n).mean(axis=0)
 
                 for j, idx in enumerate(indices):
                     text_prob   = float(text_probs_all[j])

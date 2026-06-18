@@ -1066,6 +1066,11 @@ def _hex_to_bgr(h: str) -> tuple:
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return (b, g, r)
 
+def _hw_status_line(name: str, ok: bool, status_text: str) -> str:
+    """One device's status as an HTML line: colored dot + name + status."""
+    dot_color = "#3DD66B" if ok else "#FF5C5C"   # green / red
+    return f'<span style="color:{dot_color};">&#9679;</span> {name}: {status_text}'
+
 def _get_ip_address() -> str:
     """Best-effort local IP for display — primary interface via `hostname -I`,
     falling back to a UDP socket trick if that's unavailable."""
@@ -2035,21 +2040,6 @@ QCheckBox:disabled {
 }
 QCheckBox::indicator:disabled {
     border-color: #4D5E8C;
-}
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #0B1020;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #3D55A8;
-    width: 16px;
-    margin: -6px 0;
-    border-radius: 8px;
-}
-QSlider::sub-page:horizontal {
-    background: #3D55A8;
-    border-radius: 3px;
 }
 QSpinBox {
     background: #0B1020;
@@ -3456,18 +3446,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._brightness_send_timer.setInterval(80)
         self._brightness_send_timer.timeout.connect(self._send_brightness)
 
-        self._slider_brightness = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._slider_brightness.setRange(0, 255)
-        self._slider_brightness.setValue(init_brightness)
-        self._slider_brightness.valueChanged.connect(self._on_brightness_slider_changed)
-        bright_row.addWidget(self._slider_brightness, 1)
+        self._btn_bright_down = QtWidgets.QPushButton("−")
+        self._btn_bright_down.setFixedWidth(36)
+        self._btn_bright_down.clicked.connect(self._on_brightness_step_down)
+        bright_row.addWidget(self._btn_bright_down)
 
         self._spin_brightness = QtWidgets.QSpinBox()
         self._spin_brightness.setRange(0, 255)
         self._spin_brightness.setValue(init_brightness)
         self._spin_brightness.setFixedWidth(56)
         self._spin_brightness.valueChanged.connect(self._on_brightness_spin_changed)
-        bright_row.addWidget(self._spin_brightness)
+        bright_row.addWidget(self._spin_brightness, 1)
+
+        self._btn_bright_up = QtWidgets.QPushButton("+")
+        self._btn_bright_up.setFixedWidth(36)
+        self._btn_bright_up.clicked.connect(self._on_brightness_step_up)
+        bright_row.addWidget(self._btn_bright_up)
 
         light_lay.addLayout(bright_row)
 
@@ -3500,6 +3494,7 @@ class MainWindow(QtWidgets.QMainWindow):
         setup_lay.addWidget(self._btn_redetect)
 
         self._lbl_hw_toast = QtWidgets.QLabel("")
+        self._lbl_hw_toast.setTextFormat(QtCore.Qt.RichText)
         self._lbl_hw_toast.setWordWrap(True)
         self._lbl_hw_toast.setStyleSheet("font-size:10px; color:#FFD580")
         setup_lay.addWidget(self._lbl_hw_toast)
@@ -3797,14 +3792,17 @@ class MainWindow(QtWidgets.QMainWindow):
         parts = []
         if lighting_enabled:
             if self._lighting and self._lighting.controller_ok:
-                _light_status = "OK"
+                _light_status, _light_ok = "OK", True
             elif self._detected_ports["lighting"]:
-                _light_status = "NO RESPONSE ⚠"
+                _light_status, _light_ok = "NO RESPONSE ⚠", False
             else:
-                _light_status = "NOT FOUND ⚠"
-            parts.append("Light " + _light_status)
-        parts.append("CellCon " + (cellcon_port if self._detected_ports["cellcon"] else "NOT FOUND ⚠"))
-        hw_msg = " | ".join(parts)
+                _light_status, _light_ok = "NOT FOUND ⚠", False
+            parts.append(_hw_status_line("Light", _light_ok, _light_status))
+        _cellcon_ok = bool(self._detected_ports["cellcon"])
+        parts.append(_hw_status_line(
+            "CellCon", _cellcon_ok,
+            cellcon_port if _cellcon_ok else "NOT FOUND ⚠"))
+        hw_msg = "<br>".join(parts)
         self._lbl_hw_toast.setText(hw_msg)
 
         # Build Inspector from existing template (silent no-op if template absent)
@@ -4218,9 +4216,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_lot_info.setText("—")
 
         # Ask operator for lot number (or get from CellCon / subclass hook)
+        cellcon_found = bool(self._detected_ports.get("cellcon"))
         if not self._cfg.get("DEBUG", True):
-            # Production: CellCon is authoritative — retreat if no lot received
+            # Production: CellCon is authoritative — retreat if not found / no lot received
             # (mirrors IFWFOCR01.getLotNumFromCellcon() 'err' handling)
+            if not cellcon_found:
+                QtWidgets.QMessageBox.warning(
+                    self, "CellCon", "CellCon not found on any COM port",
+                    QtWidgets.QMessageBox.Close)
+                self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
+                return   # retreat — no CellCon hardware detected
             lot = self._cellcon.get_lot()
             if not lot:
                 QtWidgets.QMessageBox.warning(
@@ -4229,7 +4234,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
                 return   # retreat — no lot from CellCon
         else:
-            lot = LotStartDialog.request(parent=self, api_fn=self._cellcon.get_lot)
+            # Debug: skip the (up to ~5s) CellCon probe entirely when no CellCon
+            # was detected at hardware-detection time — go straight to manual entry.
+            api_fn = self._cellcon.get_lot if cellcon_found else None
+            lot = LotStartDialog.request(parent=self, api_fn=api_fn)
             if lot is None:
                 self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
                 return   # operator cancelled
@@ -4302,7 +4310,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._preview_timer.stop()
         self._update_lighting_section_visibility()
 
-    # Lighting brightness slider/spinbox — only shown in Live + camera mode
+    # Lighting brightness arrow buttons/spinbox — only shown in Live + camera mode
+    _BRIGHTNESS_STEP = 5
+
     def _update_lighting_section_visibility(self):
         visible = (self._live_mode
                    and self._cfg.get("CAMERA") == "camera"
@@ -4310,18 +4320,15 @@ class MainWindow(QtWidgets.QMainWindow):
                    and self._lighting._enabled)
         self._light_frame.setVisible(visible)
 
-    def _on_brightness_slider_changed(self, value: int):
-        if self._spin_brightness.value() != value:
-            self._spin_brightness.blockSignals(True)
-            self._spin_brightness.setValue(value)
-            self._spin_brightness.blockSignals(False)
-        self._apply_brightness(value)
+    def _on_brightness_step_up(self):
+        self._spin_brightness.setValue(
+            min(255, self._spin_brightness.value() + self._BRIGHTNESS_STEP))
+
+    def _on_brightness_step_down(self):
+        self._spin_brightness.setValue(
+            max(0, self._spin_brightness.value() - self._BRIGHTNESS_STEP))
 
     def _on_brightness_spin_changed(self, value: int):
-        if self._slider_brightness.value() != value:
-            self._slider_brightness.blockSignals(True)
-            self._slider_brightness.setValue(value)
-            self._slider_brightness.blockSignals(False)
         self._apply_brightness(value)
 
     def _apply_brightness(self, value: int):
@@ -4717,28 +4724,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._cfg.get("CAMERA") == "camera":
             if self._camera and self._camera.is_open():
-                cam_status = "OK"
+                cam_status, cam_ok = "OK", True
             elif self._try_reopen_camera():
                 if self._cam_retry_timer is not None:
                     self._cam_retry_timer.stop()
                 self._error_banner.hide()
                 self._update_setup_buttons()
-                cam_status = "OK"
+                cam_status, cam_ok = "OK", True
             else:
                 self._on_camera_lost()
-                cam_status = "NOT FOUND ⚠"
-            parts.append("Camera " + cam_status)
+                cam_status, cam_ok = "NOT FOUND ⚠", False
+            parts.append(_hw_status_line("Camera", cam_ok, cam_status))
 
         if self._cfg.get("LIGHTING_ENABLE", False):
             if self._lighting and self._lighting.controller_ok:
-                _light_status = "OK"
+                _light_status, _light_ok = "OK", True
             elif ports["lighting"]:
-                _light_status = "NO RESPONSE ⚠"
+                _light_status, _light_ok = "NO RESPONSE ⚠", False
             else:
-                _light_status = "NOT FOUND ⚠"
-            parts.append("Light " + _light_status)
-        parts.append("CellCon " + (ports["cellcon"] or "NOT FOUND ⚠"))
-        self._lbl_hw_toast.setText(" | ".join(parts))
+                _light_status, _light_ok = "NOT FOUND ⚠", False
+            parts.append(_hw_status_line("Light", _light_ok, _light_status))
+
+        _cellcon_ok = bool(ports["cellcon"])
+        parts.append(_hw_status_line(
+            "CellCon", _cellcon_ok, ports["cellcon"] or "NOT FOUND ⚠"))
+        self._lbl_hw_toast.setText("<br>".join(parts))
 
     # Close
     def closeEvent(self, e):

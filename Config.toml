@@ -1,6 +1,6 @@
 # ─── Simple Setup (true / false only) ───────────────────────────────────────
 # true = live Basler camera, false = load images from Input/ (directory mode)
-USE_CAMERA = false
+USE_CAMERA = true
 
 # Set to true to drive real GPIO pins; false = log-only, safe without hardware
 IO = false
@@ -150,7 +150,7 @@ LIGHTING_USB_ID = "Prolific_Technology_Inc._USB-Serial_Controller"
 LIGHTING_PORT = "/dev/ttyUSB1"
 
 # Brightness level 0–255 set at startup, held for the entire run
-LIGHTING_VALUE = 28
+LIGHTING_VALUE = 45
 
 
 # ─── GPIO Pins (BCM numbering) ───────────────────────────────────────────────

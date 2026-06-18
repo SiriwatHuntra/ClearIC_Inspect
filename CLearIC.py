@@ -31,7 +31,9 @@ import time
 import queue
 import signal
 import fcntl
+import socket
 import threading
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -1063,6 +1065,25 @@ def _hex_to_bgr(h: str) -> tuple:
     h = h.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return (b, g, r)
+
+def _get_ip_address() -> str:
+    """Best-effort local IP for display — primary interface via `hostname -I`,
+    falling back to a UDP socket trick if that's unavailable."""
+    try:
+        r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
+        ips = r.stdout.strip().split()
+        if ips:
+            return ips[0]
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "N/A"
 
 def _build_cells(x: int, y: int, w: int, h: int,
                  cell_shrink: float = 0.95, cell_expand: float = 1.2,
@@ -3277,7 +3298,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, cfg: dict):
         super().__init__()
-        self.setWindowTitle("ClearIC Inspect")
+        self.setWindowTitle(f"ClearIC Inspect — {_get_ip_address()}")
         self._cfg               = cfg
         self._camera:    Camera | None    = None
         self._detector:  Detector | None  = None

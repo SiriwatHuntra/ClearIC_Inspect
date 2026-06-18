@@ -908,10 +908,6 @@ class MyApp(QtWidgets.QMainWindow, Ui_MainWindow):
 			cv2.waitKey(1)
 
 
-
-
-
-
     # method called by the dial 
 	def dial_method(self):
 		global lightBusy

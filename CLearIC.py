@@ -80,6 +80,8 @@ class ConfigLoader:
         "DATA_SPLIT":           "train",
         "LOG_DIR":              "logs",
         "LOG_RETENTION":        730,   # days to keep log files (2 years)
+        "NTP_SYNC":             False, # restart systemd-timesyncd at startup (Pi has no RTC)
+        "NTP_SERVER":           "",    # factory NTP server IP (informational; set in timesyncd)
         "ANN_BORDER_PX":        1,
         "RESULT_OVERLAY":      True,
         "WARMUP_FRAMES":        5,
@@ -151,6 +153,10 @@ class ConfigLoader:
             raise ConfigError("COLLECT_DATASET must be a boolean")
         if not isinstance(cfg["LOG_RETENTION"], int) or cfg["LOG_RETENTION"] < 1:
             raise ConfigError("LOG_RETENTION must be a positive integer (days)")
+        if not isinstance(cfg["NTP_SYNC"], bool):
+            raise ConfigError("NTP_SYNC must be true or false")
+        if not isinstance(cfg["NTP_SERVER"], str):
+            raise ConfigError("NTP_SERVER must be a string")
         for pin_key in ("GPIO_START_PIN", "GPIO_BUSY_PIN",
                         "GPIO_END_PIN", "GPIO_INSPEC_STAGE_PIN"):
             if not isinstance(cfg[pin_key], int) or not (1 <= cfg[pin_key] <= 27):
@@ -517,8 +523,10 @@ class CellCon:
 
     def __init__(self, port: str = "/dev/ttyUSB0"):
         self._port = port
+        self.last_error = ""   # side-channel: serial failure cause from the last get_lot()
 
     def get_lot(self) -> str:
+        self.last_error = ""
         try:
             import serial as _serial
             with _serial.Serial(
@@ -538,6 +546,7 @@ class CellCon:
                         print(f"[CellCon] Lot received: {lot}")
                         return lot
         except Exception as e:
+            self.last_error = str(e)
             print(f"[CellCon] Error: {e} — check USB at {self._port}")
         return ""
 
@@ -1070,6 +1079,30 @@ def _hw_status_line(name: str, ok: bool, status_text: str) -> str:
     """One device's status as an HTML line: colored dot + name + status."""
     dot_color = "#3DD66B" if ok else "#FF5C5C"   # green / red
     return f'<span style="color:{dot_color};">&#9679;</span> {name}: {status_text}'
+
+def _sync_time(server: str = "") -> None:
+    """Force an NTP resync at startup. The Raspberry Pi has no battery-backed
+    RTC, so a unit booting before the network is up can stamp logs, image IDs
+    and the Output/YYYYMMDD/ tree with a wrong date. Restart systemd-timesyncd
+    and wait (up to ~15 s) for the clock to synchronise. Best-effort: a failure
+    here must never block startup, so all paths are swallowed."""
+    try:
+        subprocess.run(
+            ["sudo", "systemctl", "restart", "systemd-timesyncd"],
+            capture_output=True, text=True, timeout=5)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            r = subprocess.run(
+                ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                capture_output=True, text=True, timeout=5)
+            if r.stdout.strip() == "yes":
+                print("[NTP] sync OK")
+                return
+            time.sleep(1)
+        print(f"[NTP] sync timeout (server {server or 'default'} unreachable)")
+    except Exception as e:
+        print(f"[NTP] sync error: {e}")
+
 
 def _get_ip_address() -> str:
     """Best-effort local IP for display — primary interface via `hostname -I`,
@@ -2325,6 +2358,11 @@ class RunWorker(QtCore.QThread):
             self._write_q.put(None)   # sentinel
         if self._write_thread is not None:
             self._write_thread.join(timeout=15.0)
+            if self._write_thread.is_alive():
+                msg = ("Image write queue did not flush in 15 s — "
+                       "some captured images may not have been saved ⚠")
+                print(f"[Writer] {msg}")
+                self.sig_warn.emit(msg)
             self._write_thread = None
         self._write_q = None
 
@@ -4228,9 +4266,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 return   # retreat — no CellCon hardware detected
             lot = self._cellcon.get_lot()
             if not lot:
+                # Distinguish a serial/connection failure from a genuine empty
+                # response so the operator knows whether to check the cable.
+                if self._cellcon.last_error:
+                    detail = (f"CellCon unreachable on {self._cfg.get('CELLCON_PORT', '?')} "
+                              f"— check USB cable.\n\n{self._cellcon.last_error}")
+                else:
+                    detail = "Lot number not found"
                 QtWidgets.QMessageBox.warning(
-                    self, "CellCon", "Lot number not found",
-                    QtWidgets.QMessageBox.Close)
+                    self, "CellCon", detail, QtWidgets.QMessageBox.Close)
                 self._set_ocr_status("Fill both fields to enable Start.", color="#A9B8DC")
                 return   # retreat — no lot from CellCon
         else:
@@ -4785,6 +4829,9 @@ def main():
             f"Cannot start — Config.toml problem:\n\n{e}\n\n"
             "Contact your system administrator.")
         sys.exit(1)
+
+    if cfg.get("NTP_SYNC", False):
+        _sync_time(cfg.get("NTP_SERVER", ""))
 
     os.makedirs(cfg.get("LOG_DIR", "logs"), exist_ok=True)
     os.makedirs("templates", exist_ok=True)

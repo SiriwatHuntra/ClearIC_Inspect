@@ -176,3 +176,15 @@ ANN_BORDER_PX = 1
 
 # Warn in UI when free disk space drops below this (MB)
 DISK_WARN_MB = 200
+
+
+# ─── Time Sync ───────────────────────────────────────────────────────────────
+# Restart systemd-timesyncd at startup and wait for the clock to sync. The Pi
+# has no battery-backed RTC, so a wrong boot-time clock misdates logs/images.
+# Requires timesyncd pre-configured with the factory NTP server. Leave false
+# on offline/dev units.
+NTP_SYNC = false
+
+# Factory NTP server IP (informational/logging only; the actual server is set
+# in /etc/systemd/timesyncd.conf). Example: "172.16.0.80"
+NTP_SERVER = ""
